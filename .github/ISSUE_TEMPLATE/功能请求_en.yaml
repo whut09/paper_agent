@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest an idea for this project
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 2.0 is released! new repo is [HERE](https://github.com/PaperAgent/PaperAgent-next)
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you asking
+      options:
+      - label: I have tried the PaperAgent-next and give feedback in PaperAgent-next
+        required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: Is your feature request related to a problem?
+      description: A clear and concise description of what the problem is
+      placeholder: Ex. I'm always frustrated when ...
+    validations:
+      required: false
+  - type: textarea
+    id: solution
+    attributes:
+      label: Describe the solution you'd like
+      description: A clear and concise description of what you want to happen
+    validations:
+      required: false
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add any other projects about the feature request here.
+    validations:
+      required: false

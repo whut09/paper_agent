@@ -1,0 +1,99 @@
+[project]
+name = "paper_agent"
+version = "1.9.11"
+description = "Latex PDF Translator"
+authors = [{ name = "Byaidu", email = "byaidux@gmail.com" }]
+license = "AGPL-3.0"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "requests",
+    # for arm64 linux whells
+    "pymupdf<1.25.3",
+    "tqdm",
+    "tenacity",
+    "numpy",
+    "ollama",
+    "xinference-client",
+    "deepl",
+    "openai>=1.0.0",
+    "azure-ai-translation-text<=1.0.1",
+    # 5.36 has a bug, webui starts with a white screen
+    "gradio<5.36",
+    "huggingface_hub",
+    "onnx",
+    "onnxruntime",
+    "opencv-python-headless",
+    "tencentcloud-sdk-python-tmt",
+    "pdfminer-six==20250416",
+    "gradio_pdf>=0.0.21",
+    "pikepdf",
+    "peewee>=3.17.8",
+    "fontTools",
+    "babeldoc>=0.1.22, <0.3.0",
+    "rich",
+]
+
+[project.optional-dependencies]
+backend = [
+    "flask",
+    "celery",
+    "redis"
+]
+argostranslate = [
+    "argostranslate"
+]
+mcp = [
+    "mcp>=1.6.0",
+]
+cuda = [
+    "onnxruntime-gpu",
+]
+dml = [
+    "onnxruntime-directml",
+]
+precise = []  # marker — run `paper_agent-setup-precise` after install to provision the isolated venv
+
+[dependency-groups]
+dev = [
+    "black",
+    "flake8",
+    "pre-commit",
+    "pytest",
+    "build",
+    "bumpver>=2024.1130",
+]
+
+[project.urls]
+Homepage = "https://github.com/Byaidu/PaperAgent"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+paper_agent = "paper_agent.paper_agent:main"
+paper_agent-setup-precise = "paper_agent.kernel.precise:setup_precise_cli"
+
+[tool.flake8]
+ignore = ["E203", "E261", "E501", "W503", "E741"]
+max-line-length = 88
+
+
+
+[bumpver]
+current_version = "1.9.11"
+version_pattern = "MAJOR.MINOR.PATCH[.PYTAGNUM]"
+
+[bumpver.file_patterns]
+"pyproject.toml" = [
+    'current_version = "{version}"',
+    'version = "{version}"'
+]
+"paper_agent/__init__.py" = [
+    '__version__ = "{version}"'
+]

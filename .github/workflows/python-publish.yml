@@ -1,0 +1,332 @@
+name: Test and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+env:
+  REGISTRY: ghcr.io
+  REPO_LOWER: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+  GHCR_REPO: ghcr.io/${{ github.repository }}
+  WIN_EXE_PYTHON_VERSION: "3.12.9"
+
+jobs:
+  check-repository:
+    name: Check if running in main repository
+    runs-on: ubuntu-latest
+    outputs:
+      # debug purpose
+      is_main_repo: ${{ github.repository == 'Byaidu/PaperAgent' }}
+      is_doc_only: ${{ steps.check-doc.outputs.is_doc_only }}
+    steps:
+      - run: echo "Running repository check"
+      - name: Check if commit is doc-only
+        id: check-doc
+        run: |
+          MSG=$(echo "${{ github.event.head_commit.message }}" | head -n 1)
+          if [[ "$MSG" == doc:* ]] || [[ "$MSG" == "doc("* ]]; then
+            echo "is_doc_only=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_doc_only=false" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    needs: check-repository
+    uses: ./.github/workflows/python-test.yml
+    if: needs.check-repository.outputs.is_main_repo == 'true' && needs.check-repository.outputs.is_doc_only != 'true'
+
+  build:
+    name: Build distribution 📦
+    needs: [test, check-repository]
+    if: needs.check-repository.outputs.is_main_repo == 'true' && needs.check-repository.outputs.is_doc_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      is_release: ${{ steps.check-version.outputs.tag }}
+      version: ${{ steps.check-version.outputs.tag && steps.get-release-version.outputs.version || steps.get-dev-version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          fetch-depth: 2
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup uv with Python 3.12
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Check if there is a parent commit
+        id: check-parent-commit
+        run: |
+          echo "sha=$(git rev-parse --verify --quiet HEAD^)" >> $GITHUB_OUTPUT
+
+      - name: Detect and tag new version
+        id: check-version
+        if: steps.check-parent-commit.outputs.sha
+        uses: salsify/action-detect-and-tag-new-version@b1778166f13188a9d478e2d1198f993011ba9864 # v2.0.3
+        with:
+          version-command: |
+            cat pyproject.toml | grep "version = " | head -n 1 | awk -F'"' '{print $2}'
+          tag-template: 'v{VERSION}'
+
+      - name: Install Dependencies
+        run: |
+          uv sync
+
+      - name: Bump version for developmental release
+        if: "!steps.check-version.outputs.tag"
+        id: get-dev-version
+        run: |
+          version=$(bumpver update --patch --tag=final --dry 2>&1 | grep "New Version" | awk '{print $NF}')
+          echo "version=$version.dev$(date +%s)" >> $GITHUB_OUTPUT
+          bumpver update --set-version $version.dev$(date +%s)
+
+      - name: Get release version
+        if: steps.check-version.outputs.tag
+        id: get-release-version
+        run: |
+          version=$(cat pyproject.toml | grep "version = " | head -n 1 | awk -F'"' '{print $2}')
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Build package
+        run: "uv build"
+
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish-to-pypi:
+    name: Publish Python 🐍 distribution 📦 to PyPI
+    if: needs.build.outputs.is_release != ''
+    needs:
+      - check-repository
+      - build
+      - test-win64-exe
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/paper_agent
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distribution 📦 to PyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+
+  publish-to-testpypi:
+    name: Publish Python 🐍 distribution 📦 to TestPyPI
+    if: needs.build.outputs.is_release == ''
+    needs:
+      - check-repository
+      - build
+      - test-win64-exe
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/paper_agent
+    permissions:
+      id-token: write
+    steps:
+      - name: Download all the dists
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Publish distribution 📦 to TestPyPI
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.13.0
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  build-win64-exe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs:
+      - check-repository
+    if: needs.check-repository.outputs.is_main_repo == 'true' && needs.check-repository.outputs.is_doc_only != 'true'
+    steps:
+      - name: checkout babeldoc metadata
+        uses: actions/checkout@v6
+        with:
+          repository: funstory-ai/BabelDOC
+          path: babeldoctemp1234567
+          token: ${{ secrets.GITHUB_TOKEN }}
+          sparse-checkout: babeldoc/assets/embedding_assets_metadata.py
+      - name: Cached Assets
+        id: cache-assets
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/babeldoc
+          key: test-1-babeldoc-assets-${{ hashFiles('babeldoctemp1234567/babeldoc/assets/embedding_assets_metadata.py') }}
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: Setup uv with Python ${{ env.WIN_EXE_PYTHON_VERSION }}
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: ${{ env.WIN_EXE_PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Build Windows executable
+        shell: pwsh
+        run: |
+          ./script/build-win64.ps1 `
+            -PythonVersion "${{ env.WIN_EXE_PYTHON_VERSION }}" `
+            -CleanBabelDoc `
+            -DownloadVCRedist `
+            -GenerateOfflineAssets
+
+      - name: Upload build with offline assets artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: win64-exe-with-assets
+          path: ./build
+          if-no-files-found: error
+          compression-level: 1
+          include-hidden-files: true
+
+  test-win64-exe:
+    needs:
+      - build-win64-exe
+      - check-repository
+    if: needs.check-repository.outputs.is_main_repo == 'true' && needs.check-repository.outputs.is_doc_only != 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: win64-exe-with-assets
+          path: ./build
+
+      - name: Test show version
+        run: |
+          ./build/paper_agent.exe --version
+
+      - name: Test - Translate a PDF file with plain text only
+        run: |
+          ./build/paper_agent.exe ./test/file/translate.cli.plain.text.pdf -o ./test/file
+
+      - name: Test - Translate a PDF file figure
+        run: |
+          ./build/paper_agent.exe ./test/file/translate.cli.text.with.figure.pdf -o ./test/file
+
+      - name: Delete offline assets and cache
+        shell: pwsh
+        run: |
+          $offlineAssetsPath = Get-ChildItem -Path "./build" -Filter "offline_assets_*.zip" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if ($offlineAssetsPath) {
+            Remove-Item -Path $offlineAssetsPath -Force
+          }
+          $cachePath = "$env:USERPROFILE/.cache/babeldoc"
+          if (Test-Path $cachePath) {
+            Remove-Item -Path $cachePath -Recurse -Force
+          }
+
+      - name: Test - Translate without offline assets
+        run: |
+          New-Item -Path "./test/file/offline_result" -ItemType Directory -Force
+          ./build/paper_agent.exe ./test/file/translate.cli.plain.text.pdf -o ./test/file/offline_result
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: ./test/file/
+          retention-days: 7
+
+  release-draft:
+    name: Release Draft Tasks
+    needs:
+      - check-repository
+      - build
+      - publish-to-pypi
+      - publish-to-testpypi
+      - test-win64-exe
+    if: |
+      always() && needs.check-repository.outputs.is_main_repo == 'true' &&
+      needs.check-repository.outputs.is_doc_only != 'true' &&
+      (needs.publish-to-pypi.result == 'success' || needs.publish-to-testpypi.result == 'success') &&
+      needs.test-win64-exe.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      tag_name: ${{ steps.release-drafter.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: true
+          fetch-depth: 2
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish the release notes
+        id: release-drafter
+        uses: release-drafter/release-drafter@139054aeaa9adc52ab36ddf67437541f039b88e2 # v7.1.1
+        with:
+          publish: ${{ needs.build.outputs.is_release != '' }}
+          tag: ${{ needs.build.outputs.is_release }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  upload-release:
+    needs: [release-draft, check-repository]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: always() && needs.check-repository.outputs.is_main_repo == 'true' &&
+      needs.check-repository.outputs.is_doc_only != 'true' &&
+      needs.release-draft.result == 'success'
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: win64-exe-with-assets
+          path: ./build
+
+      - name: Create release zip
+        run: |
+          mv ./build ./paper_agent
+          zip -9qr "paper_agent-${{ needs.release-draft.outputs.tag_name }}-with-assets-win64.zip" ./paper_agent/*
+
+          # Find and delete offline asset files
+          find ./paper_agent -name "offline_assets_*.zip" -type f -print -delete
+          echo "Remaining offline assets files (should be empty):"
+          find ./paper_agent -name "offline_assets_*.zip" -type f
+
+          zip -9qr "paper_agent-${{ needs.release-draft.outputs.tag_name }}-win64.zip" ./paper_agent/*
+
+      - name: Upload to latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST_RELEASE=${{ needs.release-draft.outputs.tag_name }}
+          echo "Latest release tag: $LATEST_RELEASE"
+          gh release upload "$LATEST_RELEASE" "paper_agent-${{ needs.release-draft.outputs.tag_name }}-win64.zip" --clobber

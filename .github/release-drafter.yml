@@ -1,0 +1,55 @@
+name-template: 'v$RESOLVED_VERSION'
+tag-template: 'v$RESOLVED_VERSION'
+categories:
+  - title: '🚀 Features'
+    labels:
+      - 'feature'
+      - 'enhancement'
+  - title: '🐛 Bug Fixes'
+    labels:
+      - 'fix'
+      - 'bugfix'
+      - 'bug'
+  - title: '🧰 Maintenance'
+    labels:
+      - 'chore'
+      - 'maintenance'
+      - 'refactor'
+  - title: '📝 Documentation'
+    labels:
+      - 'docs'
+      - 'documentation'
+change-template: '- $TITLE @$AUTHOR (#$NUMBER)'
+change-title-escapes: '\<*_&' # You can add # and @ to disable mentions
+version-resolver:
+  major:
+    labels:
+      - 'major'
+  minor:
+    labels:
+      - 'minor'
+  patch:
+    labels:
+      - 'patch'
+  default: patch
+template: |
+  ## Changes
+
+  $CHANGES
+
+  ## Contributors
+  
+  $CONTRIBUTORS
+
+  ## Windows Specific
+
+  If you cannot open it after downloading, please install https://aka.ms/vs/17/release/vc_redist.x64.exe and try again.
+
+  ## Assets
+
+  - paper_agent-v$RESOLVED_VERSION-win64.zip: paper_agent **without** assets(font, model, etc.)
+  - paper_agent-v$RESOLVED_VERSION-with-assets-win64.zip: (**Recommended**) paper_agent **with** assets(font, model, etc.)
+
+  > [!NOTE]
+  >
+  > The version without assets will also dynamically download resources when running, but the download may fail due to network issues.

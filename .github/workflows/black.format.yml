@@ -1,0 +1,20 @@
+name: Format Code with Black
+
+on: [push, pull_request]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: >-
+      !startsWith(github.event.head_commit.message, 'doc:') &&
+      !startsWith(github.event.head_commit.message, 'doc(') &&
+      !startsWith(github.event.pull_request.title, 'doc:') &&
+      !startsWith(github.event.pull_request.title, 'doc(')
+    steps:
+      - uses: actions/checkout@v6
+      - uses: psf/black@stable

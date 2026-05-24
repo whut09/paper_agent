@@ -1,0 +1,34 @@
+name: fork-test
+
+on:
+  push:
+    branches: [ "main", "master" ]
+
+env:
+  REGISTRY: ghcr.io
+  REPO_LOWER: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+  GHCR_REPO: ghcr.io/${{ github.repository }}
+  WIN_EXE_PYTHON_VERSION: 3.12.9
+jobs:
+  check-repository:
+    name: Check if running in main repository
+    runs-on: ubuntu-latest
+    outputs:
+      is_main_repo: ${{ github.repository == 'Byaidu/PaperAgent' }}
+      is_doc_only: ${{ steps.check-doc.outputs.is_doc_only }}
+    steps:
+      - run: echo "Running repository check"
+      - name: Check if commit is doc-only
+        id: check-doc
+        run: |
+          MSG=$(echo "${{ github.event.head_commit.message }}" | head -n 1)
+          if [[ "$MSG" == doc:* ]] || [[ "$MSG" == "doc("* ]]; then
+            echo "is_doc_only=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_doc_only=false" >> $GITHUB_OUTPUT
+          fi
+
+  test:
+    uses: ./.github/workflows/python-test.yml
+    needs: check-repository
+    if: needs.check-repository.outputs.is_main_repo != 'true' && needs.check-repository.outputs.is_doc_only != 'true'

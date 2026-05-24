@@ -1,0 +1,12 @@
+{
+    "CODEX_BASE_URL": "xx",
+    "CODEX_API_KEY": "xx",
+    "CODEX_MODEL": "xx",
+    "ENABLED_SERVICES": [],
+    "HIDDEN_GRADIO_DETAILS": true,
+    "PAPER_AGENT_LANG_FROM": "English",
+    "PAPER_AGENT_LANG_TO": "Simplified Chinese",
+    "PAPER_AGENT_VFONT": null,
+    "NOTO_FONT_PATH": "/app/SourceHanSerifCN-Regular.ttf",
+    "PAPER_AGENT_PROMPT": ""
+}

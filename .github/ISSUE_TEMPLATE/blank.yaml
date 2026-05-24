@@ -1,0 +1,25 @@
+name: Blank Issue
+description: Create a blank issue for discussion
+body:  
+  - type: markdown
+    attributes:
+      value: |
+        ## 2.0 is released! new repo is [HERE](https://github.com/PaperAgent/PaperAgent-next)
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you asking
+      options:
+      - label: I have tried the PaperAgent-next and give feedback in PaperAgent-next
+        required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: before ...
+      options:
+      - label: This issue is not about question or bug.
+        required: true
+  - type: textarea
+    id: describe
+    attributes:
+      label: Add a description

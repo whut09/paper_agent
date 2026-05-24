@@ -1,0 +1,171 @@
+name: windows exe Release Workflow
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Release Version (e.g., v1.0.0)'
+        required: true
+        type: string
+  # push:
+    # debug purpose
+env:
+  WIN_EXE_PYTHON_VERSION: 3.12.9
+jobs:
+  build-win64-exe:
+    runs-on: windows-latest
+    steps:
+      - name: checkout babeldoc metadata
+        uses: actions/checkout@v6
+        with:
+          repository: funstory-ai/BabelDOC
+          path: babeldoctemp1234567
+          token: ${{ secrets.GITHUB_TOKEN }}
+          sparse-checkout: babeldoc/assets/embedding_assets_metadata.py
+      - name: Cached Assets
+        id: cache-assets
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/babeldoc
+          key: test-1-babeldoc-assets-${{ hashFiles('babeldoctemp1234567/babeldoc/assets/embedding_assets_metadata.py') }}
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: Setup uv with Python ${{ env.WIN_EXE_PYTHON_VERSION }}
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: ${{ env.WIN_EXE_PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: 执行所有任务（创建目录、下载、解压、复制文件、安装依赖）
+        shell: pwsh
+        run: |
+          Write-Host "==== 删除 babeldoctemp1234567 文件夹 ===="
+          if (Test-Path "./babeldoctemp1234567") {
+              Remove-Item -Path "./babeldoctemp1234567" -Recurse -Force
+              Write-Host "babeldoctemp1234567 文件夹已成功删除"
+          } else {
+              Write-Host "babeldoctemp1234567 文件夹不存在，无需删除"
+          }
+          Write-Host "==== 创建必要的目录 ===="
+          New-Item -Path "./build" -ItemType Directory -Force
+          New-Item -Path "./build/runtime" -ItemType Directory -Force
+          New-Item -Path "./dep_build" -ItemType Directory -Force
+
+          Write-Host "==== 复制代码到 dep_build ===="
+          Get-ChildItem -Path "./" -Exclude "dep_build", "build" | Copy-Item -Destination "./dep_build" -Recurse -Force
+
+          Write-Host "==== 下载并解压 Python ${{ env.WIN_EXE_PYTHON_VERSION }} ===="
+          Write-Host "pythonUrl: https://www.python.org/ftp/python/${{ env.WIN_EXE_PYTHON_VERSION }}/python-${{ env.WIN_EXE_PYTHON_VERSION }}-embed-amd64.zip"
+          $pythonUrl = "https://www.python.org/ftp/python/${{ env.WIN_EXE_PYTHON_VERSION }}/python-${{ env.WIN_EXE_PYTHON_VERSION }}-embed-amd64.zip"
+          $pythonZip = "./dep_build/python.zip"
+          Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonZip
+          Expand-Archive -Path $pythonZip -DestinationPath "./build/runtime" -Force
+
+          Write-Host "==== 下载并解压 PyStand ===="
+          $pystandUrl = "https://github.com/skywind3000/PyStand/releases/download/1.1.4/PyStand-v1.1.4-exe.zip"
+          $pystandZip = "./dep_build/PyStand.zip"
+          Invoke-WebRequest -Uri $pystandUrl -OutFile $pystandZip
+          Expand-Archive -Path $pystandZip -DestinationPath "./dep_build/PyStand" -Force
+
+          Write-Host "==== 复制 PyStand.exe 到 build 并重命名 ===="
+          $pystandExe = "./dep_build/PyStand/PyStand-x64-CLI/PyStand.exe"
+          $destExe = "./build/paper_agent.exe"
+          if (Test-Path $pystandExe) {
+              Copy-Item -Path $pystandExe -Destination $destExe -Force
+          } else {
+              Write-Host "错误: PyStand.exe 未找到！"
+              exit 1
+          }
+          Write-Host "==== 创建 Python venv 在 dep_build ===="
+          uv venv ./dep_build/venv
+
+          ./dep_build/venv/Scripts/activate
+
+          Write-Host "==== 在 venv 环境中安装项目依赖 ===="
+          uv pip install .
+
+          Write-Host "==== 复制 venv/Lib/site-packages 到 build/ ===="
+          Copy-Item -Path "./dep_build/venv/Lib/site-packages" -Destination "./build/site-packages" -Recurse -Force
+
+          Write-Host "==== 复制 script/_pystand_static.int 到 build/ ===="
+          $staticFile = "./script/_pystand_static.int"
+          $destStatic = "./build/_pystand_static.int"
+          if (Test-Path $staticFile) {
+              Copy-Item -Path $staticFile -Destination $destStatic -Force
+          } else {
+              Write-Host "错误: script/_pystand_static.int 未找到！"
+              exit 1
+          }
+
+          uv run --active babeldoc --generate-offline-assets ./build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: win64-exe
+          path: ./build
+          if-no-files-found: error
+          compression-level: 9
+          include-hidden-files: true
+
+  test-win64-exe:
+    needs: 
+      - build-win64-exe
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v6
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: win64-exe
+          path: ./build
+
+      - name: Test show version
+        run: |
+          ./build/paper_agent.exe --version
+      
+      - name: Test - Translate a PDF file with plain text only
+        run: |
+          ./build/paper_agent.exe ./test/file/translate.cli.plain.text.pdf -o ./test/file
+
+      - name: Test - Translate a PDF file figure
+        run: |
+          ./build/paper_agent.exe ./test/file/translate.cli.text.with.figure.pdf -o ./test/file
+
+      - name: Delete offline assets and cache
+        shell: pwsh
+        run: |
+          Write-Host "==== 查找并删除离线资源包 ===="
+          $offlineAssetsPath = Get-ChildItem -Path "./build" -Filter "offline_assets_*.zip" -Recurse | Select-Object -First 1 -ExpandProperty FullName
+          if ($offlineAssetsPath) {
+            Write-Host "找到离线资源包: $offlineAssetsPath"
+            Remove-Item -Path $offlineAssetsPath -Force
+            Write-Host "已删除离线资源包"
+          } else {
+            Write-Host "未找到离线资源包"
+          }
+          
+          Write-Host "==== 删除缓存目录 ===="
+          $cachePath = "$env:USERPROFILE/.cache/babeldoc"
+          if (Test-Path $cachePath) {
+            Remove-Item -Path $cachePath -Recurse -Force
+            Write-Host "已删除缓存目录: $cachePath"
+          } else {
+            Write-Host "缓存目录不存在: $cachePath"
+          }
+
+      - name: Test - Translate without offline assets
+        run: |
+          ./build/paper_agent.exe ./test/file/translate.cli.plain.text.pdf -o ./test/file
+          
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: ./test/file/
+
+  

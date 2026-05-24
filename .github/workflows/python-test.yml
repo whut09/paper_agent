@@ -1,0 +1,95 @@
+name: Test and Build Python Package
+
+on:
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    if: >-
+      !startsWith(github.event.pull_request.title, 'doc:') &&
+      !startsWith(github.event.pull_request.title, 'doc(')
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+    steps:
+      - name: checkout babeldoc metadata
+        uses: actions/checkout@v6
+        with:
+          repository: funstory-ai/BabelDOC
+          path: babeldoctemp1234567
+          token: ${{ secrets.GITHUB_TOKEN }}
+          sparse-checkout: babeldoc/assets/embedding_assets_metadata.py
+      - name: Cached Assets
+        id: cache-assets
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/babeldoc
+          key: test-1-babeldoc-assets-${{ hashFiles('babeldoctemp1234567/babeldoc/assets/embedding_assets_metadata.py') }}
+      - uses: actions/checkout@v6
+      - name: Setup uv with Python ${{ matrix.python-version }}
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+      - name: Cache apt packages
+        if: runner.os == 'Linux'
+        id: cache-apt
+        uses: actions/cache@v5
+        with:
+          path: ~/apt-cache
+          key: apt-libreoffice-${{ matrix.runner }}
+
+      - name: Install system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          if [ -d ~/apt-cache ] && [ "$(ls -A ~/apt-cache 2>/dev/null)" ]; then
+            echo "Restoring cached apt packages..."
+            sudo cp ~/apt-cache/*.deb /var/cache/apt/archives/ 2>/dev/null || true
+          fi
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libreoffice-core libreoffice-writer
+          mkdir -p ~/apt-cache
+          cp /var/cache/apt/archives/*.deb ~/apt-cache/ 2>/dev/null || true
+
+      - name: Install dependencies
+        run: |
+          uv sync
+
+      - name: Test - Unit Test
+        run: |
+          uv run pytest .
+
+      - name: Test - Translate a PDF file with plain text only
+        run: uv run paper_agent ./test/file/translate.cli.plain.text.pdf -o ./test/file
+
+      - name: Test - Translate a PDF file figure
+        run: uv run paper_agent ./test/file/translate.cli.text.with.figure.pdf -o ./test/file
+
+      # - name: Test - Translate a PDF file with unknown font
+      #   run:
+      #     paper_agent ./test/file/translate.cli.font.unknown.pdf
+
+      - name: Test - Start GUI and exit
+        run: timeout 10 uv run paper_agent -i  || code=$?; if [[ $code -ne 124 && $code -ne 0 ]]; then exit $code; fi
+
+      - name: Build as a package
+        run: uv build
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results-${{ matrix.python-version }}-${{ matrix.runner }}
+          path: ./test/file/
+          retention-days: 7
