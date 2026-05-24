@@ -1,0 +1,89 @@
+<svg width="960" height="460" viewBox="0 0 960 460" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">PaperAgent workflow demo</title>
+  <desc id="desc">Animated workflow showing a paper being parsed, summarized by a model, and exported to Word.</desc>
+  <style>
+    .bg { fill: #f6f8fb; }
+    .panel { fill: #ffffff; stroke: #d7dee9; stroke-width: 1.5; }
+    .muted { fill: #667085; font-family: "Segoe UI", Arial, sans-serif; font-size: 15px; }
+    .title { fill: #182230; font-family: "Segoe UI", Arial, sans-serif; font-weight: 700; font-size: 24px; }
+    .label { fill: #344054; font-family: "Segoe UI", Arial, sans-serif; font-weight: 600; font-size: 16px; }
+    .small { fill: #667085; font-family: "Segoe UI", Arial, sans-serif; font-size: 13px; }
+    .accent { fill: #2563eb; }
+    .green { fill: #12b76a; }
+    .orange { fill: #f79009; }
+    .line { stroke: #98a2b3; stroke-width: 3; stroke-linecap: round; stroke-dasharray: 9 10; }
+    .flow { stroke: #2563eb; stroke-width: 4; stroke-linecap: round; stroke-dasharray: 1 850; animation: dash 5.8s ease-in-out infinite; }
+    .scan { fill: #2563eb; opacity: .22; animation: scan 5.8s ease-in-out infinite; }
+    .pulse { animation: pulse 5.8s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+    .fade1 { animation: fade 5.8s ease-in-out infinite; animation-delay: 0s; }
+    .fade2 { animation: fade 5.8s ease-in-out infinite; animation-delay: .7s; }
+    .fade3 { animation: fade 5.8s ease-in-out infinite; animation-delay: 1.4s; }
+    .fade4 { animation: fade 5.8s ease-in-out infinite; animation-delay: 2.1s; }
+    @keyframes dash {
+      0% { stroke-dasharray: 1 850; }
+      55% { stroke-dasharray: 850 1; }
+      100% { stroke-dasharray: 850 1; }
+    }
+    @keyframes scan {
+      0%, 12% { transform: translateY(0); opacity: .05; }
+      35% { transform: translateY(118px); opacity: .24; }
+      55%, 100% { transform: translateY(118px); opacity: .05; }
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      45% { transform: scale(1.05); opacity: .9; }
+    }
+    @keyframes fade {
+      0%, 15% { opacity: .25; transform: translateY(8px); }
+      30%, 80% { opacity: 1; transform: translateY(0); }
+      100% { opacity: .25; transform: translateY(8px); }
+    }
+  </style>
+
+  <rect class="bg" width="960" height="460" rx="18"/>
+  <text x="40" y="48" class="title">PaperAgent 论文总结流程</text>
+  <text x="40" y="75" class="muted">输入论文链接或文件，自动解析正文与图表，调用大模型生成 Word 总结。</text>
+
+  <path class="line" d="M250 240 H360 C390 240 390 175 420 175 H498"/>
+  <path class="line" d="M250 240 H360 C390 240 390 305 420 305 H498"/>
+  <path class="line" d="M615 175 H692 C720 175 720 240 748 240"/>
+  <path class="line" d="M615 305 H692 C720 305 720 240 748 240"/>
+  <path class="flow" d="M250 240 H360 C390 240 390 175 420 175 H498 M615 175 H692 C720 175 720 240 748 240"/>
+
+  <g class="fade1">
+    <rect x="40" y="126" width="210" height="228" rx="12" class="panel"/>
+    <text x="68" y="164" class="label">论文输入</text>
+    <rect x="72" y="190" width="88" height="116" rx="8" fill="#eff4ff" stroke="#b2ccff"/>
+    <path d="M92 216 H139 M92 238 H138 M92 260 H127 M92 282 H145" stroke="#2563eb" stroke-width="5" stroke-linecap="round"/>
+    <rect x="92" y="204" width="48" height="72" class="scan"/>
+    <text x="68" y="333" class="small">PDF / DOCX / arXiv 链接</text>
+  </g>
+
+  <g class="fade2">
+    <rect x="498" y="110" width="118" height="130" rx="12" class="panel"/>
+    <circle cx="557" cy="150" r="22" class="accent pulse"/>
+    <path d="M545 150 H569 M557 138 V162" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+    <text x="525" y="199" class="label">解析</text>
+    <text x="518" y="220" class="small">正文 / 图表</text>
+  </g>
+
+  <g class="fade3">
+    <rect x="498" y="260" width="118" height="130" rx="12" class="panel"/>
+    <circle cx="557" cy="300" r="22" class="orange pulse"/>
+    <path d="M544 303 C552 290 562 290 570 303" stroke="#fff" stroke-width="4" stroke-linecap="round"/>
+    <text x="524" y="349" class="label">模型</text>
+    <text x="520" y="370" class="small">分块总结</text>
+  </g>
+
+  <g class="fade4">
+    <rect x="748" y="126" width="172" height="228" rx="12" class="panel"/>
+    <text x="782" y="164" class="label">Word 总结</text>
+    <rect x="792" y="192" width="86" height="108" rx="8" fill="#ecfdf3" stroke="#75e0a7"/>
+    <rect x="808" y="212" width="54" height="8" rx="4" class="green"/>
+    <rect x="808" y="234" width="44" height="6" rx="3" fill="#98a2b3"/>
+    <rect x="808" y="250" width="52" height="6" rx="3" fill="#98a2b3"/>
+    <rect x="808" y="266" width="34" height="6" rx="3" fill="#98a2b3"/>
+    <path d="M804 320 L824 340 L866 300" stroke="#12b76a" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="778" y="333" class="small">可下载、可编辑、可归档</text>
+  </g>
+</svg>
