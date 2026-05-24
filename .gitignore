@@ -4,6 +4,7 @@ paper_agent/kernel/PaperAgent-next.git/*.csv
 paper_agent/kernel/PaperAgent-next.git/*.pdf
 
 # PDF Files
+.codex
 config.local.json
 paper_agent_files
 gui/paper_agent_files
