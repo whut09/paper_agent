@@ -253,7 +253,7 @@ demo_recaptcha = """
 
 tech_details_string = f"""
                     <summary>技术细节</summary>
-                    - GUI: PDF论文总结助手<br>
+                    - GUI: 论文总结助手<br>
                     - 版本: {__version__}
                 """
 cancellation_event_map = {}
@@ -261,7 +261,7 @@ cancellation_event_map = {}
 
 # The following code creates the GUI
 with gr.Blocks(
-    title="PDF论文总结助手",
+    title="论文总结助手",
     theme=gr.themes.Default(
         primary_hue=custom_blue, spacing_size="md", radius_size="lg"
     ),

@@ -1,6 +1,6 @@
 <svg width="960" height="560" viewBox="0 0 960 560" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">PaperAgent web UI demo</title>
-  <desc id="desc">Animated browser UI showing a file input, paper processing, and a Word summary result.</desc>
+  <desc id="desc">Animated browser UI showing paper input and a readable Word summary result.</desc>
   <style>
     .page { fill: #eef2f7; }
     .browser { fill: #fff; stroke: #d0d5dd; stroke-width: 1.5; }
@@ -12,12 +12,12 @@
     .h { fill: #182230; font: 700 22px "Segoe UI", Arial, sans-serif; }
     .label { fill: #344054; font: 700 15px "Segoe UI", Arial, sans-serif; }
     .small { fill: #667085; font: 13px "Segoe UI", Arial, sans-serif; }
+    .tiny { fill: #475467; font: 11px "Segoe UI", Arial, sans-serif; }
     .panel { fill: #fff; stroke: #d7dee9; stroke-width: 1.4; }
     .input { fill: #f8fbff; stroke: #84adff; stroke-width: 1.6; stroke-dasharray: 6 7; }
     .btn { fill: #165dff; }
     .btn2 { fill: #eef4ff; stroke: #b2ccff; }
     .white { fill: #fff; font: 700 14px "Segoe UI", Arial, sans-serif; }
-    .blue { fill: #165dff; }
     .green { fill: #12b76a; }
     .line { fill: #d0d5dd; }
     .scan { fill: #165dff; opacity: .12; animation: scan 5.8s ease-in-out infinite; }
@@ -64,22 +64,22 @@
   <rect x="156" y="55" width="356" height="26" rx="13" fill="#fff" stroke="#d0d5dd"/>
   <text x="174" y="73" class="url">http://localhost:7860/</text>
 
-  <text x="74" y="134" class="h">PDF 论文总结助手</text>
-  <text x="74" y="160" class="small">上传文件或输入论文链接，生成可下载的 Word 总结。</text>
+  <text x="74" y="134" class="h">&#x8BBA;&#x6587;&#x603B;&#x7ED3;&#x52A9;&#x624B;</text>
+  <text x="74" y="160" class="small">&#x4E0A;&#x4F20;&#x8BBA;&#x6587;&#x6216;&#x7C98;&#x8D34;&#x94FE;&#x63A5;&#xFF0C;&#x751F;&#x6210;&#x53EF;&#x4E0B;&#x8F7D;&#x7684; Word &#x603B;&#x7ED3;&#x3002;</text>
 
   <rect x="72" y="188" width="275" height="276" rx="14" class="panel"/>
-  <text x="96" y="224" class="label">文件输入</text>
+  <text x="96" y="224" class="label">&#x8F93;&#x5165;&#x8BBA;&#x6587;</text>
   <rect x="96" y="246" width="226" height="104" rx="12" class="input"/>
   <path d="M185 286 h49 m-25 -25 v50" stroke="#165dff" stroke-width="6" stroke-linecap="round"/>
-  <text x="132" y="330" class="small">拖入 PDF / DOCX 或粘贴链接</text>
+  <text x="132" y="330" class="small">&#x62D6;&#x5165; PDF / DOCX &#x6216;&#x7C98;&#x8D34;&#x94FE;&#x63A5;</text>
   <rect x="96" y="374" width="136" height="42" rx="9" class="btn pulse"/>
-  <text x="122" y="401" class="white">生成论文总结</text>
+  <text x="132" y="401" class="white">&#x751F;&#x6210;&#x603B;&#x7ED3;</text>
   <rect x="244" y="374" width="78" height="42" rx="9" class="btn2"/>
-  <text x="269" y="401" class="small">取消</text>
+  <text x="269" y="401" class="small">&#x53D6;&#x6D88;</text>
   <path class="cursor" d="M0 0 L0 32 L9 24 L16 39 L24 35 L17 21 L29 21 Z" transform="translate(96 374)"/>
 
   <rect x="382" y="188" width="214" height="276" rx="14" class="panel"/>
-  <text x="408" y="224" class="label">处理中</text>
+  <text x="408" y="224" class="label">&#x5904;&#x7406;&#x4E2D;</text>
   <rect x="414" y="250" width="150" height="10" rx="5" class="line"/>
   <rect x="414" y="250" width="150" height="10" rx="5" class="progress"/>
   <rect x="418" y="286" width="140" height="112" rx="10" fill="#f8fbff" stroke="#d7dee9"/>
@@ -90,22 +90,25 @@
   <rect x="426" y="296" width="124" height="38" rx="8" class="scan"/>
   <g class="fade-in">
     <circle cx="452" cy="426" r="8" class="green"/>
-    <text x="468" y="431" class="small">正文、图表、公式已提取</text>
+    <text x="468" y="431" class="small">&#x6B63;&#x6587;&#x3001;&#x56FE;&#x8868;&#x548C;&#x516C;&#x5F0F;&#x5DF2;&#x63D0;&#x53D6;</text>
   </g>
 
   <rect x="632" y="188" width="256" height="276" rx="14" class="panel"/>
-  <text x="658" y="224" class="label">输出结果</text>
+  <text x="658" y="224" class="label">&#x8F93;&#x51FA;&#x7ED3;&#x679C;</text>
   <g class="word">
-    <rect x="684" y="250" width="142" height="166" rx="12" fill="#ffffff" stroke="#75e0a7" stroke-width="1.6"/>
-    <rect x="684" y="250" width="142" height="34" rx="12" fill="#ecfdf3"/>
-    <text x="704" y="272" fill="#027a48" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="800">WORD</text>
-    <rect x="704" y="306" width="82" height="8" rx="4" class="green"/>
-    <rect x="704" y="330" width="102" height="7" rx="3.5" class="line"/>
-    <rect x="704" y="350" width="86" height="7" rx="3.5" class="line"/>
-    <rect x="704" y="370" width="108" height="7" rx="3.5" class="line"/>
-    <rect x="704" y="392" width="58" height="7" rx="3.5" class="line"/>
-    <circle cx="826" cy="414" r="22" class="green"/>
-    <path d="M815 414 l7 7 l16 -18" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="662" y="246" width="196" height="188" rx="12" fill="#ffffff" stroke="#75e0a7" stroke-width="1.6"/>
+    <rect x="662" y="246" width="196" height="32" rx="12" fill="#ecfdf3"/>
+    <text x="680" y="268" fill="#027a48" font-family="Segoe UI, Arial, sans-serif" font-size="13" font-weight="800">WORD &#x603B;&#x7ED3;&#x6587;&#x6863;</text>
+    <text x="680" y="304" class="tiny">&#x6807;&#x9898;&#xFF1A;&#x89C6;&#x89C9;&#x8BED;&#x8A00;&#x6A21;&#x578B;&#x7EFC;&#x8FF0;</text>
+    <text x="680" y="326" class="tiny">&#x4E00;&#x53E5;&#x8BDD;&#x603B;&#x7ED3;</text>
+    <rect x="680" y="336" width="146" height="6" rx="3" class="line"/>
+    <rect x="680" y="350" width="126" height="6" rx="3" class="line"/>
+    <text x="680" y="378" class="tiny">&#x4E3B;&#x8981;&#x53D1;&#x73B0;</text>
+    <rect x="680" y="388" width="158" height="6" rx="3" class="line"/>
+    <rect x="680" y="402" width="116" height="6" rx="3" class="line"/>
+    <rect x="680" y="416" width="92" height="6" rx="3" class="line"/>
+    <circle cx="846" cy="426" r="20" class="green"/>
+    <path d="M836 426 l7 7 l15 -17" stroke="#fff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"/>
   </g>
-  <text x="668" y="446" class="small">页面显示 Word 效果，并提供 docx 下载</text>
+  <text x="668" y="456" class="small">&#x8BFB;&#x8005;&#x53EF;&#x4EE5;&#x76F4;&#x63A5;&#x770B;&#x5230;&#x7FFB;&#x8BD1;&#x540E;&#x7684; Word &#x6587;&#x6863;&#x6548;&#x679C;&#x3002;</text>
 </svg>
