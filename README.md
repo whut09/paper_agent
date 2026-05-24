@@ -6,6 +6,14 @@ PaperAgent 是一个面向论文阅读的本地工具。它可以读取 PDF、DO
   <img src="./assets/demo.svg" width="900" alt="PaperAgent 论文总结流程动画">
 </p>
 
+## 网页端效果
+
+启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。
+
+<p align="center">
+  <img src="./assets/web-demo.svg" width="900" alt="PaperAgent 网页端从输入论文到输出 Word 总结的动画">
+</p>
+
 ## 功能特点
 
 - 支持上传本地 PDF、DOC、DOCX，也支持输入论文链接。

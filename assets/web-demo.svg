@@ -1,0 +1,111 @@
+<svg width="960" height="560" viewBox="0 0 960 560" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">PaperAgent web UI demo</title>
+  <desc id="desc">Animated browser UI showing a file input, paper processing, and a Word summary result.</desc>
+  <style>
+    .page { fill: #eef2f7; }
+    .browser { fill: #fff; stroke: #d0d5dd; stroke-width: 1.5; }
+    .bar { fill: #f2f4f7; }
+    .dot-r { fill: #f97066; }
+    .dot-y { fill: #fdb022; }
+    .dot-g { fill: #32d583; }
+    .url { fill: #667085; font: 14px "Segoe UI", Arial, sans-serif; }
+    .h { fill: #182230; font: 700 22px "Segoe UI", Arial, sans-serif; }
+    .label { fill: #344054; font: 700 15px "Segoe UI", Arial, sans-serif; }
+    .small { fill: #667085; font: 13px "Segoe UI", Arial, sans-serif; }
+    .panel { fill: #fff; stroke: #d7dee9; stroke-width: 1.4; }
+    .input { fill: #f8fbff; stroke: #84adff; stroke-width: 1.6; stroke-dasharray: 6 7; }
+    .btn { fill: #165dff; }
+    .btn2 { fill: #eef4ff; stroke: #b2ccff; }
+    .white { fill: #fff; font: 700 14px "Segoe UI", Arial, sans-serif; }
+    .blue { fill: #165dff; }
+    .green { fill: #12b76a; }
+    .line { fill: #d0d5dd; }
+    .scan { fill: #165dff; opacity: .12; animation: scan 5.8s ease-in-out infinite; }
+    .cursor { fill: #165dff; animation: cursor 5.8s ease-in-out infinite; }
+    .progress { fill: #165dff; transform-origin: left center; animation: progress 5.8s ease-in-out infinite; }
+    .fade-in { animation: appear 5.8s ease-in-out infinite; }
+    .word { animation: wordIn 5.8s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+    .pulse { animation: pulse 5.8s ease-in-out infinite; transform-origin: center; transform-box: fill-box; }
+    @keyframes scan {
+      0%, 14% { transform: translateY(0); opacity: .04; }
+      38% { transform: translateY(96px); opacity: .18; }
+      55%, 100% { transform: translateY(96px); opacity: .04; }
+    }
+    @keyframes cursor {
+      0%, 10% { transform: translate(0, 0); opacity: 0; }
+      18%, 28% { transform: translate(98px, 54px); opacity: 1; }
+      35%, 100% { transform: translate(98px, 54px); opacity: 0; }
+    }
+    @keyframes progress {
+      0%, 25% { transform: scaleX(.04); opacity: .45; }
+      55% { transform: scaleX(.72); opacity: 1; }
+      76%, 100% { transform: scaleX(1); opacity: 1; }
+    }
+    @keyframes appear {
+      0%, 45% { opacity: .2; transform: translateY(10px); }
+      62%, 100% { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes wordIn {
+      0%, 58% { opacity: 0; transform: translateX(36px) scale(.96); }
+      76%, 100% { opacity: 1; transform: translateX(0) scale(1); }
+    }
+    @keyframes pulse {
+      0%, 100% { transform: scale(1); }
+      45% { transform: scale(1.04); }
+    }
+  </style>
+
+  <rect class="page" width="960" height="560" rx="24"/>
+  <rect x="42" y="42" width="876" height="476" rx="18" class="browser"/>
+  <rect x="42" y="42" width="876" height="52" rx="18" class="bar"/>
+  <circle cx="72" cy="68" r="7" class="dot-r"/>
+  <circle cx="96" cy="68" r="7" class="dot-y"/>
+  <circle cx="120" cy="68" r="7" class="dot-g"/>
+  <rect x="156" y="55" width="356" height="26" rx="13" fill="#fff" stroke="#d0d5dd"/>
+  <text x="174" y="73" class="url">http://localhost:7860/</text>
+
+  <text x="74" y="134" class="h">PDF 论文总结助手</text>
+  <text x="74" y="160" class="small">上传文件或输入论文链接，生成可下载的 Word 总结。</text>
+
+  <rect x="72" y="188" width="275" height="276" rx="14" class="panel"/>
+  <text x="96" y="224" class="label">文件输入</text>
+  <rect x="96" y="246" width="226" height="104" rx="12" class="input"/>
+  <path d="M185 286 h49 m-25 -25 v50" stroke="#165dff" stroke-width="6" stroke-linecap="round"/>
+  <text x="132" y="330" class="small">拖入 PDF / DOCX 或粘贴链接</text>
+  <rect x="96" y="374" width="136" height="42" rx="9" class="btn pulse"/>
+  <text x="122" y="401" class="white">生成论文总结</text>
+  <rect x="244" y="374" width="78" height="42" rx="9" class="btn2"/>
+  <text x="269" y="401" class="small">取消</text>
+  <path class="cursor" d="M0 0 L0 32 L9 24 L16 39 L24 35 L17 21 L29 21 Z" transform="translate(96 374)"/>
+
+  <rect x="382" y="188" width="214" height="276" rx="14" class="panel"/>
+  <text x="408" y="224" class="label">处理中</text>
+  <rect x="414" y="250" width="150" height="10" rx="5" class="line"/>
+  <rect x="414" y="250" width="150" height="10" rx="5" class="progress"/>
+  <rect x="418" y="286" width="140" height="112" rx="10" fill="#f8fbff" stroke="#d7dee9"/>
+  <rect x="434" y="304" width="108" height="7" rx="3.5" class="line"/>
+  <rect x="434" y="324" width="88" height="7" rx="3.5" class="line"/>
+  <rect x="434" y="344" width="102" height="7" rx="3.5" class="line"/>
+  <rect x="434" y="364" width="72" height="7" rx="3.5" class="line"/>
+  <rect x="426" y="296" width="124" height="38" rx="8" class="scan"/>
+  <g class="fade-in">
+    <circle cx="452" cy="426" r="8" class="green"/>
+    <text x="468" y="431" class="small">正文、图表、公式已提取</text>
+  </g>
+
+  <rect x="632" y="188" width="256" height="276" rx="14" class="panel"/>
+  <text x="658" y="224" class="label">输出结果</text>
+  <g class="word">
+    <rect x="684" y="250" width="142" height="166" rx="12" fill="#ffffff" stroke="#75e0a7" stroke-width="1.6"/>
+    <rect x="684" y="250" width="142" height="34" rx="12" fill="#ecfdf3"/>
+    <text x="704" y="272" fill="#027a48" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="800">WORD</text>
+    <rect x="704" y="306" width="82" height="8" rx="4" class="green"/>
+    <rect x="704" y="330" width="102" height="7" rx="3.5" class="line"/>
+    <rect x="704" y="350" width="86" height="7" rx="3.5" class="line"/>
+    <rect x="704" y="370" width="108" height="7" rx="3.5" class="line"/>
+    <rect x="704" y="392" width="58" height="7" rx="3.5" class="line"/>
+    <circle cx="826" cy="414" r="22" class="green"/>
+    <path d="M815 414 l7 7 l16 -18" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="668" y="446" class="small">页面显示 Word 效果，并提供 docx 下载</text>
+</svg>
