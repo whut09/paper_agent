@@ -196,7 +196,6 @@ def summarize_file(
         preview_path,
         gr.update(visible=True),
         gr.update(visible=True),
-        gr.update(value=word_result_html(str(docx_path)), visible=True),
     )
 
 
@@ -239,177 +238,6 @@ custom_css = """
         width: 100%;
     }
 
-    .pa-flow {
-        display: flex;
-        align-items: center;
-        gap: 14px;
-        padding: 18px;
-        margin: 10px 0 14px;
-        border: 1px solid #d7dee9;
-        border-radius: 12px;
-        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-        box-shadow: 0 8px 26px rgba(16, 24, 40, 0.06);
-    }
-
-    .pa-step {
-        flex: 1;
-        min-width: 0;
-        padding: 14px;
-        border-radius: 10px;
-        background: #ffffff;
-        border: 1px solid #e4e7ec;
-        text-align: center;
-    }
-
-    .pa-icon {
-        display: inline-flex;
-        align-items: center;
-        justify-content: center;
-        width: 58px;
-        height: 58px;
-        margin-bottom: 10px;
-        border-radius: 14px;
-        color: #ffffff;
-        font-weight: 800;
-        background: #165dff;
-    }
-
-    .pa-step-title {
-        color: #182230;
-        font-weight: 700;
-        font-size: 15px;
-    }
-
-    .pa-step-note {
-        color: #667085;
-        font-size: 12px;
-        margin-top: 4px;
-    }
-
-    .pa-arrow {
-        width: 54px;
-        height: 3px;
-        border-radius: 999px;
-        background: linear-gradient(90deg, #165dff 0%, #12b76a 100%);
-        position: relative;
-        overflow: hidden;
-    }
-
-    .pa-arrow::after {
-        content: "";
-        position: absolute;
-        inset: 0;
-        width: 24px;
-        background: rgba(255, 255, 255, .75);
-        animation: paMove 1.2s infinite;
-    }
-
-    .pa-running .pa-step {
-        animation: paPulse 1.8s infinite;
-    }
-
-    .pa-running .pa-parse { animation-delay: .25s; }
-    .pa-running .pa-word { animation-delay: .5s; }
-
-    .pa-word-preview {
-        width: 190px;
-        min-height: 150px;
-        border-radius: 12px;
-        border: 1px solid #b7e4c7;
-        background: #ffffff;
-        padding: 14px;
-        position: relative;
-        box-shadow: inset 0 0 0 4px #ecfdf3;
-    }
-
-    .pa-word-head {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        margin-bottom: 16px;
-    }
-
-    .pa-word-badge {
-        padding: 4px 7px;
-        border-radius: 6px;
-        background: #12b76a;
-        color: white;
-        font-weight: 800;
-        font-size: 11px;
-    }
-
-    .pa-word-name {
-        color: #344054;
-        font-weight: 700;
-        font-size: 12px;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
-    }
-
-    .pa-word-line {
-        height: 8px;
-        width: 72%;
-        margin: 9px 0;
-        border-radius: 999px;
-        background: #d0d5dd;
-    }
-
-    .pa-word-line.pa-wide { width: 92%; }
-    .pa-word-line.pa-short { width: 48%; }
-
-    .pa-word-block {
-        height: 34px;
-        width: 84%;
-        margin-top: 14px;
-        border-radius: 8px;
-        background: #ecfdf3;
-        border: 1px solid #75e0a7;
-    }
-
-    .pa-check {
-        position: absolute;
-        right: -12px;
-        bottom: -12px;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 42px;
-        height: 42px;
-        border-radius: 50%;
-        background: #12b76a;
-        color: white;
-        font-size: 28px;
-        font-weight: 900;
-    }
-
-    .pa-result-title {
-        color: #182230;
-        font-weight: 800;
-        font-size: 18px;
-        margin-bottom: 8px;
-    }
-
-    .pa-result-note {
-        color: #667085;
-        font-size: 14px;
-    }
-
-    @keyframes paMove {
-        from { transform: translateX(-28px); }
-        to { transform: translateX(58px); }
-    }
-
-    @keyframes paPulse {
-        0%, 100% { transform: translateY(0); border-color: #e4e7ec; }
-        50% { transform: translateY(-5px); border-color: #165dff; }
-    }
-
-    @media (max-width: 760px) {
-        .pa-flow { flex-direction: column; align-items: stretch; }
-        .pa-arrow { width: 3px; height: 36px; margin: 0 auto; }
-    }
-
     """
 
 demo_recaptcha = """
@@ -429,55 +257,6 @@ tech_details_string = f"""
                     - 版本: {__version__}
                 """
 cancellation_event_map = {}
-
-PROCESSING_ANIMATION_HTML = """
-<div class="pa-flow pa-running">
-  <div class="pa-step">
-    <div class="pa-icon">PDF</div>
-    <div class="pa-step-title">输入论文</div>
-    <div class="pa-step-note">文件或链接</div>
-  </div>
-  <div class="pa-arrow"></div>
-  <div class="pa-step pa-parse">
-    <div class="pa-icon">AI</div>
-    <div class="pa-step-title">解析内容</div>
-    <div class="pa-step-note">正文 / 图表 / 公式</div>
-  </div>
-  <div class="pa-arrow"></div>
-  <div class="pa-step pa-word">
-    <div class="pa-icon">DOCX</div>
-    <div class="pa-step-title">生成 Word</div>
-    <div class="pa-step-note">正在整理总结...</div>
-  </div>
-</div>
-"""
-
-
-def word_result_html(docx_path: str) -> str:
-    filename = os.path.basename(docx_path) if docx_path else "paper-summary.docx"
-    return f"""
-<div class="pa-flow pa-done">
-  <div class="pa-word-preview">
-    <div class="pa-word-head">
-      <span class="pa-word-badge">WORD</span>
-      <span class="pa-word-name">{filename}</span>
-    </div>
-    <div class="pa-word-line pa-wide"></div>
-    <div class="pa-word-line"></div>
-    <div class="pa-word-line pa-short"></div>
-    <div class="pa-word-block"></div>
-    <div class="pa-check">✓</div>
-  </div>
-  <div>
-    <div class="pa-result-title">论文总结已生成</div>
-    <div class="pa-result-note">下载组件中可以获取 Word 文档。</div>
-  </div>
-</div>
-"""
-
-
-def show_processing_animation():
-    return gr.update(value=PROCESSING_ANIMATION_HTML, visible=True)
 
 
 # The following code creates the GUI
@@ -545,7 +324,6 @@ with gr.Blocks(
             output_file_mono = gr.File(
                 label="下载 Word 总结文档", visible=False
             )
-            result_animation = gr.HTML(visible=False)
             recaptcha_response = gr.Textbox(
                 label="reCAPTCHA响应", elem_id="verify", visible=False
             )
@@ -612,9 +390,6 @@ with gr.Blocks(
     state = gr.State({"session_id": None})
 
     summary_btn.click(
-        show_processing_animation,
-        outputs=[result_animation],
-    ).then(
         summarize_file,
         inputs=[
             file_type,
@@ -631,7 +406,6 @@ with gr.Blocks(
             preview,
             output_file_mono,
             output_title,
-            result_animation,
         ],
     ).then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
 
