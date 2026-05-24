@@ -60,7 +60,7 @@ def verify_recaptcha(response):
     return result.get("success")
 
 
-def download_with_limit(url: str, save_path: str, size_limit: int) -> str:
+def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> str:
     """
     This function downloads a file from a URL and saves it to a specified path.
 
@@ -89,7 +89,7 @@ def download_with_limit(url: str, save_path: str, size_limit: int) -> str:
                 if size_limit and total_size > size_limit:
                     raise gr.Error("Exceeds file size limit")
                 file.write(chunk)
-    return save_path / filename
+    return str(save_path / filename)
 
 
 def stop_summary_file(state: dict) -> None:
@@ -190,9 +190,9 @@ def summarize_file(
         cancellation_event_map.pop(session_id, None)
         state["session_id"] = None
 
-    preview_path = file_path if str(file_path).lower().endswith(".pdf") else None
+    preview_path = str(file_path) if str(file_path).lower().endswith(".pdf") else None
     return (
-        docx_path,
+        str(docx_path),
         preview_path,
         gr.update(visible=True),
         gr.update(visible=True),
