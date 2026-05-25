@@ -26,6 +26,7 @@ DEFAULT_MAX_ASSETS = 13
 DEFAULT_FIGURE_ASSET_LIMIT = 5
 DEFAULT_TABLE_ASSET_LIMIT = 4
 DEFAULT_FORMULA_ASSET_LIMIT = 4
+DOCX_FONT = "Microsoft YaHei"
 
 
 DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精读笔记助手。
@@ -38,8 +39,8 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 3. 中文笔记：除模型名、数据集名、指标名、论文术语、代码库名等稳定专有名词外，不要夹杂整句英文。
 4. 不要把正文写成全篇 bullet list。只有 `## 核心信息` 使用 `- 字段名: 值`；其他章节优先使用自然段和 `###` 小标题。
 5. 图表占位符优先：把重要图、表截图放在对应解释段落附近，使用 `[[ASSET:编号]]` 独占一行表示截图位置；不要创建独立“图表精读”章节，也不要把截图集中放到文末。
-6. `ASSET` 编号只是程序内部占位符，不是最终 Word 中的图、表、公式编号。正文不要写“公式 12”这类内部编号；最终 Word 会按“图 1、表 1、公式 1”独立编号。
-7. 保留原图表编号：解释图表时尽量保留 Fig. 1、Table 2 等原始编号；如果无法确定编号，说明它来自第几页的截图。
+6. `ASSET` 编号只是程序内部占位符，不是最终 Word 中的图、表、公式编号。正文不要把 `ASSET` 编号写成“公式 2”这类引用；必须使用可用图表截图里给出的“最终引用标签”。
+7. 保留原图表和公式编号：解释图、表、公式时尽量保留 Fig. 1、Table 2、Equation 8、(8) 等原始编号；如果无法确定编号，说明它来自第几页的截图。
 8. 不要输出思考过程，不要输出 `<think>`、`<thinking>`、代码块、HTML、JSON。
 9. 关键公式必须解读。优先使用“TexTeller 公式识别结果”中的 LaTeX；如果没有识别结果，可以重写 1 到 3 个最核心公式的可读文本形式，例如 `Δvision = Ctext / Cvision`；如果公式抽取不可靠，使用可用的公式截图占位符并解释含义。
 10. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
@@ -51,6 +52,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 输出必须是 Markdown，结构如下，可根据论文内容增加必要的 `###` 小节；没有原文证据的字段、章节或小节可以直接省略：
 
 # 论文标题
+标题要比原论文标题更适合中文读者阅读和传播，可以使用“研究对象 | 关键发现/核心结果/开放信息”的形式，也可以使用有张力的问题句；但标题中的机构、模型名、对比对象、数字和结论必须来自原文证据，原文没有提及的不要写。
 
 ## 核心信息
 只输出原文明确出现的字段；没有出现的字段不要写。
@@ -100,7 +102,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 图表占位符规则：
 - 只能使用“可用图表截图”中列出的 `[[ASSET:编号]]`。
 - 每个占位符必须独占一行。
-- 占位符要放在解释该图/表/公式的段落旁边，并且解释段落正文必须显式写出“如图2所示”“如表1所示”“如公式1所示”这类引用字样。
+- 占位符要放在解释该图/表/公式的段落旁边，并且解释段落正文必须使用“最终引用标签”写出“如图2所示”“如表1所示”“如公式8所示”这类引用字样，不能自行改编号。
 - 不要输出 `## 图表精读`、`## 图标精读` 或类似独立图表章节；架构图放到 `## 方法主线`，实验图表放到 `## 关键结果`。
 - 不要为了插图而重复同一占位符。
 - 如果某张截图和正文解释关系不清楚，可以不使用它，不能编造解释。
@@ -553,7 +555,7 @@ def _capture_formula_blocks_from_doc(
             page_bottom = (body_bottom_by_page or {}).get(page_no)
             if page_bottom is not None and rect.y1 > page_bottom:
                 continue
-            candidates.append((score, page_index, rect, line.text))
+            candidates.append((score, page_index, rect, _formula_block_text(lines, rect) or line.text))
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2].y0))
     assets: list[PaperAsset] = []
@@ -705,6 +707,19 @@ def _is_formula_continuation_line(text: str) -> bool:
     symbol_count = sum(1 for ch in line if ch in math_symbols)
     words = re.findall(r"[A-Za-z]{4,}", line)
     return symbol_count >= 1 and len(words) <= 2
+
+
+def _formula_block_text(lines: list[TextLine], rect: fitz.Rect) -> str:
+    parts = []
+    for line in lines:
+        if line.rect.y1 < rect.y0 - 1 or line.rect.y0 > rect.y1 + 1:
+            continue
+        if line.rect.x1 < rect.x0 - 1 or line.rect.x0 > rect.x1 + 1:
+            continue
+        text = _clean_xml_text(line.text).strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts)
 
 
 def _rect_iou(first: fitz.Rect, second: fitz.Rect) -> float:
@@ -1961,6 +1976,7 @@ def _document_xml(
         ]
 
         if text_without_markers:
+            text_without_markers = _sync_inline_asset_references(text_without_markers, line_reference_labels)
             if text_without_markers.startswith("# "):
                 section_name = text_without_markers[2:].strip()
                 if section_name != (_extract_note_title(summary) or ""):
@@ -2165,13 +2181,17 @@ def _paragraph(text: str, style: str | None = None) -> str:
 
 
 def _run_properties(style: str | None = None) -> str:
-    base_fonts = (
-        '<w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" '
-        'w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/>'
-    )
+    base_fonts = _font_run_xml()
     if style == "Heading3":
         return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="FFFFFF"/><w:sz w:val="30"/></w:rPr>'
     return f"<w:rPr>{base_fonts}</w:rPr>"
+
+
+def _font_run_xml() -> str:
+    return (
+        f'<w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" '
+        f'w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/>'
+    )
 
 
 def _paragraph_properties(style: str | None = None) -> str:
@@ -2325,7 +2345,7 @@ def _advance_asset_counter_from_label(asset: PaperAsset, label: str, counters: d
 
 
 def _original_asset_label(asset: PaperAsset) -> str:
-    text = _clean_xml_text(asset.caption or "")
+    text = _clean_xml_text(" ".join(part for part in (asset.caption, asset.text, asset.latex) if part))
     if asset.kind == "figure":
         match = re.search(r"(?i)\b(?:figure|fig\.?)\s*([0-9]+[A-Za-z]?)\b", text)
         if match:
@@ -2340,10 +2360,33 @@ def _original_asset_label(asset: PaperAsset) -> str:
         match = re.search(r"表\s*([0-9一二三四五六七八九十]+)", text)
         if match:
             return f"表 {match.group(1)}"
+    if asset.kind == "formula":
+        for source in (asset.caption, asset.text, asset.latex, text):
+            source_text = _clean_xml_text(source or "")
+            match = re.search(
+                r"(?i)\b(?:equation|eq\.?|formula)\s*[\(:：]?\s*([0-9]+[A-Za-z]?)\)?",
+                source_text,
+            )
+            if match:
+                return f"公式 {match.group(1)}"
+            match = re.search(r"(?:公式|方程)\s*[\(:：]?\s*([0-9一二三四五六七八九十]+)\)?", source_text)
+            if match:
+                return f"公式 {match.group(1)}"
+            match = _trailing_equation_number(source_text)
+            if match:
+                return f"公式 {match}"
+    return ""
+
+
+def _trailing_equation_number(text: str) -> str:
+    candidates = re.findall(r"(?:^|\s)[\(\[（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)\]）](?=\s*$)", text)
+    if candidates:
+        return candidates[-1]
     return ""
 
 
 def _with_asset_references(text: str, labels: list[str]) -> str:
+    text = _sync_inline_asset_references(text, labels)
     refs = _missing_asset_references(text, labels)
     if not refs:
         return text
@@ -2369,6 +2412,7 @@ def _append_asset_references_to_previous_paragraph(body: list[str], labels: list
 
 
 def _missing_asset_references(text: str, labels: list[str]) -> list[str]:
+    text = _sync_inline_asset_references(text, labels)
     refs = []
     for label in labels:
         compact = _compact_asset_label(label)
@@ -2379,6 +2423,32 @@ def _missing_asset_references(text: str, labels: list[str]) -> list[str]:
             continue
         refs.append(f"如{compact}所示")
     return refs
+
+
+def _sync_inline_asset_references(text: str, labels: list[str]) -> str:
+    if not labels:
+        return text
+    result = text
+    compact_labels = [_compact_asset_label(label) for label in labels]
+    for prefix in ("图", "表", "公式"):
+        same_kind_labels = [
+            compact
+            for compact in compact_labels
+            if re.match(rf"^{prefix}[0-9一二三四五六七八九十]+[A-Za-z]?$", compact)
+        ]
+        if len(same_kind_labels) != 1:
+            continue
+        compact = same_kind_labels[0]
+        match = re.match(r"^(图|表|公式)([0-9一二三四五六七八九十]+[A-Za-z]?)$", compact)
+        if not match:
+            continue
+        label_prefix, number = match.groups()
+        result = re.sub(
+            rf"如\s*{re.escape(label_prefix)}\s*[0-9一二三四五六七八九十]+[A-Za-z]?\s*所示",
+            f"如{label_prefix}{number}所示",
+            result,
+        )
+    return result
 
 
 def _asset_reference_pattern(compact_label: str) -> str:
@@ -2529,21 +2599,21 @@ def _app_props() -> str:
 
 
 def _styles_xml() -> str:
-    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
-<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="2B2B2B"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="40"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="30"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:b/><w:color w:val="2F7D6D"/><w:sz w:val="26"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="30"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="294D45"/><w:sz w:val="21"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="294D45"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="FigureCallout"><w:name w:val="figure callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="475569"/><w:sz w:val="20"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="4A3B18"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="list paragraph"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri" w:eastAsia="Microsoft YaHei" w:cs="Microsoft YaHei"/><w:color w:val="333333"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="2B2B2B"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="40"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="30"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2F7D6D"/><w:sz w:val="26"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="30"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="294D45"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="294D45"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="FigureCallout"><w:name w:val="figure callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="475569"/><w:sz w:val="20"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="4A3B18"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="list paragraph"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="333333"/><w:sz w:val="22"/></w:rPr></w:style>
 </w:styles>"""
 
 
@@ -2555,10 +2625,9 @@ def _settings_xml() -> str:
 
 
 def _font_table_xml() -> str:
-    return """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+    return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:fonts xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
-<w:font w:name="Calibri"><w:family w:val="swiss"/></w:font>
-<w:font w:name="Microsoft YaHei"><w:family w:val="swiss"/></w:font>
+<w:font w:name="{DOCX_FONT}"><w:family w:val="swiss"/></w:font>
 </w:fonts>"""
 
 
