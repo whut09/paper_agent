@@ -33,7 +33,7 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 请像顶级 AI 研究员或算法工程师写复现实验笔记一样写，不要写公众号营销文，也不要写浅层摘要。
 
 必须遵守：
-1. 证据优先：只能依据论文正文、图表标题/上下文和抽取到的表格文本写结论；缺失信息要明确写“原文未明确说明”。
+1. 证据优先：只能依据论文正文、图表标题/上下文和抽取到的表格文本写结论；原文没有提及的信息、术语、数据集、指标、模型名、应用场景或结论一律省略，不要写“原文未明确说明”“未提及”“未知”等占位句。
 2. 技术细节优先：优先解释问题定义、方法机制、训练/推理链路、关键公式、关键数字、消融和局限。
 3. 中文笔记：除模型名、数据集名、指标名、论文术语、代码库名等稳定专有名词外，不要夹杂整句英文。
 4. 不要把正文写成全篇 bullet list。只有 `## 核心信息` 使用 `- 字段名: 值`；其他章节优先使用自然段和 `###` 小标题。
@@ -48,11 +48,12 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 
 FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPaperNote 风格的完整中文 Markdown 论文精读笔记。
 
-输出必须是 Markdown，结构如下，可根据论文内容增加必要的 `###` 小节：
+输出必须是 Markdown，结构如下，可根据论文内容增加必要的 `###` 小节；没有原文证据的字段、章节或小节可以直接省略：
 
 # 论文标题
 
 ## 核心信息
+只输出原文明确出现的字段；没有出现的字段不要写。
 - 标题:
 - 中文标题:
 - 作者:
@@ -67,19 +68,19 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 - 论文类型:
 
 ## 摘要
-必须优先使用“原文摘要证据”写成忠实中文摘要；不要加入后来评价。只有原文摘要证据为空时，才写“摘要未完整抽取”。
+必须优先使用“原文摘要证据”写成忠实中文摘要；不要加入后来评价。只有原文摘要证据为空时，才省略本节，不要写占位句。
 
 ## 创新点
 用 3 到 5 个短段落说明真实创新点；不要写成每行都以 `-` 开头的长列表。每个创新点都要说明它解决什么问题、为什么重要。
 
 ## 一句话总结
-回答这篇论文真正解决什么问题，以及标题可能夸大的地方。
+回答这篇论文真正解决什么问题；只写原文直接提到或由原文证据直接支持的内容。
 
 ## 研究问题
 说明痛点、已有方法不足、任务定义和问题边界。
 
 ## 数据与任务定义
-说明输入、任务、数据集、评价指标和实验边界。若原文未明确说明，直接写“原文未明确说明”。
+说明输入、任务、数据集、评价指标和实验边界。原文没有提及的项目直接省略，不要写占位句。
 
 ## 方法主线
 必须包含 `### 机制流程`，用 3-5 步解释 Input -> 关键变换 -> Output。架构图、流程图、方法框架图必须放在本节对应解释段落附近。必须包含 `### 关键公式`，解读论文最重要的 1 到 3 个公式；优先采用 TexTeller 识别到的 LaTeX，并把对应 `[[ASSET:编号]]` 放在公式解释旁边。
@@ -88,13 +89,13 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 提炼最重要的指标、对比、消融和失败/边界证据；不要堆砌所有数字。实验图、结果表、对比表、消融表和 case analysis 图必须放在本节对应解释段落附近。
 
 ## 深度分析
-说明真正贡献、为什么可能有效、哪些地方容易误读、证据薄弱处和隐含假设。
+说明原文直接支持的贡献、有效性证据、证据薄弱处和作者明确讨论的假设；不要补写原文没有提及的推测。
 
 ## 局限
 写真实局限，包括数据、评价、部署、复杂度、泛化或基线不足。
 
 ## 总结
-收束全文，说明这篇论文最值得保留的结论、复现时应关注的实验点、可比较的后续工作和引用价值。
+收束全文，说明这篇论文原文直接支持的结论和复现时应关注的实验点；原文没有提及的后续工作、引用价值或应用场景不要补写。
 
 图表占位符规则：
 - 只能使用“可用图表截图”中列出的 `[[ASSET:编号]]`。
@@ -113,6 +114,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 - 不要输出 `## 引用` 章节。
 - 不要输出 `## 我的笔记` 章节，统一使用 `## 总结`。
 - 除 `## 核心信息` 外，不要让大多数行以 `-` 开头。
+- 原文没有提及的字段、章节和小节直接省略；不要输出“原文未明确说明”“未提及”“未知”“N/A”等占位内容。
 """
 
 
@@ -1411,6 +1413,7 @@ def _summarize_with_codex(
     for idx, chunk in enumerate(chunks, 1):
         user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
+只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
 
 可用图表截图：
 {asset_context}
@@ -1510,6 +1513,8 @@ def _normalize_final_sections(text: str) -> str:
     text = re.sub(r"(?ms)(?:^|\n)##\s*引用\s*\n.*?(?=\n## |\Z)", "\n", text)
     text = _remove_figure_reading_sections(text)
     text = _clean_core_info_section(text)
+    text = _remove_unspecified_placeholders(text)
+    text = _remove_empty_sections(text)
     text = text.replace("翻译", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -1532,6 +1537,47 @@ def _clean_core_info_section(text: str) -> str:
     return pattern.sub(clean, text)
 
 
+def _remove_unspecified_placeholders(text: str) -> str:
+    placeholder_pattern = re.compile(
+        r"^\s*(?:[-*]\s*)?(?:[^:：\n]{1,24}[:：]\s*)?"
+        r"(?:原文未明确说明|摘要未完整抽取|未完整抽取|未明确说明|未说明|未提及|未找到|未知|N/A|n/a|None|none)"
+        r"[。.\s]*$"
+    )
+    kept_lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if placeholder_pattern.match(stripped):
+            continue
+        kept_lines.append(line)
+    return "\n".join(kept_lines)
+
+
+def _remove_empty_sections(text: str) -> str:
+    blocks = re.split(r"(?m)(?=^#{1,3}\s+)", text)
+    kept: list[str] = []
+    for index, block in enumerate(blocks):
+        if not block.strip():
+            continue
+        lines = block.splitlines()
+        heading = lines[0].strip() if lines else ""
+        if heading.startswith("#"):
+            body = "\n".join(lines[1:]).strip()
+            level = len(heading) - len(heading.lstrip("#"))
+            has_child_section = False
+            for next_block in blocks[index + 1 :]:
+                next_lines = next_block.splitlines()
+                next_heading = next_lines[0].strip() if next_lines else ""
+                if not next_heading.startswith("#"):
+                    continue
+                next_level = len(next_heading) - len(next_heading.lstrip("#"))
+                has_child_section = next_level > level
+                break
+            if not body and not heading.startswith("# ") and not has_child_section:
+                continue
+        kept.append(block.strip())
+    return "\n\n".join(kept)
+
+
 def _core_info_line_is_unspecified(line: str) -> bool:
     if not re.match(r"^[-*]\s*", line):
         return False
@@ -1542,10 +1588,13 @@ def _core_info_line_is_unspecified(line: str) -> bool:
     normalized = re.sub(r"\s+", "", value).lower()
     unspecified_values = {
         "原文未明确说明",
+        "摘要未完整抽取",
+        "未完整抽取",
         "未明确说明",
         "未说明",
         "未提及",
         "未找到",
+        "未知",
         "无",
         "n/a",
         "na",
