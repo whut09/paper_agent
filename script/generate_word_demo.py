@@ -7,8 +7,10 @@ scroll positions, and stitches them into a GIF with Pillow.
 from __future__ import annotations
 
 import argparse
+import base64
 import html
 import math
+import mimetypes
 import re
 import shutil
 import tempfile
@@ -64,24 +66,112 @@ FALLBACK_PARAGRAPHS = [
 ]
 
 
-def extract_docx_paragraphs(path: Path) -> list[str]:
+def fallback_blocks() -> list[dict[str, object]]:
+    return [{"type": "paragraph", "text": text} for text in FALLBACK_PARAGRAPHS]
+
+
+def qname(namespace: str, tag: str) -> str:
+    return f"{{{namespace}}}{tag}"
+
+
+def paragraph_text(paragraph: ET.Element, namespace: dict[str, str]) -> str:
+    return "".join(
+        node.text or "" for node in paragraph.findall(".//w:t", namespace)
+    ).strip()
+
+
+def parse_relationships(docx: ZipFile) -> dict[str, str]:
+    namespace = {
+        "rel": "http://schemas.openxmlformats.org/package/2006/relationships"
+    }
+    try:
+        relationships = ET.fromstring(docx.read("word/_rels/document.xml.rels"))
+    except KeyError:
+        return {}
+
+    mapping: dict[str, str] = {}
+    for relationship in relationships.findall("rel:Relationship", namespace):
+        rel_id = relationship.get("Id")
+        target = relationship.get("Target")
+        if rel_id and target:
+            mapping[rel_id] = "word/" + target.lstrip("/")
+    return mapping
+
+
+def image_data_url(docx: ZipFile, media_path: str) -> str:
+    data = docx.read(media_path)
+    mime_type = mimetypes.guess_type(media_path)[0] or "image/png"
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def drawing_alt_text(drawing: ET.Element, namespace: dict[str, str]) -> str:
+    doc_properties = drawing.find(".//wp:docPr", namespace)
+    if doc_properties is None:
+        return "论文图表截图"
+    return doc_properties.get("descr") or doc_properties.get("name") or "论文图表截图"
+
+
+def table_rows(table: ET.Element, namespace: dict[str, str]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in table.findall(".//w:tr", namespace):
+        cells: list[str] = []
+        for cell in row.findall("./w:tc", namespace):
+            text = " ".join(
+                paragraph_text(paragraph, namespace)
+                for paragraph in cell.findall("./w:p", namespace)
+            ).strip()
+            cells.append(text)
+        if any(cells):
+            rows.append(cells)
+    return rows
+
+
+def extract_docx_blocks(path: Path) -> list[dict[str, object]]:
     if not path.exists():
-        return FALLBACK_PARAGRAPHS
+        return fallback_blocks()
 
-    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
     with ZipFile(path) as docx:
+        namespace = {
+            "w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+            "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
+            "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+            "wp": "http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing",
+        }
+        relationships = parse_relationships(docx)
         document = docx.read("word/document.xml")
+        root = ET.fromstring(document)
+        body = root.find("w:body", namespace)
+        if body is None:
+            return fallback_blocks()
 
-    root = ET.fromstring(document)
-    paragraphs: list[str] = []
-    for paragraph in root.findall(".//w:p", namespace):
-        text = "".join(
-            node.text or "" for node in paragraph.findall(".//w:t", namespace)
-        ).strip()
-        if text:
-            paragraphs.append(text)
+        blocks: list[dict[str, object]] = []
+        for child in body:
+            if child.tag == qname(namespace["w"], "p"):
+                text = paragraph_text(child, namespace)
+                if text:
+                    blocks.append({"type": "paragraph", "text": text})
+                for drawing in child.findall(".//w:drawing", namespace):
+                    blip = drawing.find(".//a:blip", namespace)
+                    if blip is None:
+                        continue
+                    rel_id = blip.get(qname(namespace["r"], "embed"))
+                    media_path = relationships.get(rel_id or "")
+                    if not media_path:
+                        continue
+                    blocks.append(
+                        {
+                            "type": "image",
+                            "src": image_data_url(docx, media_path),
+                            "alt": drawing_alt_text(drawing, namespace),
+                        }
+                    )
+            elif child.tag == qname(namespace["w"], "tbl"):
+                rows = table_rows(child, namespace)
+                if rows:
+                    blocks.append({"type": "table", "rows": rows})
 
-    return paragraphs or FALLBACK_PARAGRAPHS
+    return blocks or fallback_blocks()
 
 
 def classify_paragraph(text: str, index: int) -> str:
@@ -110,8 +200,50 @@ def paragraph_html(text: str, index: int) -> str:
     return f"<p>{escaped}</p>"
 
 
-def build_html(paragraphs: list[str]) -> str:
-    body = "\n".join(paragraph_html(text, i) for i, text in enumerate(paragraphs[:48]))
+def table_html(rows: list[list[str]]) -> str:
+    row_markup = []
+    for index, row in enumerate(rows):
+        cell_tag = "th" if index == 0 else "td"
+        cells = "".join(f"<{cell_tag}>{html.escape(cell)}</{cell_tag}>" for cell in row)
+        row_markup.append(f"<tr>{cells}</tr>")
+    return f"<table>{''.join(row_markup)}</table>"
+
+
+def block_html(block: dict[str, object], paragraph_index: int) -> str:
+    block_type = block["type"]
+    if block_type == "paragraph":
+        return paragraph_html(str(block["text"]), paragraph_index)
+    if block_type == "image":
+        src = str(block["src"])
+        alt = html.escape(str(block.get("alt") or "论文图表截图"))
+        return f"<figure class='doc-image'><img src='{src}' alt='{alt}'></figure>"
+    if block_type == "table":
+        rows = block.get("rows")
+        if isinstance(rows, list):
+            return table_html(rows)
+    return ""
+
+
+def build_html(blocks: list[dict[str, object]]) -> str:
+    rendered_blocks: list[str] = []
+    paragraph_index = 0
+    image_count = 0
+    table_count = 0
+    for block in blocks:
+        if block["type"] == "image":
+            image_count += 1
+        if block["type"] == "table":
+            table_count += 1
+        rendered_blocks.append(block_html(block, paragraph_index))
+        if block["type"] == "paragraph":
+            paragraph_index += 1
+
+    if image_count == 0 and table_count == 0:
+        rendered_blocks.append(
+            "<div class='figure'>关键图表与中文解读会保留在 Word 文档中</div>"
+        )
+
+    body = "\n".join(rendered_blocks)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -265,6 +397,41 @@ def build_html(paragraphs: list[str]) -> str:
       font-size: 14px;
       font-weight: 700;
     }}
+    .doc-image {{
+      margin: 18px 0 22px;
+      padding: 12px;
+      border: 1px solid #d7dde8;
+      border-radius: 8px;
+      background: #f8fafc;
+      text-align: center;
+    }}
+    .doc-image img {{
+      display: block;
+      max-width: 100%;
+      max-height: 340px;
+      margin: 0 auto;
+      object-fit: contain;
+      border-radius: 4px;
+    }}
+    table {{
+      width: 100%;
+      margin: 18px 0 22px;
+      border-collapse: collapse;
+      color: #344054;
+      font-size: 14px;
+      line-height: 1.55;
+    }}
+    th, td {{
+      padding: 9px 11px;
+      border: 1px solid #d0d5dd;
+      vertical-align: top;
+      text-align: left;
+    }}
+    th {{
+      color: #1d2939;
+      background: #eff6ff;
+      font-weight: 800;
+    }}
     .footer-shadow {{
       position: absolute;
       left: 0;
@@ -309,9 +476,6 @@ def build_html(paragraphs: list[str]) -> str:
     <section class="workspace">
       <article class="page" id="page">
         {body}
-        <div class="figure">关键图表与中文解读会保留在 Word 文档中</div>
-        <h2>阅读建议</h2>
-        <p>建议先阅读核心信息、摘要和方法主线，再结合关键图表定位原论文中的重点章节。若需要继续深入，可按创新点、实验结果和结论顺序做二次阅读。</p>
       </article>
       <div class="scrollbar"><div class="thumb"></div></div>
       <div class="footer-shadow"></div>
@@ -343,6 +507,19 @@ def render_frames(html_path: Path, frame_dir: Path, frame_count: int) -> list[Pa
             browser = playwright.chromium.launch(executable_path=str(edge_path))
         page = browser.new_page(viewport=VIEWPORT, device_scale_factor=1)
         page.goto(html_path.as_uri(), wait_until="networkidle")
+        page.evaluate(
+            """async () => {
+                const images = Array.from(document.images);
+                await Promise.all(images.map((image) => {
+                    if (image.complete) return Promise.resolve();
+                    if (image.decode) return image.decode().catch(() => undefined);
+                    return new Promise((resolve) => {
+                        image.onload = resolve;
+                        image.onerror = resolve;
+                    });
+                }));
+            }"""
+        )
         max_scroll = int(
             page.evaluate(
                 """() => {
@@ -392,8 +569,8 @@ def main() -> None:
     parser.add_argument("--keep-html", action="store_true")
     args = parser.parse_args()
 
-    paragraphs = extract_docx_paragraphs(args.docx)
-    html_text = build_html(paragraphs)
+    blocks = extract_docx_blocks(args.docx)
+    html_text = build_html(blocks)
 
     with tempfile.TemporaryDirectory(prefix="paper-agent-word-demo-") as temp:
         temp_dir = Path(temp)
