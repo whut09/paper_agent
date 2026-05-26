@@ -18,6 +18,10 @@ PaperAgent 是一个面向论文阅读的本地工具。它可以读取 PDF、DO
 
 生成完成后，页面会展示 Word 总结文档的预览效果，并提供 `.docx` 文件下载。最终文档不是只给一段简单摘要，而是会整理成便于阅读和二次编辑的结构化内容，例如：
 
+<p align="center">
+  <img src="./assets/word-demo.gif" width="900" alt="PaperAgent Word 总结文档滚动演示">
+</p>
+
 ```text
 论文标题：Visual Language Model Survey
 
