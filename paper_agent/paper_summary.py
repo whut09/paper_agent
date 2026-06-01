@@ -253,12 +253,12 @@ def _extract_text_and_assets(
         text_parts.append(f"\n\n[Page {page_no}]\n{page_text}")
 
         if kind_limits.get("table", 0) > 0:
-            table_assets = _capture_captioned_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
+            table_assets = _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
             table_assets = _filter_assets_before_y(table_assets, stop_y)
             assets.extend(table_assets)
 
         if kind_limits.get("table", 0) > 0:
-            table_assets = _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
+            table_assets = _capture_captioned_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
             table_assets = _filter_assets_before_y(table_assets, stop_y)
             assets.extend(table_assets)
 
@@ -1039,10 +1039,17 @@ def _group_lines_by_row(lines: list[TextLine]) -> list[list[TextLine]]:
 
 def _row_looks_table_like(text: str, group: list[TextLine]) -> bool:
     stripped = _clean_xml_text(text)
-    if len(group) >= 2:
+    if len(group) >= 4:
         return True
     number_count = len(re.findall(r"\d+(?:\.\d+)?", stripped))
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]+", stripped)
+    if len(group) >= 2:
+        long_words = re.findall(r"[A-Za-z\u4e00-\u9fff]{4,}", stripped)
+        if number_count >= 2 and len(long_words) <= 8:
+            return True
+        if all(len(_clean_xml_text(line.text).strip()) <= 24 for line in group):
+            return True
+        return False
     if number_count >= 2:
         return True
     if number_count == 1 and len(words) <= 3:
@@ -1056,10 +1063,15 @@ def _row_is_prose_after_table(text: str, group: list[TextLine], selected: bool) 
     stripped = _clean_xml_text(text)
     if not stripped:
         return False
-    if _row_looks_table_like(stripped, group):
+    if not selected:
         return False
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", stripped)
-    return selected and len(group) == 1 and len(words) >= 4
+    long_words = re.findall(r"[A-Za-z\u4e00-\u9fff]{4,}", stripped)
+    if len(group) <= 2 and len(words) >= 8:
+        return True
+    if len(group) == 1 and len(words) >= 4 and not _row_looks_table_like(stripped, group):
+        return True
+    return len(stripped) > 90 and len(long_words) >= 8
 
 
 def _caption_text_and_rect(
