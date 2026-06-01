@@ -2430,6 +2430,8 @@ def _missing_asset_references(text: str, labels: list[str]) -> list[str]:
         compact = _compact_asset_label(label)
         if not compact:
             continue
+        if _label_kind(compact) == "公式" and _contains_formula_reference(text):
+            continue
         pattern = _asset_reference_pattern(compact)
         if re.search(pattern, text):
             continue
@@ -2442,7 +2444,7 @@ def _sync_inline_asset_references(text: str, labels: list[str]) -> str:
         return text
     result = text
     compact_labels = [_compact_asset_label(label) for label in labels]
-    for prefix in ("图", "表", "公式"):
+    for prefix in ("图", "表"):
         same_kind_labels = [
             compact
             for compact in compact_labels
@@ -2461,6 +2463,20 @@ def _sync_inline_asset_references(text: str, labels: list[str]) -> str:
             result,
         )
     return result
+
+
+def _label_kind(compact_label: str) -> str:
+    match = re.match(r"^(图|表|公式)", compact_label)
+    return match.group(1) if match else ""
+
+
+def _contains_formula_reference(text: str) -> bool:
+    return bool(
+        re.search(
+            r"(?i)(?:如\s*)?(?:公式|方程|equation|eq\.?)\s*[（(]?\s*[0-9一二三四五六七八九十]+[A-Za-z]?\s*[）)]?\s*(?:所示)?",
+            _clean_xml_text(text),
+        )
+    )
 
 
 def _asset_reference_pattern(compact_label: str) -> str:
