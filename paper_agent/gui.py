@@ -6,6 +6,7 @@ import socket
 import uuid
 from asyncio import CancelledError
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import gradio as gr
 import requests
@@ -49,6 +50,15 @@ def get_config_or_env(key: str, default: str = "") -> str:
     return str(value) if value else default
 
 
+def get_config_bool_or_env(key: str, default: bool = False) -> bool:
+    value = ConfigManager.all().get(key, os.environ.get(key))
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 # Public demo control
 def verify_recaptcha(response):
     """
@@ -74,22 +84,40 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
     """
     chunk_size = 1024
     total_size = 0
-    with requests.get(url, stream=True, timeout=10) as response:
-        response.raise_for_status()
-        content = response.headers.get("Content-Disposition")
-        try:  # filename from header
-            _, params = cgi.parse_header(content)
-            filename = params["filename"]
-        except Exception:  # filename from url
-            filename = os.path.basename(url)
-        filename = os.path.splitext(os.path.basename(filename))[0] + ".pdf"
-        with open(save_path / filename, "wb") as file:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                total_size += len(chunk)
-                if size_limit and total_size > size_limit:
-                    raise gr.Error("Exceeds file size limit")
-                file.write(chunk)
-    return str(save_path / filename)
+    session = requests.Session()
+    session.trust_env = not get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY")
+    try:
+        with session.get(url, stream=True, timeout=(8, 30)) as response:
+            response.raise_for_status()
+            content = response.headers.get("Content-Disposition")
+            try:  # filename from header
+                _, params = cgi.parse_header(content)
+                filename = params["filename"]
+            except Exception:  # filename from url
+                filename = Path(unquote(urlparse(url).path)).name or "paper"
+            filename = os.path.splitext(os.path.basename(filename))[0] + ".pdf"
+            target = save_path / filename
+            with open(target, "wb") as file:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+                    total_size += len(chunk)
+                    if size_limit and total_size > size_limit:
+                        target.unlink(missing_ok=True)
+                        raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+                    file.write(chunk)
+            return str(target)
+    except gr.Error:
+        raise
+    except requests.exceptions.RequestException as exc:
+        proxy_hint = ""
+        if session.trust_env and (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
+            proxy_hint = (
+                "当前检测到 HTTP_PROXY/HTTPS_PROXY，下载请求会经过代理；"
+                "如果代理不稳定，可以在 config.local.json 中设置 "
+                '"PAPER_AGENT_DOWNLOAD_NO_PROXY": true 后重启，或改用文件上传。'
+            )
+        raise gr.Error(f"论文链接下载失败：{exc}。{proxy_hint}") from exc
 
 
 def stop_summary_file(state: dict) -> None:
