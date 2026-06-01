@@ -221,9 +221,10 @@ def summarize_file(
     preview_path = str(file_path) if str(file_path).lower().endswith(".pdf") else None
     return (
         str(docx_path),
-        preview_path,
+        gr.update(value=preview_path, visible=bool(preview_path)),
         gr.update(visible=True),
         gr.update(visible=True),
+        gr.update(visible=not bool(preview_path)),
     )
 
 
@@ -340,6 +341,8 @@ with gr.Blocks(
                 return (
                     gr.update(visible=file_type == "File"),
                     gr.update(visible=file_type == "Link"),
+                    gr.update(value=None, visible=file_type == "File"),
+                    gr.update(visible=file_type == "Link"),
                 )
 
             def on_select_page(choice):
@@ -368,36 +371,41 @@ with gr.Blocks(
 - 总结完成后可下载 docx 文档
 """)
             page_range.select(on_select_page, page_range, page_input)
-            file_type.select(
-                on_select_filetype,
-                file_type,
-                [file_input, link_input],
-                js=(
-                    f"""
-                    (a,b)=>{{
-                        try{{
-                            grecaptcha.render('recaptcha-box',{{
-                                'sitekey':'{client_key}',
-                                'callback':'onVerify'
-                            }});
-                        }}catch(error){{}}
-                        return [a];
-                    }}
-                    """
-                    if flag_demo
-                    else ""
-                ),
-            )
 
         with gr.Column(scale=2):
             gr.Markdown("## 预览")
             preview = PDF(label="文档预览", visible=True, height=2000)
+            preview_hint = gr.Markdown(
+                "链接模式会在生成时先下载论文，生成完成后再显示 PDF 预览。",
+                visible=False,
+            )
+
+    file_type.select(
+        on_select_filetype,
+        file_type,
+        [file_input, link_input, preview, preview_hint],
+        js=(
+            f"""
+            (a,b)=>{{
+                try{{
+                    grecaptcha.render('recaptcha-box',{{
+                        'sitekey':'{client_key}',
+                        'callback':'onVerify'
+                    }});
+                }}catch(error){{}}
+                return [a];
+            }}
+            """
+            if flag_demo
+            else ""
+        ),
+    )
 
     # Event handlers
     file_input.upload(
-        lambda x: x,
+        lambda x: (gr.update(value=x, visible=True), gr.update(visible=False)),
         inputs=file_input,
-        outputs=preview,
+        outputs=[preview, preview_hint],
         js=(
             f"""
             (a,b)=>{{
@@ -434,6 +442,7 @@ with gr.Blocks(
             preview,
             output_file_mono,
             output_title,
+            preview_hint,
         ],
     ).then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
 
