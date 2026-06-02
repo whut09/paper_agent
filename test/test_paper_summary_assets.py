@@ -1,9 +1,15 @@
+from pathlib import Path
+
 import fitz
 
 from paper_agent.paper_summary import (
+    PaperAsset,
     TextLine,
+    _caption_is_table,
+    _ensure_asset_markers,
     _missing_asset_references,
     _row_is_prose_after_table,
+    _row_looks_table_section_label,
     _row_looks_table_like,
     _sync_inline_asset_references,
     _with_asset_references,
@@ -38,6 +44,20 @@ def test_numeric_multi_cell_row_still_looks_like_table():
     assert not _row_is_prose_after_table(text, group, selected=True)
 
 
+def test_table_section_label_stays_inside_table():
+    group = [line("Closed-source commercial models", 66, 262, 155, 268)]
+    text = " ".join(item.text for item in group)
+
+    assert _row_looks_table_section_label(text, group)
+    assert not _row_is_prose_after_table(text, group, selected=True)
+
+
+def test_running_text_reference_is_not_table_caption():
+    assert _caption_is_table("Table 1. Comparison of methods")
+    assert _caption_is_table("Tab. 2: Video-MME results")
+    assert not _caption_is_table("Tab. 1 presents a comprehensive comparison")
+
+
 def test_formula_reference_keeps_original_paper_number():
     text = (
         "公式 13 给出模态贡献的融合方式：C_m = (1−α) I_intra,m + α I_inter,m，"
@@ -48,3 +68,17 @@ def test_formula_reference_keeps_original_paper_number():
     assert _sync_inline_asset_references(text, labels) == text
     assert _missing_asset_references(text, labels) == []
     assert _with_asset_references(text, labels) == text
+
+
+def test_formula_marker_is_inserted_before_fallback_figures():
+    assets = [
+        PaperAsset("figure", 1, Path("figure1.png"), "Figure 1. Overview"),
+        PaperAsset("figure", 1, Path("figure2.png"), "Figure 2. Framework"),
+        PaperAsset("formula", 1, Path("formula2.png"), "关键公式截图：Y = X (2)", text="Y = X (2)"),
+    ]
+    summary = "## 方法主线\n公式（2）描述输出结构，如公式2所示。"
+
+    result = _ensure_asset_markers(summary, assets)
+
+    assert result.index("[[ASSET:3]]") < result.index("[[ASSET:1]]")
+    assert "[[ASSET:3]]" in result

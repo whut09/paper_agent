@@ -550,12 +550,15 @@ def _capture_formula_blocks_from_doc(
             if score <= 0:
                 continue
             rect = _formula_clip_rect(page, line.rect, lines)
-            if rect.is_empty or rect.width < 45 or rect.height < 14:
+            if rect.is_empty or rect.width < 45 or rect.height < 8:
                 continue
             page_bottom = (body_bottom_by_page or {}).get(page_no)
             if page_bottom is not None and rect.y1 > page_bottom:
                 continue
-            candidates.append((score, page_index, rect, _formula_block_text(lines, rect) or line.text))
+            text = _formula_block_text(lines, rect) or line.text
+            if _formula_candidate_is_noise(text):
+                continue
+            candidates.append((score, page_index, rect, text))
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2].y0))
     assets: list[PaperAsset] = []
@@ -646,6 +649,8 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
 
     compact = re.sub(r"\s+", "", line).lower()
     score = 10.0 + operator_count * 8 + symbol_count * 1.5
+    if _trailing_equation_number(line):
+        score += 35
     if "modix" in paper_text.lower():
         if "e=[etext;evision]" in compact or "e=[e_text;e_vision]" in compact:
             score += 120
@@ -664,6 +669,22 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
         elif compact.startswith(("∆p=", "δp=", "Δp=")):
             score += 8
     return score
+
+
+def _formula_candidate_is_noise(text: str) -> bool:
+    cleaned = _clean_xml_text(text)
+    lowered = cleaned.lower()
+    if any(token in lowered for token in ("<answer", "</answer", "<think", "</think", "percentage point")):
+        return True
+    words = re.findall(r"[A-Za-z]{4,}", cleaned)
+    if len(words) > 14:
+        return True
+    numeric_tokens = re.findall(r"\d+(?:\.\d+)?", cleaned)
+    if len(numeric_tokens) >= 8 and not _trailing_equation_number(cleaned):
+        return True
+    if re.search(r"\b(?:total|recall|accuracy|baseline|method)\b", lowered) and len(numeric_tokens) >= 4:
+        return True
+    return False
 
 
 def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]) -> fitz.Rect:
@@ -946,7 +967,10 @@ def _caption_is_figure(caption: str) -> bool:
 
 def _caption_is_table(caption: str) -> bool:
     lowered = caption.strip().lower()
-    return lowered.startswith(("table", "tab.", "tab ")) or caption.strip().startswith("表")
+    stripped = caption.strip()
+    if stripped.startswith("表"):
+        return True
+    return bool(re.match(r"(?i)^(?:table|tab\.)\s*\d+[A-Za-z]?\s*[.:：]", stripped))
 
 
 def _table_rect_for_caption(
@@ -978,6 +1002,10 @@ def _table_rect_for_caption(
         row_text = " ".join(line.text for line in group)
         if selected and previous_y1 is not None and row_rect.y0 - previous_y1 > 44:
             break
+        if selected and _row_looks_table_section_label(row_text, group):
+            selected.extend(group)
+            previous_y1 = row_rect.y1
+            continue
         if _row_is_prose_after_table(row_text, group, bool(selected)):
             if selected:
                 break
@@ -1059,11 +1087,25 @@ def _row_looks_table_like(text: str, group: list[TextLine]) -> bool:
     return 0 < len(words) <= 3 and len(stripped) <= 36
 
 
+def _row_looks_table_section_label(text: str, group: list[TextLine]) -> bool:
+    stripped = _clean_xml_text(text).strip()
+    if len(group) != 1 or not stripped:
+        return False
+    if re.search(r"[.。:：;,，]", stripped):
+        return False
+    if re.search(r"\d", stripped):
+        return False
+    words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", stripped)
+    return 1 <= len(words) <= 5 and len(stripped) <= 48
+
+
 def _row_is_prose_after_table(text: str, group: list[TextLine], selected: bool) -> bool:
     stripped = _clean_xml_text(text)
     if not stripped:
         return False
     if not selected:
+        return False
+    if _row_looks_table_section_label(stripped, group):
         return False
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", stripped)
     long_words = re.findall(r"[A-Za-z\u4e00-\u9fff]{4,}", stripped)
@@ -1254,9 +1296,12 @@ def _nearby_caption_with_rect(
 ) -> tuple[str, fitz.Rect | None]:
     lines = _page_text_lines(page)
     best: tuple[float, int] | None = None
+    kind = "figure" if any(str(prefix).lower().startswith(("fig", "figure", "图")) for prefix in prefixes) else "table"
     for idx, line in enumerate(lines):
         lowered = line.text.lower().strip()
         if not any(lowered.startswith(prefix) for prefix in prefixes):
+            continue
+        if kind == "table" and line.rect.y0 > rect.y1 + 8:
             continue
         vertical_gap = min(abs(line.rect.y0 - rect.y1), abs(rect.y0 - line.rect.y1))
         if vertical_gap > 150:
@@ -1270,7 +1315,6 @@ def _nearby_caption_with_rect(
             best = (score, idx)
     if best is None:
         return "", None
-    kind = "figure" if any(str(prefix).lower().startswith(("fig", "figure", "图")) for prefix in prefixes) else "table"
     caption_text, caption_rect = _caption_text_and_rect(lines, best[1], page, kind)
     return caption_text[:300], caption_rect
 
@@ -1781,11 +1825,12 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     if not assets:
         return summary
 
+    summary = _insert_markers_after_explicit_references(summary, assets)
     referenced = set(re.findall(r"\[\[ASSET:(\d+)\]\]", summary))
     missing_ids = [
         idx
         for idx, asset in enumerate(assets, 1)
-        if str(idx) not in referenced and asset.kind in {"figure", "table", "formula"}
+        if str(idx) not in referenced and asset.kind in {"figure", "table"}
     ]
     if not missing_ids:
         return summary
@@ -1797,8 +1842,6 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
             continue
         if asset.kind == "table" and len([i for i in missing_ids if assets[i - 1].kind == "table" and i <= asset_id]) > 8:
             continue
-        if asset.kind == "formula" and len([i for i in missing_ids if assets[i - 1].kind == "formula" and i <= asset_id]) > 4:
-            continue
         target = _target_section_for_asset(asset)
         insertions.setdefault(target, []).extend(_asset_placeholder_lines(asset_id, asset, target))
 
@@ -1808,7 +1851,7 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     inserted_sections: set[str] = set()
     body_seen: dict[str, bool] = {}
 
-    for line in lines:
+    for line_index, line in enumerate(lines):
         result.append(line)
         heading = _heading_name(line)
         if heading:
@@ -1819,6 +1862,8 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
         stripped = line.strip()
         if not stripped or stripped.startswith(">") or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
             continue
+        if _next_nonempty_line_is_asset_marker(lines, line_index):
+            continue
         if not body_seen.get(current_section):
             body_seen[current_section] = True
             result.extend(insertions[current_section])
@@ -1828,6 +1873,49 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     for section in remaining_sections:
         _insert_asset_lines_into_section(result, section, insertions[section])
     return _normalize_final_sections("\n".join(result))
+
+
+def _next_nonempty_line_is_asset_marker(lines: list[str], line_index: int) -> bool:
+    for next_line in lines[line_index + 1 :]:
+        stripped = next_line.strip()
+        if not stripped:
+            continue
+        return bool(re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped))
+    return False
+
+
+def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAsset]) -> str:
+    lines = summary.splitlines()
+    if not lines:
+        return summary
+
+    referenced = set(re.findall(r"\[\[ASSET:(\d+)\]\]", summary))
+    insert_after: dict[int, list[str]] = {}
+    for asset_id, asset in enumerate(assets, 1):
+        if str(asset_id) in referenced:
+            continue
+        label = _original_asset_label(asset)
+        if not label:
+            continue
+        compact = _compact_asset_label(label)
+        pattern = _asset_reference_pattern(compact)
+        for line_index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
+                continue
+            if re.search(pattern, stripped):
+                insert_after.setdefault(line_index, []).append(f"[[ASSET:{asset_id}]]")
+                referenced.add(str(asset_id))
+                break
+
+    if not insert_after:
+        return summary
+
+    result: list[str] = []
+    for index, line in enumerate(lines):
+        result.append(line)
+        result.extend(insert_after.get(index, []))
+    return "\n".join(result)
 
 
 def _asset_placeholder_lines(asset_id: int, asset: PaperAsset, section: str) -> list[str]:
@@ -1856,6 +1944,8 @@ def _section_body_insert_index(lines: list[str], heading_index: int) -> int:
     while insert_at < len(lines) and not lines[insert_at].strip():
         insert_at += 1
     if insert_at < len(lines) and not lines[insert_at].lstrip().startswith("#"):
+        insert_at += 1
+    while insert_at < len(lines) and re.fullmatch(r"\s*\[\[ASSET:\d+\]\]\s*", lines[insert_at]):
         insert_at += 1
     return insert_at
 
@@ -2382,6 +2472,9 @@ def _original_asset_label(asset: PaperAsset) -> str:
             if match:
                 return f"公式 {match.group(1)}"
             match = re.search(r"(?:公式|方程)\s*[\(:：]?\s*([0-9一二三四五六七八九十]+)\)?", source_text)
+            if match:
+                return f"公式 {match.group(1)}"
+            match = re.search(r"[\(\[（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)\]）]", source_text)
             if match:
                 return f"公式 {match.group(1)}"
             match = _trailing_equation_number(source_text)
