@@ -358,6 +358,7 @@ def _capture_tables(
         table_rect = fitz.Rect(table.bbox)
         if table_rect.is_empty or table_rect.width < 40 or table_rect.height < 20:
             continue
+        table_rect = _expand_table_rect_to_borders(page, table_rect)
         caption, caption_rect = _nearby_caption_with_rect(page, table_rect, ("table", "表"))
         clip_rect = _merge_rects([table_rect, caption_rect]) if caption_rect else table_rect
         key = _box_key(page_no, clip_rect)
@@ -1022,6 +1023,7 @@ def _table_rect_for_caption(
     rect &= fitz.Rect(left, search_top, right, search_bottom)
     if rect.is_empty or rect.width < 60 or rect.height < 20:
         return None, ""
+    rect = _expand_table_rect_to_borders(page, rect)
     text = "\n".join(_clean_xml_text(" ".join(line.text for line in group)) for group in row_groups if any(line in selected for line in group))
     return rect, text[:2500]
 
@@ -1114,6 +1116,42 @@ def _row_is_prose_after_table(text: str, group: list[TextLine], selected: bool) 
     if len(group) == 1 and len(words) >= 4 and not _row_looks_table_like(stripped, group):
         return True
     return len(stripped) > 90 and len(long_words) >= 8
+
+
+def _expand_table_rect_to_borders(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
+    borders: list[fitz.Rect] = []
+    search = fitz.Rect(rect.x0 - 12, rect.y0 - 30, rect.x1 + 12, rect.y1 + 18)
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return rect
+
+    for drawing in drawings:
+        raw_rect = drawing.get("rect")
+        if not raw_rect:
+            continue
+        border = fitz.Rect(raw_rect)
+        if border.width <= 0:
+            continue
+        if border.height <= 0.1:
+            border = fitz.Rect(border.x0, border.y0 - 0.5, border.x1, border.y1 + 0.5)
+        if border.y1 < search.y0 or border.y0 > search.y1:
+            continue
+        if border.x1 < search.x0 or border.x0 > search.x1:
+            continue
+        if border.height > 2.5:
+            continue
+        if border.width < max(40.0, rect.width * 0.45):
+            continue
+        if _horizontal_overlap_fraction(border, rect.x0 - 18, rect.x1 + 18) < 0.55:
+            continue
+        borders.append(border)
+
+    if not borders:
+        return rect
+    expanded = _merge_rects([rect, *borders])
+    expanded &= page.rect
+    return expanded
 
 
 def _caption_text_and_rect(

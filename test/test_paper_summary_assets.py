@@ -7,6 +7,7 @@ from paper_agent.paper_summary import (
     TextLine,
     _caption_is_table,
     _ensure_asset_markers,
+    _expand_table_rect_to_borders,
     _missing_asset_references,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
@@ -56,6 +57,19 @@ def test_running_text_reference_is_not_table_caption():
     assert _caption_is_table("Table 1. Comparison of methods")
     assert _caption_is_table("Tab. 2: Video-MME results")
     assert not _caption_is_table("Tab. 1 presents a comprehensive comparison")
+
+
+def test_table_rect_expands_to_zero_height_bottom_border():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 600, 800)
+
+        def get_drawings(self):
+            return [{"rect": fitz.Rect(100, 198.5, 300, 198.5)}]
+
+    rect = fitz.Rect(110, 120, 290, 195)
+    expanded = _expand_table_rect_to_borders(FakePage(), rect)
+
+    assert expanded.y1 > rect.y1
 
 
 def test_formula_reference_keeps_original_paper_number():
