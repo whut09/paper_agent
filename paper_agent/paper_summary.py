@@ -962,8 +962,10 @@ def _capture_image_blocks(
 
 
 def _caption_is_figure(caption: str) -> bool:
-    lowered = caption.strip().lower()
-    return lowered.startswith(("figure", "fig.", "fig ")) or caption.strip().startswith("图")
+    stripped = caption.strip()
+    if stripped.startswith("图"):
+        return True
+    return bool(re.match(r"(?i)^(?:figure|fig\.?)\s*\d+[A-Za-z]?\s*[.:：]", stripped))
 
 
 def _caption_is_table(caption: str) -> bool:

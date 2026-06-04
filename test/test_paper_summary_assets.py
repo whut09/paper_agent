@@ -5,6 +5,7 @@ import fitz
 from paper_agent.paper_summary import (
     PaperAsset,
     TextLine,
+    _caption_is_figure,
     _caption_is_table,
     _ensure_asset_markers,
     _expand_table_rect_to_borders,
@@ -57,6 +58,13 @@ def test_running_text_reference_is_not_table_caption():
     assert _caption_is_table("Table 1. Comparison of methods")
     assert _caption_is_table("Tab. 2: Video-MME results")
     assert not _caption_is_table("Tab. 1 presents a comprehensive comparison")
+
+
+def test_running_text_reference_is_not_figure_caption():
+    assert _caption_is_figure("Figure 3. Training stability analysis")
+    assert _caption_is_figure("Fig. 2: Overview")
+    assert _caption_is_figure("Fig 4. Ablation results")
+    assert not _caption_is_figure("Figure 3 showing the per-seed test mAP distribution.")
 
 
 def test_table_rect_expands_to_zero_height_bottom_border():
