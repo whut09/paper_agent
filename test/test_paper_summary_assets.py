@@ -8,6 +8,8 @@ from paper_agent.paper_summary import (
     _caption_is_figure,
     _caption_is_table,
     _ensure_asset_markers,
+    _enforce_core_original_title,
+    _extract_abstract_from_text,
     _expand_table_rect_to_borders,
     _missing_asset_references,
     _row_is_prose_after_table,
@@ -65,6 +67,47 @@ def test_running_text_reference_is_not_figure_caption():
     assert _caption_is_figure("Fig. 2: Overview")
     assert _caption_is_figure("Fig 4. Ablation results")
     assert not _caption_is_figure("Figure 3 showing the per-seed test mAP distribution.")
+
+
+def test_abstract_text_removes_footnote_and_joins_hyphenation():
+    text = """Abstract
+The model addresses text-to-linear-image generation: synthe-
+*Work done during internship at Adobe.
+sizing a high-quality scene-referred linear image for post-
+processing. It represents the result as exposure brackets and uses
+flow matching to generate aligned brackets for downstream editing.
+
+1. Introduction
+Display-referred images are limited.
+"""
+
+    abstract = _extract_abstract_from_text(text)
+
+    assert "internship" not in abstract
+    assert "synthesizing" in abstract
+    assert "postprocessing" in abstract
+    assert "Introduction" not in abstract
+
+
+def test_core_info_title_uses_original_paper_title():
+    summary = """# 中文标题
+
+## 核心信息
+- 标题: text-to-linear-image generation
+- 中文标题: 线性图像生成
+- 机构: Adobe
+
+## 摘要
+测试。
+"""
+
+    result = _enforce_core_original_title(
+        summary,
+        "Linear Image Generation by Synthesizing Exposure Brackets",
+    )
+
+    assert "- 标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
+    assert "text-to-linear-image generation" not in result
 
 
 def test_table_rect_expands_to_zero_height_bottom_border():

@@ -56,8 +56,8 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 
 ## 核心信息
 只输出原文明确出现的字段；没有出现的字段不要写。
-- 标题:
-- 中文标题:
+- 标题: 必须填写原文标题，保持英文原文，不要改写、概括或翻译
+- 中文标题: 可以忠实翻译原文标题
 - 作者:
 - 机构:
 - 发表时间:
@@ -178,6 +178,7 @@ def summarize_paper(
     check_cancelled()
     report(0.18, "抽取正文和图表截图...")
     text, assets = _extract_text_and_assets(pdf_path, work_dir, pages, max_assets)
+    paper_title = _extract_title_from_pdf(pdf_path, pages)
     abstract = _extract_abstract_from_pdf(pdf_path, pages) or _extract_abstract_from_text(text)
     formulas = _extract_formula_candidates(text)
 
@@ -195,6 +196,7 @@ def summarize_paper(
         abstract,
         formulas,
         _recognized_formula_context(assets),
+        paper_title,
     )
 
     check_cancelled()
@@ -1371,7 +1373,7 @@ def _extract_abstract_from_text(text: str) -> str:
     )
     if not match:
         return ""
-    abstract = re.sub(r"\s+", " ", match.group(1)).strip()
+    abstract = _clean_abstract_fragment(match.group(1))
     abstract = re.sub(r"^(?:abstract\s*)+", "", abstract, flags=re.IGNORECASE).strip()
     if len(abstract) < 80:
         return ""
@@ -1385,9 +1387,18 @@ def _extract_abstract_from_pdf(pdf_path: Path, pages: list[int] | None = None) -
         return ""
     try:
         page_indices = pages if pages is not None else list(range(min(2, doc.page_count)))
-        for page_index in page_indices[:2]:
+        for page_position, page_index in enumerate(page_indices[:2]):
             if page_index < 0 or page_index >= doc.page_count:
                 continue
+            raw_text = "\n".join(
+                doc[idx].get_text("text", sort=False)
+                for idx in page_indices[page_position : page_position + 2]
+                if 0 <= idx < doc.page_count
+            )
+            abstract = _extract_abstract_from_text(raw_text)
+            if len(abstract) >= 80:
+                return abstract[:2500]
+
             page = doc[page_index]
             words = page.get_text("words", sort=True)
             abstract_y = None
@@ -1429,10 +1440,82 @@ def _extract_abstract_from_pdf(pdf_path: Path, pages: list[int] | None = None) -
         doc.close()
 
 
+def _clean_abstract_fragment(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        stripped = _clean_xml_text(line).strip()
+        if not stripped:
+            continue
+        lowered = stripped.lower()
+        if stripped.startswith("*") or lowered.startswith(("arxiv:", "copyright", "©")):
+            continue
+        lines.append(stripped)
+    return _dehyphenate_pdf_text(" ".join(lines))
+
+
 def _dehyphenate_pdf_text(text: str) -> str:
     text = re.sub(r"-\s+", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def _extract_title_from_pdf(pdf_path: Path, pages: list[int] | None = None) -> str:
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return ""
+    try:
+        page_index = pages[0] if pages else 0
+        if page_index < 0 or page_index >= doc.page_count:
+            page_index = 0
+        page = doc[page_index]
+        candidates: list[tuple[float, float, str]] = []
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                bbox = line.get("bbox") or (0, 0, 0, 0)
+                y0 = float(bbox[1])
+                if y0 > page.rect.height * 0.32:
+                    continue
+                spans = line.get("spans", [])
+                text = _clean_xml_text("".join(str(span.get("text", "")) for span in spans)).strip()
+                if not _looks_like_title_line(text):
+                    continue
+                max_size = max((float(span.get("size", 0)) for span in spans), default=0.0)
+                candidates.append((max_size, y0, text))
+        if not candidates:
+            return ""
+        largest_size = max(item[0] for item in candidates)
+        title_lines = [
+            item
+            for item in candidates
+            if item[0] >= largest_size - 0.8 and not _looks_like_author_or_affiliation(item[2])
+        ]
+        title = " ".join(text for _, _, text in sorted(title_lines, key=lambda item: item[1]))
+        return re.sub(r"\s+", " ", title).strip()[:300]
+    finally:
+        doc.close()
+
+
+def _looks_like_title_line(text: str) -> bool:
+    if len(text) < 8 or len(text) > 180:
+        return False
+    lowered = text.lower()
+    if any(token in lowered for token in ("http://", "https://", "@", "arxiv:", "abstract")):
+        return False
+    if lowered.startswith(("figure", "fig.", "table", "tab.")):
+        return False
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", text))
+
+
+def _looks_like_author_or_affiliation(text: str) -> bool:
+    lowered = text.lower()
+    if any(token in lowered for token in ("university", "institute", "research", "lab", "school", "department")):
+        return True
+    if re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+[0-9]?\b", text) and "," in text:
+        return True
+    return False
 
 
 def _extract_formula_candidates(text: str, limit: int = 8) -> list[str]:
@@ -1514,6 +1597,7 @@ def _summarize_with_codex(
     abstract: str = "",
     formulas: list[str] | None = None,
     recognized_formulas: str = "",
+    paper_title: str = "",
 ) -> str:
     client = openai.OpenAI(base_url=config.base_url, api_key=config.api_key)
     chunks = _chunk_text(paper_text, 16000)
@@ -1540,6 +1624,7 @@ def _summarize_with_codex(
         config.model,
         (
             f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+            f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
             f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
             f"关键公式候选：\n{formula_context}\n\n"
             f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
@@ -1549,6 +1634,7 @@ def _summarize_with_codex(
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, config.model)
     summary = _normalize_final_sections(summary)
+    summary = _enforce_core_original_title(summary, paper_title)
     return _ensure_asset_markers(summary, assets)
 
 
@@ -1646,6 +1732,29 @@ def _clean_core_info_section(text: str) -> str:
         return header + "\n".join(kept_lines).strip() + "\n\n"
 
     return pattern.sub(clean, text)
+
+
+def _enforce_core_original_title(text: str, paper_title: str) -> str:
+    paper_title = re.sub(r"\s+", " ", _clean_xml_text(paper_title)).strip()
+    if not paper_title:
+        return text
+
+    pattern = re.compile(r"(?ms)(^##\s*核心信息\s*\n)(.*?)(?=^## |\Z)")
+
+    def replace(match: re.Match) -> str:
+        header = match.group(1)
+        body = match.group(2).strip("\n")
+        lines = body.splitlines()
+        for index, line in enumerate(lines):
+            if re.match(r"^\s*[-*]\s*标题\s*[:：]", line):
+                prefix = re.match(r"^(\s*[-*]\s*标题\s*[:：]\s*)", line).group(1)
+                lines[index] = f"{prefix}{paper_title}"
+                return header + "\n".join(lines).strip() + "\n\n"
+        return header + f"- 标题: {paper_title}\n" + body.strip() + "\n\n"
+
+    if pattern.search(text):
+        return pattern.sub(replace, text, count=1)
+    return text
 
 
 def _remove_unspecified_placeholders(text: str) -> str:
