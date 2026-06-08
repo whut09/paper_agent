@@ -126,6 +126,7 @@ copy config.json config.local.json
     "CODEX_BASE_URL": "https://你的接口地址/v1",
     "CODEX_API_KEY": "你的 API Key",
     "CODEX_MODEL": "你的模型名称",
+    "CODEX_USE_PROXY": false,
     "ENABLED_SERVICES": [],
     "HIDDEN_GRADIO_DETAILS": true,
     "PAPER_AGENT_LANG_FROM": "English",
@@ -135,6 +136,8 @@ copy config.json config.local.json
     "PAPER_AGENT_PROMPT": ""
 }
 ```
+
+`CODEX_USE_PROXY` 默认为 `false`，总结接口不会继承系统 `HTTP_PROXY` / `HTTPS_PROXY`。如果你的接口必须走代理，再改成 `true`。
 
 `config.local.json` 已加入 `.gitignore`，不会提交到 GitHub。你当前机器上的真实配置保存在该文件中，本地启动时直接指定它即可。
 

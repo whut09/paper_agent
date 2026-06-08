@@ -207,6 +207,7 @@ def summarize_file(
                 "CODEX_BASE_URL": get_config_or_env("CODEX_BASE_URL"),
                 "CODEX_API_KEY": get_config_or_env("CODEX_API_KEY"),
                 "CODEX_MODEL": get_config_or_env("CODEX_MODEL"),
+                "CODEX_USE_PROXY": get_config_or_env("CODEX_USE_PROXY"),
             },
             max_assets=max_assets_value,
             progress=progress_bar,
@@ -214,6 +215,8 @@ def summarize_file(
         )
     except CancelledError:
         raise gr.Error("Summary cancelled")
+    except RuntimeError as exc:
+        raise gr.Error(str(exc)) from exc
     finally:
         cancellation_event_map.pop(session_id, None)
         state["session_id"] = None

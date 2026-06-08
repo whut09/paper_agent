@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 import fitz
+import httpx
 import openai
 from PIL import Image
 
@@ -142,6 +143,7 @@ class CodexConfig:
     base_url: str
     api_key: str
     model: str
+    use_proxy: bool = False
 
 
 def summarize_paper(
@@ -1566,6 +1568,7 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
     base_url = _first_value(envs, "CODEX_BASE_URL", "OPENAI_BASE_URL")
     api_key = _first_value(envs, "CODEX_API_KEY", "OPENAI_API_KEY")
     model = _first_value(envs, "CODEX_MODEL", "OPENAI_MODEL")
+    use_proxy = _truthy(_first_value(envs, "CODEX_USE_PROXY", "OPENAI_USE_PROXY"))
 
     if not base_url:
         raise ValueError("缺少 CODEX_BASE_URL，请在前端或 config.json 中配置 Codex 本地接口 URL。")
@@ -1573,7 +1576,11 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
         raise ValueError("缺少 CODEX_MODEL，请在前端或 config.json 中配置模型名称。")
     if not api_key:
         api_key = "codex-local"
-    return CodexConfig(base_url=base_url, api_key=api_key, model=model)
+    return CodexConfig(base_url=base_url, api_key=api_key, model=model, use_proxy=use_proxy)
+
+
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _first_value(envs: dict[str, str], *keys: str) -> str:
@@ -1599,14 +1606,15 @@ def _summarize_with_codex(
     recognized_formulas: str = "",
     paper_title: str = "",
 ) -> str:
-    client = openai.OpenAI(base_url=config.base_url, api_key=config.api_key)
+    client = _create_codex_client(config)
     chunks = _chunk_text(paper_text, 16000)
     asset_context = _asset_context(assets)
     formula_context = _formula_context(formulas or [])
 
-    chunk_notes = []
-    for idx, chunk in enumerate(chunks, 1):
-        user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
+    try:
+        chunk_notes = []
+        for idx, chunk in enumerate(chunks, 1):
+            user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
 只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
 
@@ -1616,37 +1624,58 @@ def _summarize_with_codex(
 论文内容：
 {chunk}
 """
-        chunk_notes.append(_chat(client, config.model, user_prompt))
+            chunk_notes.append(_chat(client, config.model, user_prompt))
 
-    final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
-    summary = _chat(
-        client,
-        config.model,
-        (
-            f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
-            f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
-            f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
-            f"关键公式候选：\n{formula_context}\n\n"
-            f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
-            f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
-        ),
+        final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
+        summary = _chat(
+            client,
+            config.model,
+            (
+                f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+                f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
+                f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
+                f"关键公式候选：\n{formula_context}\n\n"
+                f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
+                f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
+            ),
+        )
+        summary = _postprocess_summary(summary)
+        summary = _replace_missing_abstract(summary, abstract, client, config.model)
+        summary = _normalize_final_sections(summary)
+        summary = _enforce_core_original_title(summary, paper_title)
+        return _ensure_asset_markers(summary, assets)
+    finally:
+        client.close()
+
+
+def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
+    http_client = httpx.Client(
+        trust_env=config.use_proxy,
+        timeout=httpx.Timeout(600.0, connect=30.0),
     )
-    summary = _postprocess_summary(summary)
-    summary = _replace_missing_abstract(summary, abstract, client, config.model)
-    summary = _normalize_final_sections(summary)
-    summary = _enforce_core_original_title(summary, paper_title)
-    return _ensure_asset_markers(summary, assets)
+    return openai.OpenAI(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        http_client=http_client,
+        max_retries=2,
+    )
 
 
 def _chat(client: openai.OpenAI, model: str, user_prompt: str) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": DEEP_PAPER_NOTE_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": DEEP_PAPER_NOTE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+    except openai.APIConnectionError as exc:
+        raise RuntimeError(
+            "Codex 接口连接失败：服务端断开或网络链路不稳定。程序已默认不继承系统代理；"
+            "如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
+        ) from exc
     content = response.choices[0].message.content or ""
     return _postprocess_summary(content)
 

@@ -13,6 +13,7 @@ from paper_agent.paper_summary import (
     _expand_table_rect_to_borders,
     _missing_asset_references,
     _paragraph,
+    _resolve_codex_config,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
     _row_looks_table_like,
@@ -118,6 +119,27 @@ def test_heading3_background_only_wraps_text():
 
     assert "<w:shd" not in paragraph_properties
     assert '<w:shd w:fill="DDEDEA"/>' in run_properties
+
+
+def test_codex_config_disables_proxy_by_default():
+    config = _resolve_codex_config(
+        {
+            "CODEX_BASE_URL": "https://api.example.test/v1",
+            "CODEX_API_KEY": "test-key",
+            "CODEX_MODEL": "test-model",
+        }
+    )
+    proxied_config = _resolve_codex_config(
+        {
+            "CODEX_BASE_URL": "https://api.example.test/v1",
+            "CODEX_API_KEY": "test-key",
+            "CODEX_MODEL": "test-model",
+            "CODEX_USE_PROXY": "true",
+        }
+    )
+
+    assert not config.use_proxy
+    assert proxied_config.use_proxy
 
 
 def test_table_rect_expands_to_zero_height_bottom_border():
