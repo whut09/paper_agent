@@ -2434,7 +2434,7 @@ def _paragraph(text: str, style: str | None = None) -> str:
 def _run_properties(style: str | None = None) -> str:
     base_fonts = _font_run_xml()
     if style == "Heading3":
-        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="FFFFFF"/><w:sz w:val="30"/></w:rPr>'
+        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="134E4A"/><w:sz w:val="26"/><w:shd w:fill="DDEDEA"/></w:rPr>'
     return f"<w:rPr>{base_fonts}</w:rPr>"
 
 
@@ -2463,10 +2463,9 @@ def _paragraph_properties(style: str | None = None) -> str:
     if style == "Heading3":
         return (
             '<w:pPr><w:pStyle w:val="Heading3"/>'
-            '<w:spacing w:before="320" w:after="160" w:line="360" w:lineRule="auto"/>'
-            '<w:ind w:left="220" w:right="180"/>'
-            '<w:shd w:fill="0F766E"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="24" w:space="10" w:color="134E4A"/></w:pBdr>'
+            '<w:spacing w:before="260" w:after="100" w:line="320" w:lineRule="auto"/>'
+            '<w:ind w:left="80" w:right="120"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="2F7D6D"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "Caption":

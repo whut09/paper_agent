@@ -12,6 +12,7 @@ from paper_agent.paper_summary import (
     _extract_abstract_from_text,
     _expand_table_rect_to_borders,
     _missing_asset_references,
+    _paragraph,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
     _row_looks_table_like,
@@ -108,6 +109,15 @@ def test_core_info_title_uses_original_paper_title():
 
     assert "- 标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
     assert "text-to-linear-image generation" not in result
+
+
+def test_heading3_background_only_wraps_text():
+    xml = _paragraph("机制流程", "Heading3")
+    paragraph_properties = xml.split("</w:pPr>", 1)[0]
+    run_properties = xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
+
+    assert "<w:shd" not in paragraph_properties
+    assert '<w:shd w:fill="DDEDEA"/>' in run_properties
 
 
 def test_table_rect_expands_to_zero_height_bottom_border():
