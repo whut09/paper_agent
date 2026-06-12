@@ -5,6 +5,7 @@ import fitz
 from paper_agent.paper_summary import (
     PaperAsset,
     TextLine,
+    _asset_display_label,
     _caption_is_figure,
     _caption_is_table,
     _ensure_asset_markers,
@@ -61,6 +62,7 @@ def test_table_section_label_stays_inside_table():
 def test_running_text_reference_is_not_table_caption():
     assert _caption_is_table("Table 1. Comparison of methods")
     assert _caption_is_table("Tab. 2: Video-MME results")
+    assert _caption_is_table("Table 2 | Performance on multimodal benchmarks")
     assert not _caption_is_table("Tab. 1 presents a comprehensive comparison")
 
 
@@ -68,6 +70,7 @@ def test_running_text_reference_is_not_figure_caption():
     assert _caption_is_figure("Figure 3. Training stability analysis")
     assert _caption_is_figure("Fig. 2: Overview")
     assert _caption_is_figure("Fig 4. Ablation results")
+    assert _caption_is_figure("Figure 4 | Fatal-aware masking")
     assert not _caption_is_figure("Figure 3 showing the per-seed test mAP distribution.")
 
 
@@ -140,6 +143,14 @@ def test_codex_config_disables_proxy_by_default():
 
     assert not config.use_proxy
     assert proxied_config.use_proxy
+
+
+def test_unlabeled_table_asset_does_not_get_fake_table_number():
+    asset = PaperAsset("table", 11, Path("chart.png"), "Table on page 11", "legend text")
+    label = _asset_display_label(2, asset, {"figure": 0, "table": 1, "formula": 0}, {})
+
+    assert label == "第 11 页表格截图"
+    assert "表 2" not in label
 
 
 def test_table_rect_expands_to_zero_height_bottom_border():

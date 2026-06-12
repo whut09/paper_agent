@@ -364,6 +364,9 @@ def _capture_tables(
             continue
         table_rect = _expand_table_rect_to_borders(page, table_rect)
         caption, caption_rect = _nearby_caption_with_rect(page, table_rect, ("table", "表"))
+        table_text = _table_to_text(table)
+        if not caption and not _table_detection_looks_reliable(table, table_text):
+            continue
         clip_rect = _merge_rects([table_rect, caption_rect]) if caption_rect else table_rect
         key = _box_key(page_no, clip_rect)
         if key in seen_boxes:
@@ -371,7 +374,6 @@ def _capture_tables(
         seen_boxes.add(key)
         path = work_dir / f"page-{page_no:03d}-table-{idx:02d}.png"
         _save_clip(page, clip_rect, path, padding=2)
-        table_text = _table_to_text(table)
         assets.append(PaperAsset("table", page_no, path, caption or f"Table on page {page_no}", table_text, rect=table_rect))
     return assets
 
@@ -969,7 +971,7 @@ def _caption_is_figure(caption: str) -> bool:
     stripped = caption.strip()
     if stripped.startswith("图"):
         return True
-    return bool(re.match(r"(?i)^(?:figure|fig\.?)\s*\d+[A-Za-z]?\s*[.:：]", stripped))
+    return bool(re.match(r"(?i)^(?:figure|fig\.?)\s*\d+[A-Za-z]?\s*(?:[.:：]|\|)", stripped))
 
 
 def _caption_is_table(caption: str) -> bool:
@@ -977,7 +979,7 @@ def _caption_is_table(caption: str) -> bool:
     stripped = caption.strip()
     if stripped.startswith("表"):
         return True
-    return bool(re.match(r"(?i)^(?:table|tab\.)\s*\d+[A-Za-z]?\s*[.:：]", stripped))
+    return bool(re.match(r"(?i)^(?:table|tab\.)\s*\d+[A-Za-z]?\s*(?:[.:：]|\|)", stripped))
 
 
 def _table_rect_for_caption(
@@ -1326,6 +1328,32 @@ def _table_to_text(table) -> str:
         cells = [_clean_xml_text(str(cell or "")).strip().replace("\n", " ") for cell in row]
         lines.append(" | ".join(cells))
     return "\n".join(lines)
+
+
+def _table_detection_looks_reliable(table, table_text: str) -> bool:
+    try:
+        rows = table.extract()
+    except Exception:
+        rows = []
+    non_empty_rows = []
+    non_empty_cells = 0
+    numeric_cells = 0
+    for row in rows:
+        cells = [_clean_xml_text(str(cell or "")).strip() for cell in row]
+        filled = [cell for cell in cells if cell]
+        if not filled:
+            continue
+        non_empty_rows.append(filled)
+        non_empty_cells += len(filled)
+        numeric_cells += sum(1 for cell in filled if re.search(r"\d", cell))
+    if len(non_empty_rows) < 2 or non_empty_cells < 6:
+        return False
+    if numeric_cells < 3:
+        return False
+    words = re.findall(r"[A-Za-z\u4e00-\u9fff]{3,}", _clean_xml_text(table_text))
+    if len(non_empty_rows) <= 2 and len(words) > non_empty_cells:
+        return False
+    return True
 
 
 def _nearby_caption(page: fitz.Page, rect: fitz.Rect, prefixes: Iterable[str]) -> str:
@@ -2608,6 +2636,14 @@ def _asset_display_label(
         return original_label
     kind = asset.kind if asset.kind in counters else "figure"
     counters[kind] += 1
+    if kind == "table":
+        label = f"第 {asset.page_number} 页表格截图"
+        labels[asset_id] = label
+        return label
+    if kind == "figure":
+        label = f"第 {asset.page_number} 页图片截图"
+        labels[asset_id] = label
+        return label
     prefix = {"table": "表", "figure": "图", "formula": "公式"}.get(kind, "图")
     label = f"{prefix} {counters[kind]}"
     labels[asset_id] = label
