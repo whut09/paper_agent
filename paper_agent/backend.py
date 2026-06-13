@@ -10,7 +10,7 @@ from pathlib import Path
 from string import Template
 from paper_agent.doclayout import ModelInstance
 from paper_agent.config import ConfigManager
-from paper_agent.paper_summary import DEFAULT_MAX_ASSETS, summarize_paper
+from paper_agent.paper_summary import DEFAULT_MAX_ASSETS, record_summary_correction, summarize_paper
 
 flask_app = Flask("paper_agent")
 flask_app.config.from_mapping(
@@ -107,6 +107,22 @@ def create_summarize_tasks():
     filename = Path(file.filename or "paper.pdf").name
     task = summarize_task.delay(stream, filename, args)
     return {"id": task.id}
+
+
+@flask_app.route("/v1/summary_feedback", methods=["POST"])
+def create_summary_feedback():
+    payload = request.get_json(silent=True) or {}
+    try:
+        path = record_summary_correction(
+            payload.get("paper_id", "global"),
+            payload.get("original", ""),
+            payload.get("corrected", ""),
+            note=payload.get("note", ""),
+            category=payload.get("category", "summary"),
+        )
+    except ValueError as exc:
+        return {"state": "error", "message": str(exc)}, 400
+    return {"state": "stored", "path": str(path)}
 
 
 @flask_app.route("/v1/translate/<id>", methods=["GET"])

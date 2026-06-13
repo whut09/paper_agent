@@ -17,10 +17,12 @@ from paper_agent.paper_summary import (
     _build_knowledge_graph,
     _caption_is_figure,
     _caption_is_table,
+    _correction_memory_context,
     _ensure_asset_markers,
     _enforce_core_original_title,
     _extract_abstract_from_text,
     _extract_verifiable_claims,
+    _load_correction_memories,
     _expand_table_rect_to_borders,
     _missing_asset_references,
     _paragraph,
@@ -31,6 +33,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _sync_inline_asset_references,
     _with_asset_references,
+    record_summary_correction,
     summarize_paper,
 )
 
@@ -151,6 +154,32 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         graph_text = context.knowledge_graph_path.read_text(encoding="utf-8")
         assert "paper:paper" in graph_text
         assert "agent_trace" in graph_text
+
+
+def test_correction_memory_records_and_loads_by_paper_id():
+    with TemporaryDirectory() as tmp:
+        memory_path = Path(tmp) / "corrections.jsonl"
+        record_summary_correction(
+            "Paper A",
+            "把图4写成表2",
+            "图表引用必须按原始 caption 类型",
+            note="不要让无 caption 图伪装成表格编号",
+            category="asset_reference",
+            memory_path=memory_path,
+        )
+        record_summary_correction(
+            "Paper B",
+            "摘要漏掉右栏",
+            "双栏摘要要按阅读顺序拼接",
+            memory_path=memory_path,
+        )
+
+        memories = _load_correction_memories("Paper A", memory_path=memory_path)
+        context = _correction_memory_context(memories)
+
+        assert len(memories) == 1
+        assert "图表引用" in context
+        assert "无 caption 图" in context
 
 
 def test_verifier_claim_extraction_classifies_method_and_contribution():

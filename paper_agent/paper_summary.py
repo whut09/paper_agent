@@ -185,6 +185,16 @@ class KnowledgeGraphEdge:
     source_section: str = ""
 
 
+@dataclass
+class CorrectionMemory:
+    paper_id: str
+    original: str
+    corrected: str
+    note: str = ""
+    category: str = "summary"
+    created_at: str = ""
+
+
 class PaperAgentRole(str, Enum):
     READER = "Reader"
     EXTRACTOR = "Extractor"
@@ -214,6 +224,7 @@ class PaperWorkflowContext:
     formulas: list[str] = field(default_factory=list)
     grounding_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     knowledge_graph: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    correction_memories: list[CorrectionMemory] = field(default_factory=list)
     config: CodexConfig | None = None
     client: openai.OpenAI | None = None
     chunk_notes: list[str] = field(default_factory=list)
@@ -350,6 +361,7 @@ class ExtractSections(PaperWorkflowNode):
         context.formulas = _extract_formula_candidates(context.text)
         context.grounding_map = _build_grounding_map(context.text)
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map)
+        context.correction_memories = _load_correction_memories(_paper_memory_id(context.paper_title or context.paper_name))
 
 
 class SummarizeContribution(PaperWorkflowNode):
@@ -368,6 +380,7 @@ class SummarizeContribution(PaperWorkflowNode):
             context.text,
             context.assets,
             context.summary_language,
+            context.correction_memories,
         )
 
 
@@ -391,6 +404,7 @@ class ExtractMethods(PaperWorkflowNode):
             context.formulas,
             _recognized_formula_context(context.assets),
             context.paper_title,
+            context.correction_memories,
         )
 
 
@@ -412,6 +426,7 @@ class VerifyClaims(PaperWorkflowNode):
             context.config.model,
             context.paper_title,
             context.assets,
+            context.correction_memories,
         )
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
 
@@ -1887,6 +1902,104 @@ def _first_value(envs: dict[str, str], *keys: str) -> str:
     return ""
 
 
+def record_summary_correction(
+    paper_id: str,
+    original: str,
+    corrected: str,
+    *,
+    note: str = "",
+    category: str = "summary",
+    memory_path: str | Path | None = None,
+) -> Path:
+    """Store user feedback as correction memory for future paper summaries."""
+    memory = CorrectionMemory(
+        paper_id=_paper_memory_id(paper_id),
+        original=_clean_xml_text(original).strip(),
+        corrected=_clean_xml_text(corrected).strip(),
+        note=_clean_xml_text(note).strip(),
+        category=_clean_xml_text(category).strip() or "summary",
+        created_at=datetime.now(timezone.utc).isoformat(),
+    )
+    if not memory.original and not memory.corrected and not memory.note:
+        raise ValueError("Correction memory requires original, corrected, or note content.")
+    path = _correction_memory_path(memory_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(memory.__dict__, ensure_ascii=False) + "\n")
+    return path
+
+
+def _load_correction_memories(
+    paper_id: str = "",
+    *,
+    limit: int = 20,
+    memory_path: str | Path | None = None,
+) -> list[CorrectionMemory]:
+    path = _correction_memory_path(memory_path)
+    if not path.exists():
+        return []
+    normalized_paper_id = _paper_memory_id(paper_id)
+    memories: list[CorrectionMemory] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        memory = CorrectionMemory(
+            paper_id=_paper_memory_id(str(payload.get("paper_id", ""))),
+            original=str(payload.get("original", "")),
+            corrected=str(payload.get("corrected", "")),
+            note=str(payload.get("note", "")),
+            category=str(payload.get("category", "summary") or "summary"),
+            created_at=str(payload.get("created_at", "")),
+        )
+        if normalized_paper_id and memory.paper_id not in {"", "global", normalized_paper_id}:
+            continue
+        memories.append(memory)
+        if len(memories) >= limit:
+            break
+    return list(reversed(memories))
+
+
+def _correction_memory_context(memories: list[CorrectionMemory], limit: int = 8) -> str:
+    if not memories:
+        return "无历史修正。"
+    lines = []
+    for memory in memories[-limit:]:
+        pieces = [f"[{memory.category}]"]
+        if memory.original:
+            pieces.append(f"避免：{memory.original}")
+        if memory.corrected:
+            pieces.append(f"改为：{memory.corrected}")
+        if memory.note:
+            pieces.append(f"规则：{memory.note}")
+        lines.append("；".join(pieces))
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _correction_memory_path(memory_path: str | Path | None = None) -> Path:
+    if memory_path:
+        return Path(memory_path)
+    configured = ConfigManager.all().get("PAPER_AGENT_CORRECTION_MEMORY_PATH") or os.environ.get(
+        "PAPER_AGENT_CORRECTION_MEMORY_PATH"
+    )
+    if configured:
+        return Path(str(configured))
+    return Path.home() / ".config" / "PaperAgent" / "summary_corrections.jsonl"
+
+
+def _paper_memory_id(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", _clean_xml_text(value or "")).strip().lower()
+    normalized = re.sub(r"[^a-z0-9\u4e00-\u9fff._-]+", "-", normalized).strip("-")
+    return normalized[:120] or "global"
+
+
 def _summarize_with_codex(
     paper_text: str,
     assets: list[PaperAsset],
@@ -1905,6 +2018,7 @@ def _summarize_with_codex(
             paper_text,
             assets,
             summary_language,
+            _load_correction_memories(_paper_memory_id(paper_title)),
         )
         summary = _integrate_summary_with_codex(
             client,
@@ -1916,6 +2030,7 @@ def _summarize_with_codex(
             formulas or [],
             recognized_formulas,
             paper_title,
+            _load_correction_memories(_paper_memory_id(paper_title)),
         )
         verified_summary, _verification = _verify_summary_claims(
             summary,
@@ -1926,6 +2041,7 @@ def _summarize_with_codex(
             config.model,
             paper_title,
             assets,
+            _load_correction_memories(_paper_memory_id(paper_title)),
         )
         return verified_summary
     finally:
@@ -1938,14 +2054,19 @@ def _summarize_chunks_with_codex(
     paper_text: str,
     assets: list[PaperAsset],
     summary_language: str,
+    correction_memories: list[CorrectionMemory] | None = None,
 ) -> list[str]:
     chunks = _chunk_text(paper_text, 16000)
     asset_context = _asset_context(assets)
+    memory_context = _correction_memory_context(correction_memories or [])
     chunk_notes = []
     for idx, chunk in enumerate(chunks, 1):
         user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
 只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
+
+历史用户修正规则：
+{memory_context}
 
 可用图表截图：
 {asset_context}
@@ -1967,15 +2088,18 @@ def _integrate_summary_with_codex(
     formulas: list[str],
     recognized_formulas: str,
     paper_title: str,
+    correction_memories: list[CorrectionMemory] | None = None,
 ) -> str:
     asset_context = _asset_context(assets)
     formula_context = _formula_context(formulas)
+    memory_context = _correction_memory_context(correction_memories or [])
     final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
     return _chat(
         client,
         model,
         (
             f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+            f"历史用户修正规则：\n{memory_context}\n\n"
             f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
             f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
             f"关键公式候选：\n{formula_context}\n\n"
@@ -1995,6 +2119,7 @@ def _verify_summary_claims(
     model: str,
     paper_title: str,
     assets: list[PaperAsset],
+    correction_memories: list[CorrectionMemory] | None = None,
 ) -> tuple[str, VerificationResult]:
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
@@ -2003,7 +2128,7 @@ def _verify_summary_claims(
     summary = _ensure_asset_markers(summary, assets)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
-    verification = _run_verification_agent(client, model, paper_text, grounded_map)
+    verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [])
     if not verification.passed:
         details = "\n".join(f"- {error}" for error in verification.errors[:8])
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
@@ -2015,12 +2140,14 @@ def _run_verification_agent(
     model: str,
     paper_text: str,
     grounding_map: dict[str, list[dict[str, str]]],
+    correction_memories: list[CorrectionMemory] | None = None,
 ) -> VerificationResult:
     claims = grounding_map.get("claims", [])
     if not claims:
         return VerificationResult(False, ["未能从总结中抽取到可校验 claim。"])
 
     evidence = _verification_evidence_text(paper_text, grounding_map)
+    memory_context = _correction_memory_context(correction_memories or [])
     prompt = (
         "你是论文总结 Verifier Agent。你的任务不是润色总结，而是判断总结中的关键 claim 是否被原文证据支持。\n\n"
         "必须遵守：\n"
@@ -2031,6 +2158,7 @@ def _run_verification_agent(
         "5. 只输出 JSON，不要输出 Markdown，不要解释过程。\n\n"
         "输出格式：\n"
         "{\"pass\": true/false, \"errors\": [\"具体错误1\", \"具体错误2\"]}\n\n"
+        f"历史用户修正规则：\n{memory_context}\n\n"
         f"Grounding Map：\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
     )
     output = _chat(
