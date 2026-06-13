@@ -2324,7 +2324,7 @@ def _verify_summary_claims(
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
     verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [], prompt_patches)
-    if not verification.passed:
+    if _verification_should_block_report(verification):
         details = "\n".join(f"- {error}" for error in verification.errors[:8])
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
     return summary, verification
@@ -2367,7 +2367,24 @@ def _run_verification_agent(
         prompt,
         system_prompt=CRITIC_SYSTEM_PROMPT,
     )
-    return _parse_verification_result(output)
+    verification = _parse_verification_result(output)
+    if _verification_failed_due_to_format(verification):
+        repair_prompt = (
+            "下面是 Verifier Agent 的原始输出。请只把它转换为合法 JSON；"
+            "如果无法判断，就输出 {\"pass\": true, \"errors\": []}，不要输出 Markdown 或解释。\n\n"
+            "合法格式：{\"pass\": true/false, \"errors\": [\"具体错误1\"]}\n\n"
+            f"原始输出：\n{output}"
+        )
+        repaired_output = _chat(
+            client,
+            model,
+            repair_prompt,
+            system_prompt=CRITIC_SYSTEM_PROMPT,
+        )
+        repaired = _parse_verification_result(repaired_output)
+        if not _verification_failed_due_to_format(repaired):
+            return repaired
+    return verification
 
 
 def _extract_verifiable_claims(summary: str, limit: int = 24) -> list[dict[str, str]]:
@@ -2743,6 +2760,14 @@ def _parse_verification_result(output: str) -> VerificationResult:
     if not passed and not cleaned_errors:
         cleaned_errors = ["Verifier Agent 判定失败，但未给出具体错误。"]
     return VerificationResult(passed, cleaned_errors)
+
+
+def _verification_should_block_report(result: VerificationResult) -> bool:
+    return not result.passed and not _verification_failed_due_to_format(result)
+
+
+def _verification_failed_due_to_format(result: VerificationResult) -> bool:
+    return not result.passed and any("输出不是合法 JSON" in error for error in result.errors)
 
 
 def _extract_json_object(text: str) -> str:

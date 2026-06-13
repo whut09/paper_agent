@@ -34,10 +34,12 @@ from paper_agent.paper_summary import (
     _row_looks_table_section_label,
     _row_looks_table_like,
     _sync_inline_asset_references,
+    _verification_should_block_report,
     _with_asset_references,
     get_self_improving_prompt_patches,
     record_summary_correction,
     summarize_paper,
+    VerificationResult,
 )
 
 
@@ -329,6 +331,14 @@ def test_verifier_json_parser_is_conservative():
     assert failed.errors == ["新增了原文没有的贡献"]
     assert not invalid.passed
     assert invalid.errors
+
+
+def test_verifier_format_error_does_not_block_report():
+    invalid_json = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object"])
+    unsupported_claim = VerificationResult(False, ["新增了原文没有的贡献"])
+
+    assert not _verification_should_block_report(invalid_json)
+    assert _verification_should_block_report(unsupported_claim)
 
 
 def test_two_column_prose_after_table_is_not_table_row():
