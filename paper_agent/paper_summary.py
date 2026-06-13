@@ -195,6 +195,13 @@ class CorrectionMemory:
     created_at: str = ""
 
 
+@dataclass
+class PromptPatch:
+    target: str
+    content: str
+    source_category: str = "summary"
+
+
 class PaperAgentRole(str, Enum):
     READER = "Reader"
     EXTRACTOR = "Extractor"
@@ -225,6 +232,7 @@ class PaperWorkflowContext:
     grounding_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     knowledge_graph: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     correction_memories: list[CorrectionMemory] = field(default_factory=list)
+    prompt_patches: list[PromptPatch] = field(default_factory=list)
     config: CodexConfig | None = None
     client: openai.OpenAI | None = None
     chunk_notes: list[str] = field(default_factory=list)
@@ -362,6 +370,7 @@ class ExtractSections(PaperWorkflowNode):
         context.grounding_map = _build_grounding_map(context.text)
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map)
         context.correction_memories = _load_correction_memories(_paper_memory_id(context.paper_title or context.paper_name))
+        context.prompt_patches = _build_prompt_patches(context.correction_memories)
 
 
 class SummarizeContribution(PaperWorkflowNode):
@@ -381,6 +390,7 @@ class SummarizeContribution(PaperWorkflowNode):
             context.assets,
             context.summary_language,
             context.correction_memories,
+            context.prompt_patches,
         )
 
 
@@ -405,6 +415,7 @@ class ExtractMethods(PaperWorkflowNode):
             _recognized_formula_context(context.assets),
             context.paper_title,
             context.correction_memories,
+            context.prompt_patches,
         )
 
 
@@ -427,6 +438,7 @@ class VerifyClaims(PaperWorkflowNode):
             context.paper_title,
             context.assets,
             context.correction_memories,
+            context.prompt_patches,
         )
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
 
@@ -1983,6 +1995,171 @@ def _correction_memory_context(memories: list[CorrectionMemory], limit: int = 8)
     return "\n".join(f"- {line}" for line in lines)
 
 
+def get_self_improving_prompt_patches(
+    paper_id: str = "global",
+    *,
+    memory_path: str | Path | None = None,
+) -> dict[str, str]:
+    memories = _load_correction_memories(paper_id, memory_path=memory_path)
+    patches = _build_prompt_patches(memories)
+    return {
+        target: _prompt_patch_context(patches, target)
+        for target in ("extraction", "summarization", "evaluation")
+    }
+
+
+def _build_prompt_patches(memories: list[CorrectionMemory], limit: int = 12) -> list[PromptPatch]:
+    patches: list[PromptPatch] = []
+    for memory in memories[-limit:]:
+        memory_text = _memory_text(memory)
+        for target in ("extraction", "summarization", "evaluation"):
+            if not _memory_targets_prompt(memory, target, memory_text):
+                continue
+            patches.append(
+                PromptPatch(
+                    target=target,
+                    content=_memory_to_prompt_rule(memory, target),
+                    source_category=memory.category or "summary",
+                )
+            )
+    return patches
+
+
+def _prompt_patch_context(patches: list[PromptPatch], target: str, limit: int = 8) -> str:
+    target_patches = [patch for patch in patches if patch.target == target]
+    if not target_patches:
+        return "No learned prompt patches."
+    header = {
+        "extraction": "Self-improving extraction prompt patch:",
+        "summarization": "Self-improving summarization prompt patch:",
+        "evaluation": "Self-improving evaluation rubric patch:",
+    }.get(target, "Self-improving prompt patch:")
+    lines = [header]
+    seen: set[str] = set()
+    for patch in target_patches[-limit:]:
+        content = _clean_xml_text(patch.content).strip()
+        if not content or content in seen:
+            continue
+        seen.add(content)
+        lines.append(f"- {content}")
+    return "\n".join(lines) if len(lines) > 1 else "No learned prompt patches."
+
+
+def _memory_text(memory: CorrectionMemory) -> str:
+    return " ".join(
+        [
+            memory.category or "",
+            memory.original or "",
+            memory.corrected or "",
+            memory.note or "",
+        ]
+    ).lower()
+
+
+def _memory_targets_prompt(memory: CorrectionMemory, target: str, memory_text: str) -> bool:
+    category = (memory.category or "").lower()
+    if category in {"global", "all", target}:
+        return True
+    if target == "extraction":
+        keywords = (
+            "extract",
+            "extraction",
+            "title",
+            "abstract",
+            "section",
+            "column",
+            "caption",
+            "figure",
+            "table",
+            "formula",
+            "asset",
+            "crop",
+            "page",
+            "evidence",
+            "标题",
+            "摘要",
+            "双栏",
+            "分页",
+            "章节",
+            "正文",
+            "图",
+            "表",
+            "公式",
+            "截图",
+            "截取",
+            "定位",
+            "抽取",
+            "原文",
+        )
+    elif target == "summarization":
+        keywords = (
+            "summary",
+            "summarization",
+            "writing",
+            "structure",
+            "method",
+            "contribution",
+            "result",
+            "总结",
+            "摘要",
+            "标题",
+            "创新",
+            "方法",
+            "机制",
+            "主线",
+            "结果",
+            "结论",
+            "解释",
+        )
+    else:
+        keywords = (
+            "evaluation",
+            "verify",
+            "verification",
+            "critic",
+            "rubric",
+            "claim",
+            "grounding",
+            "hallucination",
+            "source",
+            "section",
+            "figure",
+            "table",
+            "formula",
+            "评估",
+            "校验",
+            "验证",
+            "可信",
+            "证据",
+            "原文",
+            "章节",
+            "编号",
+            "图",
+            "表",
+            "公式",
+            "错误",
+            "不一致",
+            "所示",
+        )
+    return any(keyword in memory_text for keyword in keywords)
+
+
+def _memory_to_prompt_rule(memory: CorrectionMemory, target: str) -> str:
+    pieces = []
+    if memory.original:
+        pieces.append(f"avoid: {memory.original}")
+    if memory.corrected:
+        pieces.append(f"prefer: {memory.corrected}")
+    if memory.note:
+        pieces.append(f"rule: {memory.note}")
+    base = "; ".join(pieces) or f"apply prior user correction category={memory.category}"
+    if target == "extraction":
+        return f"During evidence extraction, {base}; preserve source page/section/caption boundaries."
+    if target == "summarization":
+        return f"During summary synthesis, {base}; do not rewrite evidence into unsupported claims."
+    return f"During verification, fail outputs that violate this learned rule: {base}."
+
+
 def _correction_memory_path(memory_path: str | Path | None = None) -> Path:
     if memory_path:
         return Path(memory_path)
@@ -2012,13 +2189,16 @@ def _summarize_with_codex(
 ) -> str:
     client = _create_codex_client(config)
     try:
+        correction_memories = _load_correction_memories(_paper_memory_id(paper_title))
+        prompt_patches = _build_prompt_patches(correction_memories)
         chunk_notes = _summarize_chunks_with_codex(
             client,
             config.model,
             paper_text,
             assets,
             summary_language,
-            _load_correction_memories(_paper_memory_id(paper_title)),
+            correction_memories,
+            prompt_patches,
         )
         summary = _integrate_summary_with_codex(
             client,
@@ -2030,7 +2210,8 @@ def _summarize_with_codex(
             formulas or [],
             recognized_formulas,
             paper_title,
-            _load_correction_memories(_paper_memory_id(paper_title)),
+            correction_memories,
+            prompt_patches,
         )
         verified_summary, _verification = _verify_summary_claims(
             summary,
@@ -2041,7 +2222,8 @@ def _summarize_with_codex(
             config.model,
             paper_title,
             assets,
-            _load_correction_memories(_paper_memory_id(paper_title)),
+            correction_memories,
+            prompt_patches,
         )
         return verified_summary
     finally:
@@ -2055,10 +2237,14 @@ def _summarize_chunks_with_codex(
     assets: list[PaperAsset],
     summary_language: str,
     correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
 ) -> list[str]:
     chunks = _chunk_text(paper_text, 16000)
     asset_context = _asset_context(assets)
-    memory_context = _correction_memory_context(correction_memories or [])
+    memories = correction_memories or []
+    patches = prompt_patches or _build_prompt_patches(memories)
+    memory_context = _correction_memory_context(memories)
+    extraction_patch = _prompt_patch_context(patches, "extraction")
     chunk_notes = []
     for idx, chunk in enumerate(chunks, 1):
         user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
@@ -2067,6 +2253,9 @@ def _summarize_chunks_with_codex(
 
 历史用户修正规则：
 {memory_context}
+
+自优化抽取提示词：
+{extraction_patch}
 
 可用图表截图：
 {asset_context}
@@ -2089,10 +2278,14 @@ def _integrate_summary_with_codex(
     recognized_formulas: str,
     paper_title: str,
     correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
 ) -> str:
     asset_context = _asset_context(assets)
     formula_context = _formula_context(formulas)
-    memory_context = _correction_memory_context(correction_memories or [])
+    memories = correction_memories or []
+    patches = prompt_patches or _build_prompt_patches(memories)
+    memory_context = _correction_memory_context(memories)
+    summarization_patch = _prompt_patch_context(patches, "summarization")
     final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
     return _chat(
         client,
@@ -2100,6 +2293,7 @@ def _integrate_summary_with_codex(
         (
             f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
             f"历史用户修正规则：\n{memory_context}\n\n"
+            f"自优化总结提示词：\n{summarization_patch}\n\n"
             f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
             f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
             f"关键公式候选：\n{formula_context}\n\n"
@@ -2120,6 +2314,7 @@ def _verify_summary_claims(
     paper_title: str,
     assets: list[PaperAsset],
     correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
 ) -> tuple[str, VerificationResult]:
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
@@ -2128,7 +2323,7 @@ def _verify_summary_claims(
     summary = _ensure_asset_markers(summary, assets)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
-    verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [])
+    verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [], prompt_patches)
     if not verification.passed:
         details = "\n".join(f"- {error}" for error in verification.errors[:8])
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
@@ -2141,13 +2336,17 @@ def _run_verification_agent(
     paper_text: str,
     grounding_map: dict[str, list[dict[str, str]]],
     correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
 ) -> VerificationResult:
     claims = grounding_map.get("claims", [])
     if not claims:
         return VerificationResult(False, ["未能从总结中抽取到可校验 claim。"])
 
     evidence = _verification_evidence_text(paper_text, grounding_map)
-    memory_context = _correction_memory_context(correction_memories or [])
+    memories = correction_memories or []
+    patches = prompt_patches or _build_prompt_patches(memories)
+    memory_context = _correction_memory_context(memories)
+    evaluation_patch = _prompt_patch_context(patches, "evaluation")
     prompt = (
         "你是论文总结 Verifier Agent。你的任务不是润色总结，而是判断总结中的关键 claim 是否被原文证据支持。\n\n"
         "必须遵守：\n"
@@ -2159,6 +2358,7 @@ def _run_verification_agent(
         "输出格式：\n"
         "{\"pass\": true/false, \"errors\": [\"具体错误1\", \"具体错误2\"]}\n\n"
         f"历史用户修正规则：\n{memory_context}\n\n"
+        f"自优化评估 Rubric：\n{evaluation_patch}\n\n"
         f"Grounding Map：\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
     )
     output = _chat(

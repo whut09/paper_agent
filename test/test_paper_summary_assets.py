@@ -13,6 +13,7 @@ from paper_agent.paper_summary import (
     TextLine,
     _asset_display_label,
     _attach_claims_to_grounding_map,
+    _build_prompt_patches,
     _build_grounding_map,
     _build_knowledge_graph,
     _caption_is_figure,
@@ -26,6 +27,7 @@ from paper_agent.paper_summary import (
     _expand_table_rect_to_borders,
     _missing_asset_references,
     _paragraph,
+    _prompt_patch_context,
     _parse_verification_result,
     _resolve_codex_config,
     _row_is_prose_after_table,
@@ -33,6 +35,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _sync_inline_asset_references,
     _with_asset_references,
+    get_self_improving_prompt_patches,
     record_summary_correction,
     summarize_paper,
 )
@@ -180,6 +183,44 @@ def test_correction_memory_records_and_loads_by_paper_id():
         assert len(memories) == 1
         assert "图表引用" in context
         assert "无 caption 图" in context
+
+
+def test_self_improving_prompt_patches_route_feedback_by_target():
+    with TemporaryDirectory() as tmp:
+        memory_path = Path(tmp) / "corrections.jsonl"
+        record_summary_correction(
+            "Paper A",
+            "公式13解释后又写成公式2所示",
+            "公式编号必须保持和原文一致",
+            category="verification",
+            memory_path=memory_path,
+        )
+        record_summary_correction(
+            "Paper A",
+            "双栏摘要只抽取了左栏",
+            "分页或双栏摘要要按阅读顺序完整拼接",
+            category="extraction",
+            memory_path=memory_path,
+        )
+        record_summary_correction(
+            "Paper A",
+            "方法主线小标题背景太长",
+            "小标题只包裹文字，不要拉满整行",
+            category="summarization",
+            memory_path=memory_path,
+        )
+
+        memories = _load_correction_memories("Paper A", memory_path=memory_path)
+        patches = _build_prompt_patches(memories)
+        extraction_context = _prompt_patch_context(patches, "extraction")
+        summary_context = _prompt_patch_context(patches, "summarization")
+        evaluation_context = _prompt_patch_context(patches, "evaluation")
+        public_context = get_self_improving_prompt_patches("Paper A", memory_path=memory_path)
+
+        assert "双栏摘要" in extraction_context
+        assert "方法主线" in summary_context
+        assert "公式13" in evaluation_context
+        assert set(public_context) == {"extraction", "summarization", "evaluation"}
 
 
 def test_verifier_claim_extraction_classifies_method_and_contribution():

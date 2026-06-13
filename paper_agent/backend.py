@@ -10,7 +10,12 @@ from pathlib import Path
 from string import Template
 from paper_agent.doclayout import ModelInstance
 from paper_agent.config import ConfigManager
-from paper_agent.paper_summary import DEFAULT_MAX_ASSETS, record_summary_correction, summarize_paper
+from paper_agent.paper_summary import (
+    DEFAULT_MAX_ASSETS,
+    get_self_improving_prompt_patches,
+    record_summary_correction,
+    summarize_paper,
+)
 
 flask_app = Flask("paper_agent")
 flask_app.config.from_mapping(
@@ -123,6 +128,12 @@ def create_summary_feedback():
     except ValueError as exc:
         return {"state": "error", "message": str(exc)}, 400
     return {"state": "stored", "path": str(path)}
+
+
+@flask_app.route("/v1/prompt_patches", methods=["GET"])
+def get_prompt_patches():
+    paper_id = request.args.get("paper_id", "global")
+    return {"paper_id": paper_id, "patches": get_self_improving_prompt_patches(paper_id)}
 
 
 @flask_app.route("/v1/translate/<id>", methods=["GET"])
