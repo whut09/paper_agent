@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import os
 import re
 import shutil
@@ -147,6 +148,12 @@ class CodexConfig:
 
 
 @dataclass
+class VerificationResult:
+    passed: bool
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
 class PaperWorkflowContext:
     input_path: str
     output_dir: str | Path
@@ -170,6 +177,7 @@ class PaperWorkflowContext:
     client: openai.OpenAI | None = None
     chunk_notes: list[str] = field(default_factory=list)
     summary: str = ""
+    verification: VerificationResult | None = None
     docx_path: Path | None = None
 
     def report(self, value: float, desc: str) -> None:
@@ -341,8 +349,9 @@ class VerifyClaims(PaperWorkflowNode):
         if context.client is None or context.config is None:
             raise ValueError("VerifyClaims requires an initialized Codex client.")
         context.report(0.78, "校验标题、摘要和图表引用...")
-        context.summary = _verify_summary_claims(
+        context.summary, context.verification = _verify_summary_claims(
             context.summary,
+            context.text,
             context.abstract,
             context.client,
             context.config.model,
@@ -1839,7 +1848,16 @@ def _summarize_with_codex(
             recognized_formulas,
             paper_title,
         )
-        return _verify_summary_claims(summary, abstract, client, config.model, paper_title, assets)
+        verified_summary, _verification = _verify_summary_claims(
+            summary,
+            paper_text,
+            abstract,
+            client,
+            config.model,
+            paper_title,
+            assets,
+        )
+        return verified_summary
     finally:
         client.close()
 
@@ -1899,17 +1917,160 @@ def _integrate_summary_with_codex(
 
 def _verify_summary_claims(
     summary: str,
+    paper_text: str,
     abstract: str,
     client: openai.OpenAI,
     model: str,
     paper_title: str,
     assets: list[PaperAsset],
-) -> str:
+) -> tuple[str, VerificationResult]:
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
     summary = _enforce_core_original_title(summary, paper_title)
-    return _ensure_asset_markers(summary, assets)
+    summary = _ensure_asset_markers(summary, assets)
+    verification = _run_verification_agent(client, model, paper_text, summary)
+    if not verification.passed:
+        details = "\n".join(f"- {error}" for error in verification.errors[:8])
+        raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
+    return summary, verification
+
+
+def _run_verification_agent(
+    client: openai.OpenAI,
+    model: str,
+    paper_text: str,
+    summary: str,
+) -> VerificationResult:
+    claims = _extract_verifiable_claims(summary)
+    if not claims:
+        return VerificationResult(False, ["未能从总结中抽取到可校验 claim。"])
+
+    evidence = _verification_evidence_text(paper_text)
+    prompt = (
+        "你是论文总结 Verifier Agent。你的任务不是润色总结，而是判断总结中的关键 claim 是否被原文证据支持。\n\n"
+        "必须遵守：\n"
+        "1. claim 必须能在原文证据中找到直接支持，不能靠常识或猜测补全。\n"
+        "2. method / 方法相关 claim 必须能在 method、approach、model、training、algorithm、implementation 等方法相关段落中找到依据。\n"
+        "3. contribution / 创新点相关 claim 不能新增原文没有声明的贡献、能力、数据集、指标或应用场景。\n"
+        "4. 只输出 JSON，不要输出 Markdown，不要解释过程。\n\n"
+        "输出格式：\n"
+        "{\"pass\": true/false, \"errors\": [\"具体错误1\", \"具体错误2\"]}\n\n"
+        f"待校验 claims：\n{json.dumps(claims, ensure_ascii=False, indent=2)}\n\n"
+        f"原文证据：\n{evidence}"
+    )
+    output = _chat(
+        client,
+        model,
+        prompt,
+        system_prompt="You are a strict paper-summary verifier. Output only valid JSON.",
+    )
+    return _parse_verification_result(output)
+
+
+def _extract_verifiable_claims(summary: str, limit: int = 24) -> list[dict[str, str]]:
+    claims: list[dict[str, str]] = []
+    current_section = ""
+    for raw_line in summary.splitlines():
+        line = _clean_xml_text(raw_line).strip()
+        if not line or re.fullmatch(r"\[\[ASSET:\d+\]\]", line):
+            continue
+        if line.startswith("#"):
+            current_section = line.lstrip("#").strip()
+            continue
+        if current_section in {"核心信息", "摘要"}:
+            continue
+        normalized = _normalize_markdown_line(line)
+        for sentence in _split_claim_sentences(normalized):
+            if not _claim_is_verifiable(sentence):
+                continue
+            claims.append(
+                {
+                    "section": current_section or "正文",
+                    "type": _claim_type(current_section, sentence),
+                    "claim": sentence,
+                }
+            )
+            if len(claims) >= limit:
+                return claims
+    return claims
+
+
+def _split_claim_sentences(text: str) -> list[str]:
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[。！？!?；;])\s*", text)
+    return [part.strip() for part in parts if len(part.strip()) >= 18]
+
+
+def _claim_is_verifiable(sentence: str) -> bool:
+    if any(token in sentence for token in ("原文未", "未提及", "未知", "N/A")):
+        return False
+    return bool(re.search(r"[A-Za-z\u4e00-\u9fff]", sentence))
+
+
+def _claim_type(section: str, sentence: str) -> str:
+    text = f"{section} {sentence}"
+    if any(token in section for token in ("创新", "贡献")) or re.search(
+        r"(?i)\b(contribution|novelty|innovation)\b",
+        section,
+    ):
+        return "contribution"
+    if any(token in section for token in ("方法", "机制", "流程")) or re.search(
+        r"(?i)\b(method|approach|model|training|algorithm|implementation)\b",
+        section,
+    ):
+        return "method"
+    if any(token in text for token in ("创新", "贡献", "提出", "首次", "开放", "解决")):
+        return "contribution"
+    if any(token in text for token in ("方法", "机制", "流程", "训练", "推理", "架构", "算法", "优化", "模型")):
+        return "method"
+    return "claim"
+
+
+def _verification_evidence_text(paper_text: str, max_chars: int = 24000) -> str:
+    chunks = _chunk_text(paper_text, max_chars // 3)
+    if len(paper_text) <= max_chars:
+        return paper_text
+    head = chunks[0] if chunks else paper_text[: max_chars // 3]
+    method = _section_window_for_verifier(paper_text, ("method", "approach", "model", "training", "algorithm", "implementation"))
+    result = _section_window_for_verifier(paper_text, ("experiment", "evaluation", "result", "ablation", "analysis"))
+    evidence = "\n\n".join(part for part in (head, method, result) if part)
+    return evidence[:max_chars]
+
+
+def _section_window_for_verifier(text: str, keywords: tuple[str, ...], window: int = 9000) -> str:
+    lowered = text.lower()
+    positions = [lowered.find(keyword) for keyword in keywords if lowered.find(keyword) >= 0]
+    if not positions:
+        return ""
+    start = max(0, min(positions) - 1200)
+    return text[start : start + window]
+
+
+def _parse_verification_result(output: str) -> VerificationResult:
+    try:
+        payload = json.loads(_extract_json_object(output))
+    except Exception as exc:
+        return VerificationResult(False, [f"Verifier Agent 输出不是合法 JSON：{exc}"])
+    errors = payload.get("errors") or []
+    if not isinstance(errors, list):
+        errors = [str(errors)]
+    cleaned_errors = [_clean_xml_text(str(error)).strip() for error in errors if str(error).strip()]
+    passed = bool(payload.get("pass")) and not cleaned_errors
+    if not passed and not cleaned_errors:
+        cleaned_errors = ["Verifier Agent 判定失败，但未给出具体错误。"]
+    return VerificationResult(passed, cleaned_errors)
+
+
+def _extract_json_object(text: str) -> str:
+    cleaned = _strip_markdown_fences(text).strip()
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("missing JSON object")
+    return cleaned[start : end + 1]
 
 
 def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
@@ -1925,12 +2086,17 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
     )
 
 
-def _chat(client: openai.OpenAI, model: str, user_prompt: str) -> str:
+def _chat(
+    client: openai.OpenAI,
+    model: str,
+    user_prompt: str,
+    system_prompt: str = DEEP_PAPER_NOTE_SYSTEM_PROMPT,
+) -> str:
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": DEEP_PAPER_NOTE_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.2,

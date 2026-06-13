@@ -14,9 +14,11 @@ from paper_agent.paper_summary import (
     _ensure_asset_markers,
     _enforce_core_original_title,
     _extract_abstract_from_text,
+    _extract_verifiable_claims,
     _expand_table_rect_to_borders,
     _missing_asset_references,
     _paragraph,
+    _parse_verification_result,
     _resolve_codex_config,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
@@ -107,6 +109,39 @@ def test_summarize_paper_accepts_custom_workflow():
     )
 
     assert result == "custom-summary.docx"
+
+
+def test_verifier_claim_extraction_classifies_method_and_contribution():
+    summary = """# Test
+
+## 创新点
+论文提出一个新的检索增强训练框架，用于减少多轮工具调用中的失败噪声。
+
+## 方法主线
+### 机制流程
+模型先生成搜索动作，再根据工具返回结果更新视觉上下文。
+
+## 摘要
+这里不应该被抽取为 claim。
+"""
+
+    claims = _extract_verifiable_claims(summary)
+
+    assert any(claim["type"] == "contribution" for claim in claims)
+    assert any(claim["type"] == "method" for claim in claims)
+    assert all("摘要" not in claim["section"] for claim in claims)
+
+
+def test_verifier_json_parser_is_conservative():
+    passed = _parse_verification_result('{"pass": true, "errors": []}')
+    failed = _parse_verification_result('```json\n{"pass": false, "errors": ["新增了原文没有的贡献"]}\n```')
+    invalid = _parse_verification_result("not json")
+
+    assert passed.passed
+    assert not failed.passed
+    assert failed.errors == ["新增了原文没有的贡献"]
+    assert not invalid.passed
+    assert invalid.errors
 
 
 def test_two_column_prose_after_table_is_not_table_row():
