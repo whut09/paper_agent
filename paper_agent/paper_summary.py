@@ -162,6 +162,22 @@ class GroundingSection:
 
 
 @dataclass
+class KnowledgeGraphNode:
+    id: str
+    label: str
+    type: str
+    source_section: str = ""
+
+
+@dataclass
+class KnowledgeGraphEdge:
+    source: str
+    target: str
+    relation: str
+    source_section: str = ""
+
+
+@dataclass
 class PaperWorkflowContext:
     input_path: str
     output_dir: str | Path
@@ -182,12 +198,14 @@ class PaperWorkflowContext:
     abstract: str = ""
     formulas: list[str] = field(default_factory=list)
     grounding_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
+    knowledge_graph: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     config: CodexConfig | None = None
     client: openai.OpenAI | None = None
     chunk_notes: list[str] = field(default_factory=list)
     summary: str = ""
     verification: VerificationResult | None = None
     docx_path: Path | None = None
+    knowledge_graph_path: Path | None = None
 
     def report(self, value: float, desc: str) -> None:
         if self.progress:
@@ -309,6 +327,7 @@ class ExtractSections(PaperWorkflowNode):
         context.abstract = _extract_abstract_from_pdf(context.pdf_path, context.pages) or _extract_abstract_from_text(context.text)
         context.formulas = _extract_formula_candidates(context.text)
         context.grounding_map = _build_grounding_map(context.text)
+        context.knowledge_graph = _build_knowledge_graph(context.grounding_map)
 
 
 class SummarizeContribution(PaperWorkflowNode):
@@ -369,6 +388,7 @@ class VerifyClaims(PaperWorkflowNode):
             context.paper_title,
             context.assets,
         )
+        context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
 
 
 class GenerateReport(PaperWorkflowNode):
@@ -382,6 +402,12 @@ class GenerateReport(PaperWorkflowNode):
         context.report(0.85, "写入 Word 文档...")
         context.docx_path = context.output / f"{context.paper_name}-summary.docx"
         _write_docx(context.docx_path, context.source_path.name, context.summary, context.assets)
+        if context.knowledge_graph:
+            context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+            context.knowledge_graph_path.write_text(
+                json.dumps(context.knowledge_graph, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
         context.report(1.0, "论文总结完成")
 
 
@@ -2111,6 +2137,135 @@ def _attach_claims_to_grounding_map(
         grounded["source_title"] = source.get("title", "") if source else ""
         result["claims"].append(grounded)
     return result
+
+
+def _build_knowledge_graph(
+    grounding_map: dict[str, list[dict[str, str]]],
+    summary: str = "",
+) -> dict[str, list[dict[str, str]]]:
+    nodes: dict[str, KnowledgeGraphNode] = {}
+    edges: set[tuple[str, str, str, str]] = set()
+
+    def add_node(label: str, node_type: str, source_section: str = "") -> str:
+        normalized = _normalize_kg_label(label)
+        if not normalized:
+            return ""
+        node_id = f"{node_type}:{_slugify_kg_label(normalized)}"
+        if node_id not in nodes:
+            nodes[node_id] = KnowledgeGraphNode(node_id, normalized, node_type, source_section)
+        elif source_section and not nodes[node_id].source_section:
+            nodes[node_id].source_section = source_section
+        return node_id
+
+    def add_edge(source: str, target: str, relation: str, source_section: str = "") -> None:
+        if source and target and source != target:
+            edges.add((source, target, relation, source_section))
+
+    paper_id = add_node("Paper", "paper")
+    concept_ids: list[str] = []
+
+    for bucket, node_type in (("intro", "concept"), ("method", "method"), ("experiments", "evaluation")):
+        for section in grounding_map.get(bucket, []):
+            section_id = section.get("section_id", "")
+            section_node = add_node(section.get("title", bucket), "section", section_id)
+            add_edge(paper_id, section_node, "has_section", section_id)
+            text = section.get("text", "")
+            for label in _extract_kg_terms(text, node_type):
+                term_type = _kg_term_type(label, node_type)
+                term_node = add_node(label, term_type, section_id)
+                if term_type == "method":
+                    add_edge(section_node, term_node, "describes_method", section_id)
+                elif term_type == "dataset":
+                    add_edge(section_node, term_node, "uses_dataset", section_id)
+                elif term_type == "evaluation":
+                    add_edge(section_node, term_node, "reports_evaluation", section_id)
+                else:
+                    add_edge(section_node, term_node, "mentions", section_id)
+                    concept_ids.append(term_node)
+
+    for source, target in zip(concept_ids, concept_ids[1:]):
+        add_edge(source, target, "relates_to")
+
+    claims = _attach_claims_to_grounding_map(grounding_map, _extract_verifiable_claims(summary)).get("claims", []) if summary else []
+    for index, claim in enumerate(claims, 1):
+        claim_node = add_node(claim.get("claim", f"Claim {index}")[:120], "claim", claim.get("source_section", ""))
+        source_section = claim.get("source_section", "")
+        source_title = claim.get("source_title", "")
+        if source_title:
+            section_node = add_node(source_title, "section", source_section)
+            add_edge(claim_node, section_node, "grounded_in", source_section)
+        if claim.get("type"):
+            type_node = add_node(claim["type"], "claim_type")
+            add_edge(claim_node, type_node, "has_claim_type", source_section)
+
+    return {
+        "nodes": [node.__dict__ for node in nodes.values()],
+        "edges": [
+            {
+                "source": source,
+                "target": target,
+                "relation": relation,
+                "source_section": source_section,
+            }
+            for source, target, relation, source_section in sorted(edges)
+        ],
+    }
+
+
+def _extract_kg_terms(text: str, default_type: str, limit: int = 18) -> list[str]:
+    candidates: list[str] = []
+    patterns = [
+        r"\b[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)+(?:\s+[A-Z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)*\b",
+        r"\b[A-Z]{2,}(?:-[A-Z0-9]+)*\b",
+        r"\b[A-Z][A-Za-z0-9]+(?:Net|Former|Agent|GPT|BERT|VAE|GRPO|RAG|OCR)\b",
+        r"\b[a-z]+(?:-[a-z]+)+\b",
+        r"\b[A-Za-z]+(?:\s+[A-Za-z]+){0,2}\s+(?:attention|interaction|tool-use|benchmark|dataset|accuracy|ablation|evaluation)\b",
+    ]
+    for pattern in patterns:
+        candidates.extend(re.findall(pattern, text))
+    if default_type in {"method", "evaluation"}:
+        candidates.extend(re.findall(r"\b[A-Z][A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\s+(?:benchmark|dataset)\b", text))
+        candidates.extend(re.findall(r"\b(?:accuracy|ablation|evaluation|metric|score)(?:\s+[a-z]+){0,2}\b", text, flags=re.IGNORECASE))
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in candidates:
+        label = _normalize_kg_label(item)
+        if not label or label.lower() in seen or _kg_label_is_noise(label):
+            continue
+        seen.add(label.lower())
+        result.append(label)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _kg_term_type(label: str, default_type: str) -> str:
+    lowered = label.lower()
+    if any(token in lowered for token in ("accuracy", "ablation", "evaluation", "score", "metric")):
+        return "evaluation"
+    if any(token in lowered for token in ("dataset", "benchmark", "bench", "vqa", "qa")):
+        return "dataset"
+    if default_type == "method" or any(token in lowered for token in ("agent", "grpo", "rag", "vae", "model", "net", "former")):
+        return "method"
+    return "concept"
+
+
+def _normalize_kg_label(label: str) -> str:
+    label = _clean_xml_text(str(label)).strip(" .,:;()[]{}")
+    label = re.sub(r"\s+", " ", label)
+    return label[:160]
+
+
+def _slugify_kg_label(label: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9\u4e00-\u9fff]+", "-", label.lower()).strip("-")
+    return slug[:80] or "node"
+
+
+def _kg_label_is_noise(label: str) -> bool:
+    lowered = label.lower()
+    if lowered in {"page", "figure", "table", "section", "paper"}:
+        return True
+    return len(label) < 3 or len(label.split()) > 8
 
 
 def _best_source_section_for_claim(claim: str, sections: list[dict[str, str]]) -> dict[str, str] | None:

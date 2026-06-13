@@ -1,8 +1,10 @@
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import fitz
 
 from paper_agent.paper_summary import (
+    GenerateReport,
     PaperAsset,
     PaperWorkflow,
     PaperWorkflowContext,
@@ -11,6 +13,7 @@ from paper_agent.paper_summary import (
     _asset_display_label,
     _attach_claims_to_grounding_map,
     _build_grounding_map,
+    _build_knowledge_graph,
     _caption_is_figure,
     _caption_is_table,
     _ensure_asset_markers,
@@ -113,6 +116,25 @@ def test_summarize_paper_accepts_custom_workflow():
     assert result == "custom-summary.docx"
 
 
+def test_generate_report_writes_knowledge_graph_sidecar():
+    with TemporaryDirectory() as tmp:
+        context = workflow_context()
+        context.output = Path(tmp)
+        context.source_path = Path("paper.pdf")
+        context.paper_name = "paper"
+        context.summary = "# Test\n\n## 总结\n测试。"
+        context.knowledge_graph = {
+            "nodes": [{"id": "paper:paper", "label": "Paper", "type": "paper", "source_section": ""}],
+            "edges": [],
+        }
+
+        GenerateReport().run(context)
+
+        assert context.docx_path and context.docx_path.exists()
+        assert context.knowledge_graph_path and context.knowledge_graph_path.exists()
+        assert "paper:paper" in context.knowledge_graph_path.read_text(encoding="utf-8")
+
+
 def test_verifier_claim_extraction_classifies_method_and_contribution():
     summary = """# Test
 
@@ -172,6 +194,41 @@ def test_grounding_map_attaches_claim_source_section():
 
     assert grounded["claims"][0]["source_section"] == "2"
     assert grounded["claims"][0]["source_title"] == "Method"
+
+
+def test_knowledge_graph_extracts_research_nodes_and_edges():
+    grounding_map = {
+        "intro": [{"section_id": "1", "title": "Introduction", "text": "SWE-Agent studies tool-use for GitHub interaction."}],
+        "method": [{"section_id": "2", "title": "Method", "text": "The method uses Transformer self-attention and GRPO training."}],
+        "experiments": [{"section_id": "3", "title": "Experiments", "text": "Evaluation uses SWE-Bench benchmark and reports accuracy ablation."}],
+        "claims": [],
+    }
+
+    graph = _build_knowledge_graph(grounding_map)
+    node_types = {node["type"] for node in graph["nodes"]}
+    edge_relations = {edge["relation"] for edge in graph["edges"]}
+
+    assert {"concept", "method", "dataset", "evaluation"} <= node_types
+    assert "describes_method" in edge_relations
+    assert "uses_dataset" in edge_relations
+    assert "reports_evaluation" in edge_relations
+
+
+def test_knowledge_graph_links_claims_to_source_sections():
+    grounding_map = {
+        "intro": [],
+        "method": [{"section_id": "2", "title": "Method", "text": "retrieval OCR image enhancement actions during training"}],
+        "experiments": [],
+        "claims": [],
+    }
+    summary = """## 方法主线
+模型使用 retrieval、OCR 和 image enhancement actions 完成训练。
+"""
+
+    graph = _build_knowledge_graph(grounding_map, summary)
+
+    assert any(node["type"] == "claim" for node in graph["nodes"])
+    assert any(edge["relation"] == "grounded_in" and edge["source_section"] == "2" for edge in graph["edges"])
 
 
 def test_verifier_json_parser_is_conservative():
