@@ -10,6 +10,7 @@ import subprocess
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -47,6 +48,13 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 9. 关键公式必须解读。优先使用“TexTeller 公式识别结果”中的 LaTeX；如果没有识别结果，可以重写 1 到 3 个最核心公式的可读文本形式，例如 `Δvision = Ctext / Cvision`；如果公式抽取不可靠，使用可用的公式截图占位符并解释含义。
 10. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
 """
+
+SYNTHESIZER_SYSTEM_PROMPT = DEEP_PAPER_NOTE_SYSTEM_PROMPT
+CRITIC_SYSTEM_PROMPT = (
+    "You are the Critic agent in a research-paper multi-agent pipeline. "
+    "You verify paper-summary claims against structured grounding evidence. "
+    "Output only valid JSON."
+)
 
 
 FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPaperNote 风格的完整中文 Markdown 论文精读笔记。
@@ -177,6 +185,13 @@ class KnowledgeGraphEdge:
     source_section: str = ""
 
 
+class PaperAgentRole(str, Enum):
+    READER = "Reader"
+    EXTRACTOR = "Extractor"
+    SYNTHESIZER = "Synthesizer"
+    CRITIC = "Critic"
+
+
 @dataclass
 class PaperWorkflowContext:
     input_path: str
@@ -204,6 +219,7 @@ class PaperWorkflowContext:
     chunk_notes: list[str] = field(default_factory=list)
     summary: str = ""
     verification: VerificationResult | None = None
+    agent_trace: list[dict[str, str]] = field(default_factory=list)
     docx_path: Path | None = None
     knowledge_graph_path: Path | None = None
 
@@ -224,6 +240,7 @@ class PaperWorkflowContext:
 class PaperWorkflowNode:
     name = ""
     depends_on: tuple[str, ...] = ()
+    agent_role = PaperAgentRole.EXTRACTOR
 
     def run(self, context: PaperWorkflowContext) -> None:
         raise NotImplementedError
@@ -267,7 +284,9 @@ class PaperWorkflow:
                     raise ValueError(f"Workflow has cyclic or unsatisfied dependencies: {sorted(pending)}")
                 for name in ready:
                     context.check_cancelled()
-                    self.nodes[name].run(context)
+                    node = self.nodes[name]
+                    context.agent_trace.append({"agent": node.agent_role.value, "node": node.name})
+                    node.run(context)
                     completed.add(name)
                     pending.remove(name)
             return context
@@ -277,6 +296,7 @@ class PaperWorkflow:
 
 class PreparePaper(PaperWorkflowNode):
     name = "PreparePaper"
+    agent_role = PaperAgentRole.READER
 
     def run(self, context: PaperWorkflowContext) -> None:
         output = Path(context.output_dir)
@@ -299,6 +319,7 @@ class PreparePaper(PaperWorkflowNode):
 class ParsePaper(PaperWorkflowNode):
     name = "ParsePaper"
     depends_on = ("PreparePaper",)
+    agent_role = PaperAgentRole.READER
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.pdf_path is None or context.work_dir is None:
@@ -318,6 +339,7 @@ class ParsePaper(PaperWorkflowNode):
 class ExtractSections(PaperWorkflowNode):
     name = "ExtractSections"
     depends_on = ("ParsePaper",)
+    agent_role = PaperAgentRole.EXTRACTOR
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.pdf_path is None:
@@ -333,6 +355,7 @@ class ExtractSections(PaperWorkflowNode):
 class SummarizeContribution(PaperWorkflowNode):
     name = "SummarizeContribution"
     depends_on = ("ExtractSections",)
+    agent_role = PaperAgentRole.SYNTHESIZER
 
     def run(self, context: PaperWorkflowContext) -> None:
         context.check_cancelled()
@@ -351,6 +374,7 @@ class SummarizeContribution(PaperWorkflowNode):
 class ExtractMethods(PaperWorkflowNode):
     name = "ExtractMethods"
     depends_on = ("SummarizeContribution",)
+    agent_role = PaperAgentRole.SYNTHESIZER
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.client is None or context.config is None:
@@ -373,6 +397,7 @@ class ExtractMethods(PaperWorkflowNode):
 class VerifyClaims(PaperWorkflowNode):
     name = "VerifyClaims"
     depends_on = ("ExtractMethods",)
+    agent_role = PaperAgentRole.CRITIC
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.client is None or context.config is None:
@@ -394,6 +419,7 @@ class VerifyClaims(PaperWorkflowNode):
 class GenerateReport(PaperWorkflowNode):
     name = "GenerateReport"
     depends_on = ("VerifyClaims",)
+    agent_role = PaperAgentRole.SYNTHESIZER
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.output is None or context.source_path is None:
@@ -404,8 +430,14 @@ class GenerateReport(PaperWorkflowNode):
         _write_docx(context.docx_path, context.source_path.name, context.summary, context.assets)
         if context.knowledge_graph:
             context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+            graph_payload = {
+                **context.knowledge_graph,
+                "metadata": {
+                    "agent_trace": context.agent_trace,
+                },
+            }
             context.knowledge_graph_path.write_text(
-                json.dumps(context.knowledge_graph, ensure_ascii=False, indent=2),
+                json.dumps(graph_payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         context.report(1.0, "论文总结完成")
@@ -1921,7 +1953,7 @@ def _summarize_chunks_with_codex(
 论文内容：
 {chunk}
 """
-        chunk_notes.append(_chat(client, model, user_prompt))
+        chunk_notes.append(_chat(client, model, user_prompt, system_prompt=SYNTHESIZER_SYSTEM_PROMPT))
     return chunk_notes
 
 
@@ -1950,6 +1982,7 @@ def _integrate_summary_with_codex(
             f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
             f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
         ),
+        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
     )
 
 
@@ -2004,7 +2037,7 @@ def _run_verification_agent(
         client,
         model,
         prompt,
-        system_prompt="You are a strict paper-summary verifier. Output only valid JSON.",
+        system_prompt=CRITIC_SYSTEM_PROMPT,
     )
     return _parse_verification_result(output)
 

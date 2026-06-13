@@ -5,6 +5,7 @@ import fitz
 
 from paper_agent.paper_summary import (
     GenerateReport,
+    PaperAgentRole,
     PaperAsset,
     PaperWorkflow,
     PaperWorkflowContext,
@@ -88,6 +89,20 @@ def test_paper_workflow_runs_nodes_by_dependency():
         "VerifyClaims",
         "GenerateReport",
     ]
+    assert [item["agent"] for item in context.agent_trace] == [PaperAgentRole.EXTRACTOR.value] * 7
+
+
+def test_default_workflow_declares_multi_agent_roles():
+    workflow = PaperWorkflow.default()
+    roles = {name: node.agent_role for name, node in workflow.nodes.items()}
+
+    assert roles["PreparePaper"] == PaperAgentRole.READER
+    assert roles["ParsePaper"] == PaperAgentRole.READER
+    assert roles["ExtractSections"] == PaperAgentRole.EXTRACTOR
+    assert roles["SummarizeContribution"] == PaperAgentRole.SYNTHESIZER
+    assert roles["ExtractMethods"] == PaperAgentRole.SYNTHESIZER
+    assert roles["VerifyClaims"] == PaperAgentRole.CRITIC
+    assert roles["GenerateReport"] == PaperAgentRole.SYNTHESIZER
 
 
 def test_paper_workflow_rejects_cycles():
@@ -127,12 +142,15 @@ def test_generate_report_writes_knowledge_graph_sidecar():
             "nodes": [{"id": "paper:paper", "label": "Paper", "type": "paper", "source_section": ""}],
             "edges": [],
         }
+        context.agent_trace = [{"agent": "Reader", "node": "ParsePaper"}]
 
         GenerateReport().run(context)
 
         assert context.docx_path and context.docx_path.exists()
         assert context.knowledge_graph_path and context.knowledge_graph_path.exists()
-        assert "paper:paper" in context.knowledge_graph_path.read_text(encoding="utf-8")
+        graph_text = context.knowledge_graph_path.read_text(encoding="utf-8")
+        assert "paper:paper" in graph_text
+        assert "agent_trace" in graph_text
 
 
 def test_verifier_claim_extraction_classifies_method_and_contribution():
