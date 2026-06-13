@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable
@@ -146,6 +146,225 @@ class CodexConfig:
     use_proxy: bool = False
 
 
+@dataclass
+class PaperWorkflowContext:
+    input_path: str
+    output_dir: str | Path
+    pages: list[int] | None
+    summary_language: str
+    codex_envs: dict[str, str]
+    max_assets: int
+    progress: ProgressCallback | None = None
+    cancellation_event: asyncio.Event | None = None
+    output: Path | None = None
+    source_path: Path | None = None
+    pdf_path: Path | None = None
+    paper_name: str = ""
+    work_dir: Path | None = None
+    text: str = ""
+    assets: list[PaperAsset] = field(default_factory=list)
+    paper_title: str = ""
+    abstract: str = ""
+    formulas: list[str] = field(default_factory=list)
+    config: CodexConfig | None = None
+    client: openai.OpenAI | None = None
+    chunk_notes: list[str] = field(default_factory=list)
+    summary: str = ""
+    docx_path: Path | None = None
+
+    def report(self, value: float, desc: str) -> None:
+        if self.progress:
+            self.progress(value, desc)
+
+    def check_cancelled(self) -> None:
+        if self.cancellation_event and self.cancellation_event.is_set():
+            raise asyncio.CancelledError
+
+    def close(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+
+
+class PaperWorkflowNode:
+    name = ""
+    depends_on: tuple[str, ...] = ()
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        raise NotImplementedError
+
+
+class PaperWorkflow:
+    def __init__(self, nodes: list[PaperWorkflowNode]):
+        self.nodes = {node.name: node for node in nodes}
+        if len(self.nodes) != len(nodes):
+            raise ValueError("PaperWorkflow node names must be unique.")
+        for node in nodes:
+            missing = [name for name in node.depends_on if name not in self.nodes]
+            if missing:
+                raise ValueError(f"Workflow node {node.name} depends on missing nodes: {missing}")
+
+    @classmethod
+    def default(cls) -> "PaperWorkflow":
+        return cls(
+            [
+                PreparePaper(),
+                ParsePaper(),
+                ExtractSections(),
+                SummarizeContribution(),
+                ExtractMethods(),
+                VerifyClaims(),
+                GenerateReport(),
+            ]
+        )
+
+    def run(self, context: PaperWorkflowContext) -> PaperWorkflowContext:
+        pending = set(self.nodes)
+        completed: set[str] = set()
+        try:
+            while pending:
+                ready = sorted(
+                    name
+                    for name in pending
+                    if all(dep in completed for dep in self.nodes[name].depends_on)
+                )
+                if not ready:
+                    raise ValueError(f"Workflow has cyclic or unsatisfied dependencies: {sorted(pending)}")
+                for name in ready:
+                    context.check_cancelled()
+                    self.nodes[name].run(context)
+                    completed.add(name)
+                    pending.remove(name)
+            return context
+        finally:
+            context.close()
+
+
+class PreparePaper(PaperWorkflowNode):
+    name = "PreparePaper"
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        output = Path(context.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+
+        source_path = Path(context.input_path)
+        context.report(0.05, "准备论文文件...")
+        pdf_path = _ensure_pdf(source_path, output)
+        paper_name = _safe_stem(source_path.stem)
+        work_dir = output / f"{paper_name}-summary-assets"
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        context.output = output
+        context.source_path = source_path
+        context.pdf_path = pdf_path
+        context.paper_name = paper_name
+        context.work_dir = work_dir
+
+
+class ParsePaper(PaperWorkflowNode):
+    name = "ParsePaper"
+    depends_on = ("PreparePaper",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        if context.pdf_path is None or context.work_dir is None:
+            raise ValueError("ParsePaper requires prepared PDF and work directory.")
+        context.check_cancelled()
+        context.report(0.18, "抽取正文和图表截图...")
+        context.text, context.assets = _extract_text_and_assets(
+            context.pdf_path,
+            context.work_dir,
+            context.pages,
+            context.max_assets,
+        )
+        if not context.text.strip():
+            raise ValueError("未能从文档中抽取到可总结的正文。")
+
+
+class ExtractSections(PaperWorkflowNode):
+    name = "ExtractSections"
+    depends_on = ("ParsePaper",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        if context.pdf_path is None:
+            raise ValueError("ExtractSections requires a parsed PDF.")
+        context.report(0.32, "提取标题、摘要和公式...")
+        context.paper_title = _extract_title_from_pdf(context.pdf_path, context.pages)
+        context.abstract = _extract_abstract_from_pdf(context.pdf_path, context.pages) or _extract_abstract_from_text(context.text)
+        context.formulas = _extract_formula_candidates(context.text)
+
+
+class SummarizeContribution(PaperWorkflowNode):
+    name = "SummarizeContribution"
+    depends_on = ("ExtractSections",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        context.check_cancelled()
+        context.report(0.48, "调用 Codex 接口生成分段笔记...")
+        context.config = _resolve_codex_config(context.codex_envs)
+        context.client = _create_codex_client(context.config)
+        context.chunk_notes = _summarize_chunks_with_codex(
+            context.client,
+            context.config.model,
+            context.text,
+            context.assets,
+            context.summary_language,
+        )
+
+
+class ExtractMethods(PaperWorkflowNode):
+    name = "ExtractMethods"
+    depends_on = ("SummarizeContribution",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        if context.client is None or context.config is None:
+            raise ValueError("ExtractMethods requires an initialized Codex client.")
+        context.check_cancelled()
+        context.report(0.68, "整合方法、结果和分析...")
+        context.summary = _integrate_summary_with_codex(
+            context.client,
+            context.config.model,
+            context.chunk_notes,
+            context.assets,
+            context.summary_language,
+            context.abstract,
+            context.formulas,
+            _recognized_formula_context(context.assets),
+            context.paper_title,
+        )
+
+
+class VerifyClaims(PaperWorkflowNode):
+    name = "VerifyClaims"
+    depends_on = ("ExtractMethods",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        if context.client is None or context.config is None:
+            raise ValueError("VerifyClaims requires an initialized Codex client.")
+        context.report(0.78, "校验标题、摘要和图表引用...")
+        context.summary = _verify_summary_claims(
+            context.summary,
+            context.abstract,
+            context.client,
+            context.config.model,
+            context.paper_title,
+            context.assets,
+        )
+
+
+class GenerateReport(PaperWorkflowNode):
+    name = "GenerateReport"
+    depends_on = ("VerifyClaims",)
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        if context.output is None or context.source_path is None:
+            raise ValueError("GenerateReport requires prepared output paths.")
+        context.check_cancelled()
+        context.report(0.85, "写入 Word 文档...")
+        context.docx_path = context.output / f"{context.paper_name}-summary.docx"
+        _write_docx(context.docx_path, context.source_path.name, context.summary, context.assets)
+        context.report(1.0, "论文总结完成")
+
+
 def summarize_paper(
     input_path: str,
     output_dir: str | Path,
@@ -156,57 +375,23 @@ def summarize_paper(
     max_assets: int = DEFAULT_MAX_ASSETS,
     progress: ProgressCallback | None = None,
     cancellation_event: asyncio.Event | None = None,
+    workflow: PaperWorkflow | None = None,
 ) -> str:
     """Summarize a paper and write a Word .docx file with captured figures/tables."""
-
-    def report(value: float, desc: str) -> None:
-        if progress:
-            progress(value, desc)
-
-    def check_cancelled() -> None:
-        if cancellation_event and cancellation_event.is_set():
-            raise asyncio.CancelledError
-
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    source_path = Path(input_path)
-    report(0.05, "准备论文文件...")
-    pdf_path = _ensure_pdf(source_path, output)
-    paper_name = _safe_stem(source_path.stem)
-    work_dir = output / f"{paper_name}-summary-assets"
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    check_cancelled()
-    report(0.18, "抽取正文和图表截图...")
-    text, assets = _extract_text_and_assets(pdf_path, work_dir, pages, max_assets)
-    paper_title = _extract_title_from_pdf(pdf_path, pages)
-    abstract = _extract_abstract_from_pdf(pdf_path, pages) or _extract_abstract_from_text(text)
-    formulas = _extract_formula_candidates(text)
-
-    if not text.strip():
-        raise ValueError("未能从文档中抽取到可总结的正文。")
-
-    check_cancelled()
-    report(0.48, "调用 Codex 本地接口生成论文总结...")
-    config = _resolve_codex_config(codex_envs or {})
-    summary = _summarize_with_codex(
-        text,
-        assets,
-        config,
-        summary_language,
-        abstract,
-        formulas,
-        _recognized_formula_context(assets),
-        paper_title,
+    context = PaperWorkflowContext(
+        input_path=input_path,
+        output_dir=output_dir,
+        pages=pages,
+        summary_language=summary_language,
+        codex_envs=codex_envs or {},
+        max_assets=max_assets,
+        progress=progress,
+        cancellation_event=cancellation_event,
     )
-
-    check_cancelled()
-    report(0.85, "写入 Word 文档...")
-    docx_path = output / f"{paper_name}-summary.docx"
-    _write_docx(docx_path, source_path.name, summary, assets)
-    report(1.0, "论文总结完成")
-    return str(docx_path)
+    result = (workflow or PaperWorkflow.default()).run(context)
+    if result.docx_path is None:
+        raise RuntimeError("Paper workflow finished without generating a report.")
+    return str(result.docx_path)
 
 
 def _ensure_pdf(source_path: Path, output_dir: Path) -> Path:
@@ -1635,14 +1820,42 @@ def _summarize_with_codex(
     paper_title: str = "",
 ) -> str:
     client = _create_codex_client(config)
+    try:
+        chunk_notes = _summarize_chunks_with_codex(
+            client,
+            config.model,
+            paper_text,
+            assets,
+            summary_language,
+        )
+        summary = _integrate_summary_with_codex(
+            client,
+            config.model,
+            chunk_notes,
+            assets,
+            summary_language,
+            abstract,
+            formulas or [],
+            recognized_formulas,
+            paper_title,
+        )
+        return _verify_summary_claims(summary, abstract, client, config.model, paper_title, assets)
+    finally:
+        client.close()
+
+
+def _summarize_chunks_with_codex(
+    client: openai.OpenAI,
+    model: str,
+    paper_text: str,
+    assets: list[PaperAsset],
+    summary_language: str,
+) -> list[str]:
     chunks = _chunk_text(paper_text, 16000)
     asset_context = _asset_context(assets)
-    formula_context = _formula_context(formulas or [])
-
-    try:
-        chunk_notes = []
-        for idx, chunk in enumerate(chunks, 1):
-            user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
+    chunk_notes = []
+    for idx, chunk in enumerate(chunks, 1):
+        user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
 只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
 
@@ -1652,28 +1865,51 @@ def _summarize_with_codex(
 论文内容：
 {chunk}
 """
-            chunk_notes.append(_chat(client, config.model, user_prompt))
+        chunk_notes.append(_chat(client, model, user_prompt))
+    return chunk_notes
 
-        final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
-        summary = _chat(
-            client,
-            config.model,
-            (
-                f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
-                f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
-                f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
-                f"关键公式候选：\n{formula_context}\n\n"
-                f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
-                f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
-            ),
-        )
-        summary = _postprocess_summary(summary)
-        summary = _replace_missing_abstract(summary, abstract, client, config.model)
-        summary = _normalize_final_sections(summary)
-        summary = _enforce_core_original_title(summary, paper_title)
-        return _ensure_asset_markers(summary, assets)
-    finally:
-        client.close()
+
+def _integrate_summary_with_codex(
+    client: openai.OpenAI,
+    model: str,
+    chunk_notes: list[str],
+    assets: list[PaperAsset],
+    summary_language: str,
+    abstract: str,
+    formulas: list[str],
+    recognized_formulas: str,
+    paper_title: str,
+) -> str:
+    asset_context = _asset_context(assets)
+    formula_context = _formula_context(formulas)
+    final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
+    return _chat(
+        client,
+        model,
+        (
+            f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+            f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
+            f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
+            f"关键公式候选：\n{formula_context}\n\n"
+            f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
+            f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
+        ),
+    )
+
+
+def _verify_summary_claims(
+    summary: str,
+    abstract: str,
+    client: openai.OpenAI,
+    model: str,
+    paper_title: str,
+    assets: list[PaperAsset],
+) -> str:
+    summary = _postprocess_summary(summary)
+    summary = _replace_missing_abstract(summary, abstract, client, model)
+    summary = _normalize_final_sections(summary)
+    summary = _enforce_core_original_title(summary, paper_title)
+    return _ensure_asset_markers(summary, assets)
 
 
 def _create_codex_client(config: CodexConfig) -> openai.OpenAI:

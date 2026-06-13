@@ -4,6 +4,9 @@ import fitz
 
 from paper_agent.paper_summary import (
     PaperAsset,
+    PaperWorkflow,
+    PaperWorkflowContext,
+    PaperWorkflowNode,
     TextLine,
     _asset_display_label,
     _caption_is_figure,
@@ -20,11 +23,90 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _sync_inline_asset_references,
     _with_asset_references,
+    summarize_paper,
 )
 
 
 def line(text: str, x0: float, y0: float, x1: float, y1: float) -> TextLine:
     return TextLine(text=text, rect=fitz.Rect(x0, y0, x1, y1))
+
+
+class DummyWorkflowNode(PaperWorkflowNode):
+    def __init__(self, name: str, depends_on: tuple[str, ...] = ()):
+        self.name = name
+        self.depends_on = depends_on
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        context.chunk_notes.append(self.name)
+
+
+class FinishWorkflowNode(PaperWorkflowNode):
+    name = "Finish"
+
+    def run(self, context: PaperWorkflowContext) -> None:
+        context.docx_path = Path("custom-summary.docx")
+
+
+def workflow_context() -> PaperWorkflowContext:
+    return PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=Path("."),
+        pages=None,
+        summary_language="中文",
+        codex_envs={},
+        max_assets=0,
+    )
+
+
+def test_paper_workflow_runs_nodes_by_dependency():
+    workflow = PaperWorkflow(
+        [
+            DummyWorkflowNode("GenerateReport", ("VerifyClaims",)),
+            DummyWorkflowNode("VerifyClaims", ("ExtractMethods",)),
+            DummyWorkflowNode("ExtractMethods", ("SummarizeContribution",)),
+            DummyWorkflowNode("SummarizeContribution", ("ExtractSections",)),
+            DummyWorkflowNode("ExtractSections", ("ParsePaper",)),
+            DummyWorkflowNode("ParsePaper", ("PreparePaper",)),
+            DummyWorkflowNode("PreparePaper"),
+        ]
+    )
+    context = workflow.run(workflow_context())
+
+    assert context.chunk_notes == [
+        "PreparePaper",
+        "ParsePaper",
+        "ExtractSections",
+        "SummarizeContribution",
+        "ExtractMethods",
+        "VerifyClaims",
+        "GenerateReport",
+    ]
+
+
+def test_paper_workflow_rejects_cycles():
+    workflow = PaperWorkflow(
+        [
+            DummyWorkflowNode("A", ("B",)),
+            DummyWorkflowNode("B", ("A",)),
+        ]
+    )
+
+    try:
+        workflow.run(workflow_context())
+    except ValueError as exc:
+        assert "cyclic" in str(exc)
+    else:
+        raise AssertionError("Expected cyclic workflow to fail")
+
+
+def test_summarize_paper_accepts_custom_workflow():
+    result = summarize_paper(
+        "paper.pdf",
+        Path("."),
+        workflow=PaperWorkflow([FinishWorkflowNode()]),
+    )
+
+    assert result == "custom-summary.docx"
 
 
 def test_two_column_prose_after_table_is_not_table_row():
