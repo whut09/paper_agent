@@ -154,6 +154,14 @@ class VerificationResult:
 
 
 @dataclass
+class GroundingSection:
+    section_id: str
+    title: str
+    category: str
+    text: str
+
+
+@dataclass
 class PaperWorkflowContext:
     input_path: str
     output_dir: str | Path
@@ -173,6 +181,7 @@ class PaperWorkflowContext:
     paper_title: str = ""
     abstract: str = ""
     formulas: list[str] = field(default_factory=list)
+    grounding_map: dict[str, list[dict[str, str]]] = field(default_factory=dict)
     config: CodexConfig | None = None
     client: openai.OpenAI | None = None
     chunk_notes: list[str] = field(default_factory=list)
@@ -299,6 +308,7 @@ class ExtractSections(PaperWorkflowNode):
         context.paper_title = _extract_title_from_pdf(context.pdf_path, context.pages)
         context.abstract = _extract_abstract_from_pdf(context.pdf_path, context.pages) or _extract_abstract_from_text(context.text)
         context.formulas = _extract_formula_candidates(context.text)
+        context.grounding_map = _build_grounding_map(context.text)
 
 
 class SummarizeContribution(PaperWorkflowNode):
@@ -352,6 +362,7 @@ class VerifyClaims(PaperWorkflowNode):
         context.summary, context.verification = _verify_summary_claims(
             context.summary,
             context.text,
+            context.grounding_map,
             context.abstract,
             context.client,
             context.config.model,
@@ -1851,6 +1862,7 @@ def _summarize_with_codex(
         verified_summary, _verification = _verify_summary_claims(
             summary,
             paper_text,
+            _build_grounding_map(paper_text),
             abstract,
             client,
             config.model,
@@ -1918,6 +1930,7 @@ def _integrate_summary_with_codex(
 def _verify_summary_claims(
     summary: str,
     paper_text: str,
+    grounding_map: dict[str, list[dict[str, str]]],
     abstract: str,
     client: openai.OpenAI,
     model: str,
@@ -1929,7 +1942,9 @@ def _verify_summary_claims(
     summary = _normalize_final_sections(summary)
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
-    verification = _run_verification_agent(client, model, paper_text, summary)
+    claims = _extract_verifiable_claims(summary)
+    grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
+    verification = _run_verification_agent(client, model, paper_text, grounded_map)
     if not verification.passed:
         details = "\n".join(f"- {error}" for error in verification.errors[:8])
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
@@ -1940,24 +1955,24 @@ def _run_verification_agent(
     client: openai.OpenAI,
     model: str,
     paper_text: str,
-    summary: str,
+    grounding_map: dict[str, list[dict[str, str]]],
 ) -> VerificationResult:
-    claims = _extract_verifiable_claims(summary)
+    claims = grounding_map.get("claims", [])
     if not claims:
         return VerificationResult(False, ["未能从总结中抽取到可校验 claim。"])
 
-    evidence = _verification_evidence_text(paper_text)
+    evidence = _verification_evidence_text(paper_text, grounding_map)
     prompt = (
         "你是论文总结 Verifier Agent。你的任务不是润色总结，而是判断总结中的关键 claim 是否被原文证据支持。\n\n"
         "必须遵守：\n"
         "1. claim 必须能在原文证据中找到直接支持，不能靠常识或猜测补全。\n"
         "2. method / 方法相关 claim 必须能在 method、approach、model、training、algorithm、implementation 等方法相关段落中找到依据。\n"
         "3. contribution / 创新点相关 claim 不能新增原文没有声明的贡献、能力、数据集、指标或应用场景。\n"
-        "4. 只输出 JSON，不要输出 Markdown，不要解释过程。\n\n"
+        "4. 每个 claim 已带有 source_section/source_title；如果 source_section 为空、指向错误章节，或 method claim 没有落在 method bucket，也必须报错。\n"
+        "5. 只输出 JSON，不要输出 Markdown，不要解释过程。\n\n"
         "输出格式：\n"
         "{\"pass\": true/false, \"errors\": [\"具体错误1\", \"具体错误2\"]}\n\n"
-        f"待校验 claims：\n{json.dumps(claims, ensure_ascii=False, indent=2)}\n\n"
-        f"原文证据：\n{evidence}"
+        f"Grounding Map：\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
     )
     output = _chat(
         client,
@@ -1996,6 +2011,145 @@ def _extract_verifiable_claims(summary: str, limit: int = 24) -> list[dict[str, 
     return claims
 
 
+def _build_grounding_map(paper_text: str) -> dict[str, list[dict[str, str]]]:
+    sections = _extract_grounding_sections(paper_text)
+    result: dict[str, list[dict[str, str]]] = {
+        "intro": [],
+        "method": [],
+        "experiments": [],
+        "claims": [],
+    }
+    for section in sections:
+        bucket = section.category if section.category in result else ""
+        if not bucket:
+            continue
+        result[bucket].append(
+            {
+                "section_id": section.section_id,
+                "title": section.title,
+                "text": section.text[:5000],
+            }
+        )
+    if not any(result[key] for key in ("intro", "method", "experiments")) and paper_text.strip():
+        result["intro"].append(
+            {
+                "section_id": "document",
+                "title": "Document",
+                "text": paper_text[:5000],
+            }
+        )
+    return result
+
+
+def _extract_grounding_sections(paper_text: str) -> list[GroundingSection]:
+    heading_pattern = re.compile(
+        r"(?m)^\s*(?P<num>(?:\d+|[IVX]+)(?:\.\d+)*)\.?\s+(?P<title>[A-Z][A-Za-z][A-Za-z0-9 /&,\-:]{2,80})\s*$"
+    )
+    matches = list(heading_pattern.finditer(paper_text))
+    sections: list[GroundingSection] = []
+    for index, match in enumerate(matches):
+        title = _clean_xml_text(match.group("title")).strip()
+        if _grounding_heading_is_noise(title):
+            continue
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(paper_text)
+        text = _clean_xml_text(paper_text[start:end]).strip()
+        if len(text) < 40:
+            continue
+        section_id = match.group("num")
+        category = _grounding_section_category(title)
+        sections.append(GroundingSection(section_id, title, category, text))
+    return sections
+
+
+def _grounding_heading_is_noise(title: str) -> bool:
+    lowered = title.lower()
+    if lowered.startswith(("figure", "table", "appendix", "references", "abstract")):
+        return True
+    return len(title.split()) > 12
+
+
+def _grounding_section_category(title: str) -> str:
+    lowered = title.lower()
+    if any(token in lowered for token in ("introduction", "background", "motivation")):
+        return "intro"
+    if any(
+        token in lowered
+        for token in (
+            "method",
+            "approach",
+            "model",
+            "architecture",
+            "training",
+            "algorithm",
+            "implementation",
+            "framework",
+        )
+    ):
+        return "method"
+    if any(token in lowered for token in ("experiment", "evaluation", "result", "ablation", "analysis", "benchmark")):
+        return "experiments"
+    return ""
+
+
+def _attach_claims_to_grounding_map(
+    grounding_map: dict[str, list[dict[str, str]]],
+    claims: list[dict[str, str]],
+) -> dict[str, list[dict[str, str]]]:
+    result = {key: [dict(item) for item in value] for key, value in grounding_map.items()}
+    result.setdefault("claims", [])
+    source_sections = [
+        section
+        for key in ("intro", "method", "experiments")
+        for section in result.get(key, [])
+    ]
+    result["claims"] = []
+    for claim in claims:
+        source = _best_source_section_for_claim(claim.get("claim", ""), source_sections)
+        grounded = dict(claim)
+        grounded["source_section"] = source.get("section_id", "") if source else ""
+        grounded["source_title"] = source.get("title", "") if source else ""
+        result["claims"].append(grounded)
+    return result
+
+
+def _best_source_section_for_claim(claim: str, sections: list[dict[str, str]]) -> dict[str, str] | None:
+    claim_tokens = _grounding_tokens(claim)
+    if not claim_tokens:
+        return sections[0] if sections else None
+    best: tuple[float, dict[str, str] | None] = (0.0, None)
+    for section in sections:
+        section_tokens = _grounding_tokens(f"{section.get('title', '')} {section.get('text', '')}")
+        if not section_tokens:
+            continue
+        overlap = len(claim_tokens & section_tokens)
+        score = overlap / max(len(claim_tokens), 1)
+        if score > best[0]:
+            best = (score, section)
+    return best[1] or (sections[0] if sections else None)
+
+
+def _grounding_tokens(text: str) -> set[str]:
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-z][a-z0-9_\-]{2,}|[\u4e00-\u9fff]{2,}", lowered))
+    stopwords = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "that",
+        "this",
+        "from",
+        "into",
+        "模型",
+        "论文",
+        "方法",
+        "结果",
+        "作者",
+    }
+    return {token for token in tokens if token not in stopwords}
+
+
 def _split_claim_sentences(text: str) -> list[str]:
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
@@ -2029,15 +2183,26 @@ def _claim_type(section: str, sentence: str) -> str:
     return "claim"
 
 
-def _verification_evidence_text(paper_text: str, max_chars: int = 24000) -> str:
+def _verification_evidence_text(
+    paper_text: str,
+    grounding_map: dict[str, list[dict[str, str]]] | None = None,
+    max_chars: int = 24000,
+) -> dict[str, object]:
+    grounding_map = grounding_map or _build_grounding_map(paper_text)
     chunks = _chunk_text(paper_text, max_chars // 3)
-    if len(paper_text) <= max_chars:
-        return paper_text
-    head = chunks[0] if chunks else paper_text[: max_chars // 3]
-    method = _section_window_for_verifier(paper_text, ("method", "approach", "model", "training", "algorithm", "implementation"))
-    result = _section_window_for_verifier(paper_text, ("experiment", "evaluation", "result", "ablation", "analysis"))
-    evidence = "\n\n".join(part for part in (head, method, result) if part)
-    return evidence[:max_chars]
+    fallback = paper_text if len(paper_text) <= max_chars else ""
+    if not fallback:
+        head = chunks[0] if chunks else paper_text[: max_chars // 3]
+        method = _section_window_for_verifier(paper_text, ("method", "approach", "model", "training", "algorithm", "implementation"))
+        result = _section_window_for_verifier(paper_text, ("experiment", "evaluation", "result", "ablation", "analysis"))
+        fallback = "\n\n".join(part for part in (head, method, result) if part)[:max_chars]
+    return {
+        "intro": grounding_map.get("intro", []),
+        "method": grounding_map.get("method", []),
+        "experiments": grounding_map.get("experiments", []),
+        "claims": grounding_map.get("claims", []),
+        "fallback_evidence": fallback,
+    }
 
 
 def _section_window_for_verifier(text: str, keywords: tuple[str, ...], window: int = 9000) -> str:

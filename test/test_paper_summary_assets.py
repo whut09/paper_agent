@@ -9,6 +9,8 @@ from paper_agent.paper_summary import (
     PaperWorkflowNode,
     TextLine,
     _asset_display_label,
+    _attach_claims_to_grounding_map,
+    _build_grounding_map,
     _caption_is_figure,
     _caption_is_table,
     _ensure_asset_markers,
@@ -130,6 +132,46 @@ def test_verifier_claim_extraction_classifies_method_and_contribution():
     assert any(claim["type"] == "contribution" for claim in claims)
     assert any(claim["type"] == "method" for claim in claims)
     assert all("摘要" not in claim["section"] for claim in claims)
+
+
+def test_grounding_map_extracts_paper_sections():
+    paper_text = """[Page 1]
+1 Introduction
+This paper studies multimodal search agents and explains the motivation for reliable evidence grounding.
+
+2 Method
+Our method builds a tool-using agent with retrieval, OCR, and image enhancement actions during training.
+
+3 Experiments
+Experiments compare the agent on multimodal QA benchmarks and ablation studies.
+"""
+
+    grounding_map = _build_grounding_map(paper_text)
+
+    assert grounding_map["intro"][0]["section_id"] == "1"
+    assert grounding_map["method"][0]["section_id"] == "2"
+    assert grounding_map["experiments"][0]["section_id"] == "3"
+
+
+def test_grounding_map_attaches_claim_source_section():
+    grounding_map = {
+        "intro": [{"section_id": "1", "title": "Introduction", "text": "motivation and background"}],
+        "method": [{"section_id": "2", "title": "Method", "text": "retrieval OCR image enhancement actions during training"}],
+        "experiments": [{"section_id": "3", "title": "Experiments", "text": "benchmark ablation accuracy"}],
+        "claims": [],
+    }
+    claims = [
+        {
+            "section": "方法主线",
+            "type": "method",
+            "claim": "模型使用 retrieval、OCR 和 image enhancement actions 完成训练。",
+        }
+    ]
+
+    grounded = _attach_claims_to_grounding_map(grounding_map, claims)
+
+    assert grounded["claims"][0]["source_section"] == "2"
+    assert grounded["claims"][0]["source_title"] == "Method"
 
 
 def test_verifier_json_parser_is_conservative():
