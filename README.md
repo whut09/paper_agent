@@ -1,10 +1,41 @@
 # PaperAgent
 
-PaperAgent 是一个面向论文阅读的本地工具。它可以读取 PDF、DOC、DOCX 或论文链接，自动抽取正文、图表和公式等素材，并调用兼容 OpenAI SDK 的大模型接口生成中文论文总结，最后导出可编辑的 Word 文档。
+PaperAgent 是一个面向论文精读的本地 Agent Harness。它不是只把论文丢给大模型做一次摘要，而是把 PDF / Word 解析、正文与图表抽取、证据定位、多 Agent 协作、Verifier 校验、Word 报告生成和用户反馈学习组织成一条可运行、可检查、可迭代的工程链路。
+
+它可以读取 PDF、DOC、DOCX 或论文链接，自动抽取正文、图表、表格和公式等素材，调用兼容 OpenAI SDK 的大模型接口生成中文论文精读报告，最后导出可编辑的 Word 文档。核心目标是把“读论文”变成一个有 Harness 约束的 Agent 工作流：每个结论尽量回到原文证据，每次用户修正都能反哺下一次抽取、总结和评估。
 
 <p align="center">
   <img src="./assets/demo.svg" width="900" alt="PaperAgent 论文总结流程动画">
 </p>
+
+## 项目定位
+
+PaperAgent 关注的不只是“生成一份好看的论文总结”，而是构建一个面向研究文档理解的 Agent Harness：
+
+- **Agent Harness**：把 Reader、Extractor、Synthesizer、Critic 等角色放进同一条可执行工作流里，明确输入、输出、依赖关系和失败条件。
+- **Harness Engineering**：围绕 PDF 解析、图表截图、Grounding Map、Knowledge Graph、Verifier Agent、报告生成等环节做工程约束，减少幻觉和错配。
+- **Loop Engineering**：把用户反馈写入 correction memory，再自动生成 extraction prompt、summarization prompt 和 evaluation rubric 的 prompt patch，让系统在真实使用中持续修正。
+
+## Agent Harness 架构
+
+PaperAgent 当前的论文总结链路被组织为 DAG / graph executor，而不是单次 prompt 调用：
+
+```mermaid
+flowchart LR
+    A["PreparePaper<br/>输入文件或链接"] --> B["ParsePaper<br/>解析 PDF / Word"]
+    B --> C["ExtractSections<br/>正文、摘要、标题、图表、公式"]
+    C --> D["SummarizeContribution<br/>分段阅读笔记"]
+    D --> E["ExtractMethods<br/>整合方法、贡献和结果"]
+    E --> F["VerifyClaims<br/>Verifier / Critic 校验"]
+    F --> G["GenerateReport<br/>生成 Word + KG sidecar"]
+    H["User Feedback"] --> I["Correction Memory"]
+    I --> J["Self-improving Prompt Patches"]
+    J --> C
+    J --> D
+    J --> F
+```
+
+这条链路让 Agent 的行为更像一个可观测的实验系统：Reader 负责读入和解析，Extractor 负责结构化证据，Synthesizer 负责写作，Critic 负责拒绝没有证据支持的 claim，最后由报告生成器把文本、图表和元信息写入 `.docx`。
 
 ## 网页端效果
 
@@ -59,23 +90,91 @@ PaperAgent 是一个面向论文阅读的本地工具。它可以读取 PDF、DO
 ## 功能特点
 
 - 支持上传本地 PDF、DOC、DOCX，也支持输入论文链接。
-- 自动抽取论文正文、图表截图、公式等关键素材。
-- 调用 `config.json` 中配置的大模型接口生成中文总结。
+- 自动抽取论文正文、版面结构、图表截图、表格、公式和摘要证据。
+- 使用 DAG / graph executor 组织论文理解流程，节点包括 ParsePaper、ExtractSections、SummarizeContribution、ExtractMethods、VerifyClaims 和 GenerateReport。
+- 内置多 Agent 分工：Reader 读论文，Extractor 抽取结构，Synthesizer 写总结，Critic / Verifier 检查可信度。
+- 构建 Grounding Map，把 intro、method、experiments 和 claims 映射回原文证据。
+- 构建 Paper-to-Knowledge Graph，提取 concept、method、dataset、evaluation 等节点和关系。
+- Verifier Agent 会检查 claim 是否能在原文中找到支撑，方法类 claim 是否落在 method 证据中，贡献类 claim 是否新增了原文没有的内容。
+- 支持 correction memory：用户反馈会被保存为历史修正规则，后续总结自动注入。
+- 支持 self-improving prompt patches：根据历史反馈自动优化 extraction prompt、summarization prompt 和 evaluation rubric。
 - 在浏览器中预览论文，并下载生成的 `.docx` 总结文档。
 - 直接使用 Python 命令行启动。
 
-## 简单原理
+## Harness Engineering
 
-程序启动后会读取配置文件中的模型接口参数。用户提交论文后，PaperAgent 会先解析 PDF 或 Word 文档，提取正文、版面结构和关键素材；随后把论文正文分块发送给大模型生成分段笔记，再合并、润色和结构化整理；最后把总结内容与关键图表写入 Word 文档。
+PaperAgent 的重点不是把 prompt 写得更长，而是把论文理解过程放进可控的 Harness：
+
+- **结构化执行**：每个 workflow node 都有明确依赖，失败可以定位到具体阶段。
+- **证据优先**：标题、摘要、公式、图表和 claim 都尽量保留原文来源，避免把模型常识写进报告。
+- **资产约束**：图表引用必须来自已抽取的可用截图，正文不能凭空编造图号、表号或公式号。
+- **评估闭环**：Verifier Agent 在生成报告前检查关键 claim，失败时停止生成，而不是把不可信内容写进 Word。
+- **可观察产物**：除了 `.docx` 报告，还会生成 knowledge graph sidecar，用于查看 Agent trace、结构节点和证据关系。
+
+## Loop Engineering
+
+PaperAgent 也把“用户指出错误”视为系统输入，而不是一次性对话里的临时修正：
+
+```text
+user feedback
+  -> summary correction
+  -> correction memory
+  -> prompt patch
+  -> future extraction / summarization / evaluation
+```
+
+反馈可以通过后端接口写入：
+
+```http
+POST /v1/summary_feedback
+```
+
+示例 payload：
+
+```json
+{
+  "paper_id": "Linear Image Generation by Synthesizing Exposure Brackets",
+  "category": "asset_reference",
+  "original": "文字写着表2所示，但插入的是图",
+  "corrected": "图表引用必须和原文 caption 类型一致",
+  "note": "没有表格 caption 的截图不能被当成表格编号引用"
+}
+```
+
+系统会把这些修正保存到 correction memory，并在下一次处理同一论文或全局规则时自动生成三类 prompt patch：
+
+- `extraction`：影响标题、摘要、章节、图表、公式等证据抽取。
+- `summarization`：影响最终中文精读报告的组织、措辞和引用方式。
+- `evaluation`：影响 Verifier Agent 的检查标准和拒绝条件。
+
+当前自动生成的 prompt patch 可以通过接口查看：
+
+```http
+GET /v1/prompt_patches?paper_id=your-paper-id
+```
+
+默认记忆文件位置：
+
+```text
+~/.config/PaperAgent/summary_corrections.jsonl
+```
+
+也可以通过 `PAPER_AGENT_CORRECTION_MEMORY_PATH` 指定自定义路径。
+
+## 处理流程
+
+程序启动后会读取配置文件中的模型接口参数。用户提交论文后，PaperAgent 会先解析 PDF 或 Word 文档，提取正文、版面结构和关键素材；随后构建 Grounding Map 和 Knowledge Graph；再把论文正文分块发送给大模型生成分段笔记，由 Synthesizer 合并、润色和结构化整理；最后由 Verifier Agent 校验关键 claim，通过后把总结内容与关键图表写入 Word 文档。
 
 整体流程：
 
 ```text
 论文文件或链接
   -> 文档解析与正文抽取
-  -> 图表/公式素材提取
-  -> 调用大模型生成总结
-  -> 生成 Word 总结文档
+  -> 图表 / 表格 / 公式素材提取
+  -> Grounding Map + Knowledge Graph
+  -> Reader / Extractor / Synthesizer 多 Agent 协作
+  -> Verifier Agent 校验 claim
+  -> 生成 Word 总结文档与 KG sidecar
 ```
 
 ## 环境要求
@@ -133,6 +232,7 @@ copy config.json config.local.json
     "PAPER_AGENT_LANG_TO": "Simplified Chinese",
     "PAPER_AGENT_VFONT": null,
     "NOTO_FONT_PATH": "/app/SourceHanSerifCN-Regular.ttf",
+    "PAPER_AGENT_CORRECTION_MEMORY_PATH": "",
     "PAPER_AGENT_PROMPT": ""
 }
 ```
