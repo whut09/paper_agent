@@ -34,6 +34,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_section_label,
     _row_looks_table_like,
     _sync_inline_asset_references,
+    _visual_rect_for_caption,
     _verification_should_block_report,
     _with_asset_references,
     get_self_improving_prompt_patches,
@@ -478,6 +479,38 @@ def test_table_rect_expands_to_zero_height_bottom_border():
     expanded = _expand_table_rect_to_borders(FakePage(), rect)
 
     assert expanded.y1 > rect.y1
+
+
+def test_captioned_figure_crop_does_not_cross_previous_table():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            return {"blocks": []}
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(58, 120, 520, 390)},
+                {"rect": fitz.Rect(86, 432, 282, 626)},
+                {"rect": fitz.Rect(320, 432, 522, 626)},
+            ]
+
+    lines = [
+        line("RefCOCO", 75, 158, 140, 171),
+        line("Ref-L4", 190, 158, 250, 171),
+        line("Lisa", 335, 158, 380, 171),
+        line("90.62 (+0.17)", 64, 210, 150, 224),
+        line("74.54 (+1.28)", 190, 210, 280, 224),
+        line("65.86 (+1.99)", 330, 210, 420, 224),
+        line("59.44 (+2.94)", 430, 376, 520, 390),
+        line("Figure 3. Performance curves of different post-training paradigms", 50, 690, 555, 704),
+    ]
+
+    rect = _visual_rect_for_caption(FakePage(), lines[-1].rect, lines)
+
+    assert rect is not None
+    assert rect.y0 > 400
+    assert rect.y1 < 680
 
 
 def test_formula_reference_keeps_original_paper_number():

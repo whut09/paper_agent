@@ -1531,6 +1531,10 @@ def _visual_rect_for_caption(
     near = [r for r in candidates if -8 <= caption_rect.y0 - r.y1 <= 150]
     seed_pool = near or candidates
     seed = max(seed_pool, key=lambda r: r.width * r.height)
+    barrier_y = _figure_upper_barrier_y(lines, seed, caption_rect, left, right, search_top)
+    if barrier_y is not None:
+        search_top = max(search_top, barrier_y + 2)
+        candidates = [region for region in candidates if region.y0 >= search_top - 1]
     group = fitz.Rect(seed)
     changed = True
     while changed:
@@ -1545,6 +1549,33 @@ def _visual_rect_for_caption(
     if group.is_empty or group.width < 40 or group.height < 30:
         return None
     return group
+
+
+def _figure_upper_barrier_y(
+    lines: list[TextLine],
+    seed: fitz.Rect,
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+    search_top: float,
+) -> float | None:
+    candidate_lines = [
+        line
+        for line in lines
+        if search_top <= line.rect.y0 < seed.y0
+        and _horizontal_overlap_fraction(line.rect, left, right) > 0
+    ]
+    barrier: float | None = None
+    for group in _group_lines_by_row(candidate_lines):
+        row_rect = _merge_rects([line.rect for line in group])
+        if row_rect.is_empty:
+            continue
+        if seed.y0 - row_rect.y1 > 180:
+            continue
+        row_text = " ".join(line.text for line in group)
+        if _row_looks_table_like(row_text, group) or _caption_is_table(row_text):
+            barrier = max(barrier or row_rect.y1, row_rect.y1)
+    return barrier
 
 
 def _fallback_visual_rect_for_caption(page: fitz.Page, caption_rect: fitz.Rect) -> fitz.Rect | None:
