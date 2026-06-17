@@ -1203,7 +1203,7 @@ def _capture_captioned_figures(
         caption_text, caption_rect = _caption_text_and_rect(lines, line_index, page, "figure")
         visual_rect = _visual_rect_for_caption(page, line.rect, lines)
         if visual_rect is None:
-            visual_rect = _fallback_visual_rect_for_caption(page, line.rect)
+            visual_rect = _fallback_visual_rect_for_caption(page, line.rect, lines)
         if visual_rect is None:
             continue
         clip_rect = _merge_rects([visual_rect, caption_rect])
@@ -1215,7 +1215,7 @@ def _capture_captioned_figures(
         seen_boxes.add(key)
         figure_index += 1
         path = work_dir / f"page-{page_no:03d}-captioned-figure-{figure_index:02d}.png"
-        _save_clip(page, clip_rect, path, padding=2)
+        _save_clip(page, clip_rect, path, padding=1)
         assets.append(PaperAsset("figure", page_no, path, caption_text[:300], rect=visual_rect))
     return assets
 
@@ -1475,8 +1475,13 @@ def _caption_text_and_rect(
             break
         if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Za-z]", next_line.text):
             break
-        if kind == "figure" and len(caption_lines) >= 3:
-            break
+        if kind == "figure":
+            if len(caption_lines) >= 3:
+                break
+            if _figure_caption_continuation_is_body_text(previous.text, next_line.text):
+                break
+            if len(caption_lines) >= 1 and not _line_looks_caption_continuation(next_line.text):
+                break
         if kind == "table":
             if len(caption_lines) >= 4:
                 break
@@ -1495,6 +1500,20 @@ def _line_looks_caption_continuation(text: str) -> bool:
         return False
     words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", stripped)
     return len(words) >= 4 or stripped[:1].islower()
+
+
+def _figure_caption_continuation_is_body_text(previous_text: str, next_text: str) -> bool:
+    previous = _clean_xml_text(previous_text).strip()
+    following = _clean_xml_text(next_text).strip()
+    if not previous or not following:
+        return False
+    if not re.search(r"[.!?。！？]$", previous):
+        return False
+    if re.match(r"^(?:Figure|Fig\.?|Table|Tab\.?)\s*\d+", following, flags=re.IGNORECASE):
+        return True
+    if following[:1].isupper() and len(re.findall(r"[A-Za-z]{2,}", following)) >= 3:
+        return True
+    return bool(re.match(r"^(?:To|We|The|This|These|Our|In)\b", following))
 
 
 def _caption_column_bounds(page: fitz.Page, caption_rect: fitz.Rect) -> tuple[float, float]:
@@ -1578,13 +1597,63 @@ def _figure_upper_barrier_y(
     return barrier
 
 
-def _fallback_visual_rect_for_caption(page: fitz.Page, caption_rect: fitz.Rect) -> fitz.Rect | None:
+def _fallback_visual_rect_for_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine] | None = None,
+) -> fitz.Rect | None:
     left, right = _caption_column_bounds(page, caption_rect)
     top = max(0, caption_rect.y0 - min(300, page.rect.height * 0.38))
+    barrier_y = _fallback_figure_upper_body_barrier_y(lines or [], caption_rect, left, right, top)
+    if barrier_y is not None:
+        top = max(top, barrier_y + 8)
     rect = fitz.Rect(left, top, right, max(top + 80, caption_rect.y0 - 2))
     if rect.is_empty or rect.width < 40 or rect.height < 40:
         return None
     return rect
+
+
+def _fallback_figure_upper_body_barrier_y(
+    lines: list[TextLine],
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+    search_top: float,
+) -> float | None:
+    barrier: float | None = None
+    for group in _group_lines_by_row(
+        [
+            line
+            for line in lines
+            if search_top <= line.rect.y0 < caption_rect.y0 - 45
+            and _horizontal_overlap_fraction(line.rect, left, right) > 0
+        ]
+    ):
+        row_rect = _merge_rects([line.rect for line in group])
+        if row_rect.is_empty:
+            continue
+        text = _clean_xml_text(" ".join(line.text for line in group)).strip()
+        if _row_is_body_text_before_figure(text, group, left, right):
+            barrier = max(barrier or row_rect.y1, row_rect.y1)
+    return barrier
+
+
+def _row_is_body_text_before_figure(text: str, group: list[TextLine], left: float, right: float) -> bool:
+    if not text or _caption_is_figure(text) or _caption_is_table(text):
+        return False
+    if re.search(r"[%+−±]|\d", text):
+        return False
+    words = re.findall(r"[A-Za-z\u4e00-\u9fff]{2,}", text)
+    if len(group) == 1 and len(words) <= 3:
+        return False
+    if _row_looks_table_like(text, group):
+        return True
+    if len(words) < 7:
+        return False
+    row_rect = _merge_rects([line.rect for line in group])
+    column_width = max(right - left, 1)
+    has_sentence_punctuation = bool(re.search(r"[.。;；,，]$", text))
+    return row_rect.width > column_width * 0.38 or has_sentence_punctuation
 
 
 def _page_graphic_regions(page: fitz.Page) -> list[fitz.Rect]:

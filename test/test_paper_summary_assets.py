@@ -18,10 +18,12 @@ from paper_agent.paper_summary import (
     _build_knowledge_graph,
     _caption_is_figure,
     _caption_is_table,
+    _caption_text_and_rect,
     _correction_memory_context,
     _ensure_asset_markers,
     _enforce_core_original_title,
     _extract_abstract_from_text,
+    _fallback_visual_rect_for_caption,
     _extract_verifiable_claims,
     _load_correction_memories,
     _expand_table_rect_to_borders,
@@ -511,6 +513,41 @@ def test_captioned_figure_crop_does_not_cross_previous_table():
     assert rect is not None
     assert rect.y0 > 400
     assert rect.y1 < 680
+
+
+def test_figure_caption_does_not_absorb_following_body_text():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure 5. The impact of hard data ratio on OOD performance.", 62, 530, 520, 545),
+        line("To investigate why a small number of hard samples can", 70, 574, 520, 589),
+    ]
+
+    text, rect = _caption_text_and_rect(lines, 0, FakePage(), "figure")
+
+    assert "To investigate" not in text
+    assert rect.y1 < 560
+
+
+def test_fallback_figure_crop_trims_body_text_above_plot():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    caption = line("Figure 5. The impact of hard data ratio on OOD performance.", 62, 530, 520, 545)
+    lines = [
+        line("We observe that standard SFT, which incorporates only", 48, 120, 520, 136),
+        line("but emerges clearly even at low mixing ratios.", 48, 236, 472, 252),
+        line("ImageNet-R", 143, 272, 225, 286),
+        line("+5% hard data", 168, 330, 258, 344),
+        caption,
+    ]
+
+    rect = _fallback_visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y0 > 255
+    assert rect.y0 < 285
 
 
 def test_formula_reference_keeps_original_paper_number():
