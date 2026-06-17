@@ -54,6 +54,8 @@ paper_agent/
 
 这一步的目标是先把调用边界稳定下来：GUI 和 backend 通过 `harness/`、`memory/` 入口调用总结能力，测试也覆盖新 facade。后续可以把 `paper_summary.py` 中的实现按这些边界逐块迁移，而不影响外部入口。
 
+Harness 层的节点协议已经开始结构化：每个节点声明 `requires` / `produces`，执行后写入 `NodeResult`，包含 `status`、`outputs`、`evidence`、`artifacts`、`errors`、`warnings` 和 `metrics`。这让 ParsePaper、ExtractEvidence、SynthesizeReport、VerifyClaims、GenerateDocx 这类节点都可以被检查、统计和回放。
+
 ## 网页端效果
 
 启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。

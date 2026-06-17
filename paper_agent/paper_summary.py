@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Protocol
 
 import fitz
 import httpx
@@ -202,6 +202,27 @@ class PromptPatch:
     source_category: str = "summary"
 
 
+@dataclass
+class NodeResult:
+    status: str = "success"
+    outputs: dict = field(default_factory=dict)
+    evidence: list[dict] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
+
+
+class HarnessNode(Protocol):
+    name: str
+    role: str
+    requires: list[str]
+    produces: list[str]
+
+    def run(self, ctx: "PaperWorkflowContext") -> NodeResult:
+        ...
+
+
 class PaperAgentRole(str, Enum):
     READER = "Reader"
     EXTRACTOR = "Extractor"
@@ -239,6 +260,7 @@ class PaperWorkflowContext:
     summary: str = ""
     verification: VerificationResult | None = None
     agent_trace: list[dict[str, str]] = field(default_factory=list)
+    node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
     knowledge_graph_path: Path | None = None
 
@@ -256,12 +278,21 @@ class PaperWorkflowContext:
             self.client = None
 
 
+PaperContext = PaperWorkflowContext
+
+
 class PaperWorkflowNode:
     name = ""
     depends_on: tuple[str, ...] = ()
     agent_role = PaperAgentRole.EXTRACTOR
+    requires: list[str] = []
+    produces: list[str] = []
 
-    def run(self, context: PaperWorkflowContext) -> None:
+    @property
+    def role(self) -> str:
+        return self.agent_role.value
+
+    def run(self, context: PaperWorkflowContext) -> NodeResult | None:
         raise NotImplementedError
 
 
@@ -304,8 +335,24 @@ class PaperWorkflow:
                 for name in ready:
                     context.check_cancelled()
                     node = self.nodes[name]
-                    context.agent_trace.append({"agent": node.agent_role.value, "node": node.name})
-                    node.run(context)
+                    started_at = datetime.now(timezone.utc)
+                    try:
+                        node_result = node.run(context)
+                    except Exception as exc:
+                        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+                        result = _normalize_node_result(
+                            node,
+                            NodeResult(status="failed", errors=[str(exc)]),
+                            context,
+                            elapsed,
+                        )
+                        context.node_results[node.name] = result
+                        context.agent_trace.append(_node_trace_entry(node, result))
+                        raise
+                    elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+                    result = _normalize_node_result(node, node_result, context, elapsed)
+                    context.node_results[node.name] = result
+                    context.agent_trace.append(_node_trace_entry(node, result))
                     completed.add(name)
                     pending.remove(name)
             return context
@@ -316,6 +363,8 @@ class PaperWorkflow:
 class PreparePaper(PaperWorkflowNode):
     name = "PreparePaper"
     agent_role = PaperAgentRole.READER
+    requires = ["input_path", "output_dir"]
+    produces = ["source_path", "pdf_path", "paper_name", "work_dir"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         output = Path(context.output_dir)
@@ -339,6 +388,8 @@ class ParsePaper(PaperWorkflowNode):
     name = "ParsePaper"
     depends_on = ("PreparePaper",)
     agent_role = PaperAgentRole.READER
+    requires = ["pdf_path", "work_dir", "pages", "max_assets"]
+    produces = ["paper_text", "assets"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.pdf_path is None or context.work_dir is None:
@@ -359,6 +410,8 @@ class ExtractSections(PaperWorkflowNode):
     name = "ExtractSections"
     depends_on = ("ParsePaper",)
     agent_role = PaperAgentRole.EXTRACTOR
+    requires = ["paper_text", "assets"]
+    produces = ["paper_title", "abstract", "formulas", "grounding_map", "knowledge_graph", "prompt_patches"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.pdf_path is None:
@@ -377,6 +430,8 @@ class SummarizeContribution(PaperWorkflowNode):
     name = "SummarizeContribution"
     depends_on = ("ExtractSections",)
     agent_role = PaperAgentRole.SYNTHESIZER
+    requires = ["paper_text", "assets", "prompt_patches"]
+    produces = ["chunk_notes"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         context.check_cancelled()
@@ -398,6 +453,8 @@ class ExtractMethods(PaperWorkflowNode):
     name = "ExtractMethods"
     depends_on = ("SummarizeContribution",)
     agent_role = PaperAgentRole.SYNTHESIZER
+    requires = ["chunk_notes", "assets", "abstract", "formulas"]
+    produces = ["draft_report"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.client is None or context.config is None:
@@ -423,6 +480,8 @@ class VerifyClaims(PaperWorkflowNode):
     name = "VerifyClaims"
     depends_on = ("ExtractMethods",)
     agent_role = PaperAgentRole.CRITIC
+    requires = ["draft_report", "grounding_map", "assets"]
+    produces = ["verification_report", "verified_report", "knowledge_graph"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.client is None or context.config is None:
@@ -447,6 +506,8 @@ class GenerateReport(PaperWorkflowNode):
     name = "GenerateReport"
     depends_on = ("VerifyClaims",)
     agent_role = PaperAgentRole.SYNTHESIZER
+    requires = ["verified_report", "asset_manifest"]
+    produces = ["docx", "trace.json", "kg.json"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.output is None or context.source_path is None:
@@ -468,6 +529,103 @@ class GenerateReport(PaperWorkflowNode):
                 encoding="utf-8",
             )
         context.report(1.0, "论文总结完成")
+
+
+def _normalize_node_result(
+    node: PaperWorkflowNode,
+    result: NodeResult | None,
+    context: PaperWorkflowContext,
+    elapsed_seconds: float,
+) -> NodeResult:
+    if result is None:
+        result = NodeResult()
+    elif not isinstance(result, NodeResult):
+        result = NodeResult(outputs={"return": result})
+    if not result.outputs:
+        result.outputs = _node_output_snapshot(node, context)
+    if not result.artifacts:
+        result.artifacts = _node_artifacts_snapshot(node, context)
+    result.metrics.setdefault("elapsed_seconds", round(elapsed_seconds, 4))
+    result.metrics.setdefault("asset_count", len(context.assets))
+    result.metrics.setdefault("claim_count", len(context.grounding_map.get("claims", [])))
+    result.metrics.setdefault("chunk_count", len(context.chunk_notes))
+    if result.errors and result.status == "success":
+        result.status = "failed"
+    elif result.warnings and result.status == "success":
+        result.status = "warning"
+    return result
+
+
+def _node_trace_entry(node: PaperWorkflowNode, result: NodeResult) -> dict[str, str]:
+    return {
+        "agent": node.agent_role.value,
+        "node": node.name,
+        "status": result.status,
+        "errors": str(len(result.errors)),
+        "warnings": str(len(result.warnings)),
+    }
+
+
+def _node_output_snapshot(node: PaperWorkflowNode, context: PaperWorkflowContext) -> dict:
+    snapshot: dict[str, object] = {}
+    for name in node.produces:
+        value = _context_output_value(name, context)
+        if value is not None:
+            snapshot[name] = value
+    return snapshot
+
+
+def _context_output_value(name: str, context: PaperWorkflowContext) -> object | None:
+    mapping = {
+        "source_path": context.source_path,
+        "pdf_path": context.pdf_path,
+        "paper_name": context.paper_name,
+        "work_dir": context.work_dir,
+        "paper_text": context.text,
+        "assets": context.assets,
+        "paper_title": context.paper_title,
+        "abstract": context.abstract,
+        "formulas": context.formulas,
+        "grounding_map": context.grounding_map,
+        "knowledge_graph": context.knowledge_graph,
+        "prompt_patches": context.prompt_patches,
+        "chunk_notes": context.chunk_notes,
+        "draft_report": context.summary,
+        "verified_report": context.summary,
+        "verification_report": context.verification,
+        "docx": context.docx_path,
+        "kg.json": context.knowledge_graph_path,
+        "trace.json": context.agent_trace,
+    }
+    value = mapping.get(name)
+    if value is None:
+        return None
+    return _summarize_node_output(value)
+
+
+def _summarize_node_output(value: object) -> object:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, str):
+        return value[:240]
+    if isinstance(value, VerificationResult):
+        return {"passed": value.passed, "errors": value.errors[:5]}
+    if isinstance(value, list):
+        return {"count": len(value)}
+    if isinstance(value, dict):
+        return {"keys": sorted(value.keys())[:12], "count": len(value)}
+    return value
+
+
+def _node_artifacts_snapshot(node: PaperWorkflowNode, context: PaperWorkflowContext) -> list[str]:
+    artifacts: list[str] = []
+    if "assets" in node.produces:
+        artifacts.extend(str(asset.path) for asset in context.assets if asset.path)
+    if "docx" in node.produces and context.docx_path:
+        artifacts.append(str(context.docx_path))
+    if "kg.json" in node.produces and context.knowledge_graph_path:
+        artifacts.append(str(context.knowledge_graph_path))
+    return artifacts
 
 
 def summarize_paper(

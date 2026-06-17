@@ -1,5 +1,5 @@
 """Report and verification schemas."""
 
-from paper_agent.paper_summary import KnowledgeGraphEdge, KnowledgeGraphNode, VerificationResult
+from paper_agent.paper_summary import KnowledgeGraphEdge, KnowledgeGraphNode, NodeResult, VerificationResult
 
-__all__ = ["KnowledgeGraphEdge", "KnowledgeGraphNode", "VerificationResult"]
+__all__ = ["KnowledgeGraphEdge", "KnowledgeGraphNode", "NodeResult", "VerificationResult"]

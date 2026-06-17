@@ -101,6 +101,16 @@ def test_paper_workflow_runs_nodes_by_dependency():
         "GenerateReport",
     ]
     assert [item["agent"] for item in context.agent_trace] == [PaperAgentRole.EXTRACTOR.value] * 7
+    assert [item["status"] for item in context.agent_trace] == ["success"] * 7
+    assert set(context.node_results) == {
+        "PreparePaper",
+        "ParsePaper",
+        "ExtractSections",
+        "SummarizeContribution",
+        "ExtractMethods",
+        "VerifyClaims",
+        "GenerateReport",
+    }
 
 
 def test_default_workflow_declares_multi_agent_roles():
