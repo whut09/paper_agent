@@ -1,0 +1,2 @@
+"""Application entrypoints for PaperAgent."""
+

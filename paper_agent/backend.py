@@ -10,12 +10,10 @@ from pathlib import Path
 from string import Template
 from paper_agent.doclayout import ModelInstance
 from paper_agent.config import ConfigManager
-from paper_agent.paper_summary import (
-    DEFAULT_MAX_ASSETS,
-    get_self_improving_prompt_patches,
-    record_summary_correction,
-    summarize_paper,
-)
+from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
+from paper_agent.harness.workflow import summarize_paper
+from paper_agent.memory.correction_memory import record_summary_correction
+from paper_agent.memory.prompt_patch import get_self_improving_prompt_patches
 
 flask_app = Flask("paper_agent")
 flask_app.config.from_mapping(

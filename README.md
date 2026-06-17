@@ -37,6 +37,23 @@ flowchart LR
 
 这条链路让 Agent 的行为更像一个可观测的实验系统：Reader 负责读入和解析，Extractor 负责结构化证据，Synthesizer 负责写作，Critic 负责拒绝没有证据支持的 claim，最后由报告生成器把文本、图表和元信息写入 `.docx`。
 
+## 代码结构
+
+项目目录已经按 Agent Harness 的工程边界组织。当前 `paper_summary.py` 仍保留为兼容核心，新的包结构作为稳定 facade 承接后续拆分：
+
+```text
+paper_agent/
+  app/          # CLI、GUI、backend、MCP 等应用入口 facade
+  harness/      # DAG workflow、node、context、trace、policy、result
+  agents/       # Reader、Extractor、Synthesizer、Verifier、Reflector
+  tools/        # PDF 解析、资产抽取、公式、DOCX、KG、Grounding
+  memory/       # correction memory 与 self-improving prompt patch
+  evaluation/   # verifier validators、metrics、golden cases
+  schemas/      # paper、asset、claim、report 等共享 schema
+```
+
+这一步的目标是先把调用边界稳定下来：GUI 和 backend 通过 `harness/`、`memory/` 入口调用总结能力，测试也覆盖新 facade。后续可以把 `paper_summary.py` 中的实现按这些边界逐块迁移，而不影响外部入口。
+
 ## 网页端效果
 
 启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。

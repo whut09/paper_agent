@@ -15,7 +15,8 @@ import logging
 
 from paper_agent import __version__
 from paper_agent.config import ConfigManager
-from paper_agent.paper_summary import DEFAULT_MAX_ASSETS, summarize_paper
+from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
+from paper_agent.harness.workflow import summarize_paper
 
 logger = logging.getLogger(__name__)
 
