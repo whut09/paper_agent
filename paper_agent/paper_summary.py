@@ -160,6 +160,11 @@ class CodexConfig:
 class VerificationResult:
     passed: bool
     errors: list[str] = field(default_factory=list)
+    hard_failures: list[dict[str, str]] = field(default_factory=list)
+    soft_warnings: list[dict[str, str]] = field(default_factory=list)
+    patch_suggestions: list[dict[str, str]] = field(default_factory=list)
+    revision_attempted: bool = False
+    revision_applied: bool = False
 
 
 @dataclass
@@ -514,6 +519,8 @@ class PaperWorkflow:
                         )
                         context.node_results[node.name] = result
                         context.agent_trace.append(_node_trace_entry(context, node, result))
+                        if context.output and context.paper_name and (context.verification or context.guard_results):
+                            _write_harness_sidecars(context)
                         raise
                     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
                     result = _normalize_node_result(node, node_result, context, elapsed)
@@ -726,6 +733,14 @@ def _normalize_node_result(
         "guard_warning_count",
         len([guard for guard in context.guard_results if guard.status == "warning"]),
     )
+    if context.verification is not None:
+        result.metrics.setdefault("hard_failure_count", len(context.verification.hard_failures))
+        result.metrics.setdefault("soft_warning_count", len(context.verification.soft_warnings))
+        result.metrics.setdefault("patch_suggestion_count", len(context.verification.patch_suggestions))
+        result.metrics.setdefault("revision_attempted", context.verification.revision_attempted)
+        result.metrics.setdefault("revision_applied", context.verification.revision_applied)
+        if node.name == "VerifyClaims":
+            result.warnings.extend(_verification_warning_messages(context.verification))
     if result.errors and result.status == "success":
         result.status = "failed"
     elif result.warnings and result.status == "success":
@@ -808,8 +823,24 @@ def _write_harness_sidecars(context: PaperWorkflowContext) -> None:
 
 def _verification_payload(verification: VerificationResult | None) -> dict:
     if verification is None:
-        return {"passed": False, "errors": ["verification not available"]}
-    return {"passed": verification.passed, "errors": list(verification.errors)}
+        return {
+            "passed": False,
+            "errors": ["verification not available"],
+            "hard_failures": [],
+            "soft_warnings": [],
+            "patch_suggestions": [],
+            "revision_attempted": False,
+            "revision_applied": False,
+        }
+    return {
+        "passed": verification.passed,
+        "errors": list(verification.errors),
+        "hard_failures": list(verification.hard_failures),
+        "soft_warnings": list(verification.soft_warnings),
+        "patch_suggestions": list(verification.patch_suggestions),
+        "revision_attempted": verification.revision_attempted,
+        "revision_applied": verification.revision_applied,
+    }
 
 
 def _guard_payload(result: GuardResult) -> dict:
@@ -868,7 +899,14 @@ def _summarize_node_output(value: object) -> object:
     if isinstance(value, str):
         return value[:240]
     if isinstance(value, VerificationResult):
-        return {"passed": value.passed, "errors": value.errors[:5]}
+        return {
+            "passed": value.passed,
+            "errors": value.errors[:5],
+            "hard_failures": value.hard_failures[:5],
+            "soft_warnings": value.soft_warnings[:5],
+            "patch_suggestions": value.patch_suggestions[:5],
+            "revision_applied": value.revision_applied,
+        }
     if isinstance(value, list):
         return {"count": len(value)}
     if isinstance(value, dict):
@@ -2873,13 +2911,47 @@ def _verify_summary_claims(
         paper_title,
         correction_memories or [],
     )
-    verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [], prompt_patches)
+    verification = _run_verification_agent(
+        client,
+        model,
+        paper_text,
+        grounded_map,
+        correction_memories or [],
+        prompt_patches,
+    )
+    if verification.patch_suggestions:
+        verification.revision_attempted = True
+        revised_summary = _apply_verifier_patch_suggestions(summary, verification.patch_suggestions)
+        if revised_summary != summary:
+            summary = _postprocess_summary(revised_summary)
+            summary = _normalize_final_sections(summary)
+            summary = _enforce_core_original_title(summary, paper_title)
+            summary = _ensure_asset_markers(summary, assets)
+            claims = _extract_verifiable_claims(summary)
+            grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
+            guard_results = _run_harness_guards(
+                summary,
+                grounded_map,
+                assets,
+                paper_title,
+                correction_memories or [],
+            )
+            verification = _run_verification_agent(
+                client,
+                model,
+                paper_text,
+                grounded_map,
+                correction_memories or [],
+                prompt_patches,
+            )
+            verification.revision_attempted = True
+            verification.revision_applied = True
     guard_errors = _blocking_guard_errors(guard_results)
     if guard_errors:
-        verification.errors.extend(guard_errors)
+        _add_guard_failures_to_verification(verification, guard_errors)
         verification.passed = False
     if _verification_should_block_report(verification):
-        details = "\n".join(f"- {error}" for error in verification.errors[:8])
+        details = _verification_failure_details(verification)
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
     return summary, verification, guard_results
 
@@ -2909,6 +2981,82 @@ def _blocking_guard_errors(results: list[GuardResult]) -> list[str]:
         if spec and spec.blocking and result.errors:
             errors.extend(f"{result.name}: {error}" for error in result.errors)
     return errors
+
+
+def _add_guard_failures_to_verification(verification: VerificationResult, guard_errors: list[str]) -> None:
+    for error in guard_errors:
+        if error not in verification.errors:
+            verification.errors.append(error)
+        verification.hard_failures.append(
+            {
+                "type": "guard_failure",
+                "claim": "",
+                "reason": error,
+            }
+        )
+
+
+def _verification_failure_details(verification: VerificationResult) -> str:
+    hard_failures = verification.hard_failures or [
+        {"type": "hard_failure", "claim": "", "reason": error} for error in verification.errors
+    ]
+    lines = []
+    for failure in hard_failures[:8]:
+        failure_type = failure.get("type", "hard_failure")
+        claim = failure.get("claim", "")
+        reason = failure.get("reason", "") or failure.get("message", "")
+        suffix = f" | claim: {claim}" if claim else ""
+        lines.append(f"- {failure_type}: {reason}{suffix}")
+    if verification.patch_suggestions:
+        lines.append(f"- patch_suggestions: {len(verification.patch_suggestions)} suggestion(s) recorded")
+    return "\n".join(lines)
+
+
+def _verification_warning_messages(verification: VerificationResult) -> list[str]:
+    warnings = []
+    for warning in verification.soft_warnings:
+        warning_type = warning.get("type", "soft_warning")
+        claim = warning.get("claim", "")
+        reason = warning.get("reason", "") or warning.get("message", "")
+        suffix = f" | claim: {claim}" if claim else ""
+        warnings.append(f"{warning_type}: {reason}{suffix}")
+    if verification.revision_applied:
+        warnings.append("Verifier revision loop applied patch suggestions once")
+    elif verification.revision_attempted and verification.patch_suggestions:
+        warnings.append("Verifier revision loop could not apply patch suggestions automatically")
+    return warnings
+
+
+def _apply_verifier_patch_suggestions(summary: str, suggestions: list[dict[str, str]]) -> str:
+    revised = summary
+    for suggestion in suggestions:
+        operation = str(suggestion.get("operation", "")).strip().lower()
+        target = _clean_xml_text(str(suggestion.get("target", ""))).strip()
+        replacement = _clean_xml_text(
+            str(suggestion.get("replacement", suggestion.get("value", suggestion.get("text", ""))))
+        ).strip()
+        if not target:
+            continue
+        if operation in {"delete_claim", "delete", "remove_claim", "remove"}:
+            revised = _delete_summary_claim(revised, target)
+        elif operation in {"replace_claim", "replace", "rewrite_claim", "rewrite"} and target in revised:
+            revised = revised.replace(target, replacement or "")
+    return re.sub(r"\n{3,}", "\n\n", revised).strip()
+
+
+def _delete_summary_claim(summary: str, target: str) -> str:
+    lines = summary.splitlines()
+    kept: list[str] = []
+    removed = False
+    for line in lines:
+        normalized = _normalize_markdown_line(line)
+        if target in line or target in normalized:
+            removed = True
+            continue
+        kept.append(line)
+    if removed:
+        return "\n".join(kept)
+    return summary.replace(target, "")
 
 
 def _guard_result(
@@ -3100,7 +3248,17 @@ def _run_verification_agent(
 ) -> VerificationResult:
     claims = grounding_map.get("claims", [])
     if not claims:
-        return VerificationResult(False, ["未能从总结中抽取到可校验 claim。"])
+        return VerificationResult(
+            False,
+            ["no verifiable claims extracted from the report"],
+            hard_failures=[
+                {
+                    "type": "no_verifiable_claims",
+                    "claim": "",
+                    "reason": "no verifiable claims extracted from the report",
+                }
+            ],
+        )
 
     evidence = _verification_evidence_text(paper_text, grounding_map)
     memories = correction_memories or []
@@ -3121,6 +3279,33 @@ def _run_verification_agent(
         f"自优化评估 Rubric：\n{evaluation_patch}\n\n"
         f"Grounding Map：\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
     )
+    prompt = (
+        "You are the Verifier Agent for a paper-understanding harness. "
+        "Your job is not to polish the report; your job is to decide whether every important claim is grounded.\n\n"
+        "Gate policy:\n"
+        "1. A claim must have direct support in the grounding map. Do not use common sense to fill gaps.\n"
+        "2. Method claims must be supported by method/approach/model/training/algorithm/implementation evidence.\n"
+        "3. Contribution claims must not invent datasets, metrics, capabilities, applications, or novelty not stated in the paper.\n"
+        "4. Weak or narrow evidence should be a soft warning, not a hard failure.\n"
+        "5. If a claim can be repaired safely, add a patch suggestion. Prefer delete_claim for unsupported additions.\n"
+        "6. Output JSON only. Do not output Markdown.\n\n"
+        "Required JSON schema:\n"
+        "{\n"
+        "  \"passed\": true/false,\n"
+        "  \"hard_failures\": [\n"
+        "    {\"type\": \"unsupported_core_claim\", \"claim\": \"...\", \"reason\": \"...\"}\n"
+        "  ],\n"
+        "  \"soft_warnings\": [\n"
+        "    {\"type\": \"weak_evidence\", \"claim\": \"...\", \"reason\": \"...\"}\n"
+        "  ],\n"
+        "  \"patch_suggestions\": [\n"
+        "    {\"operation\": \"delete_claim\", \"target\": \"...\"}\n"
+        "  ]\n"
+        "}\n\n"
+        f"User correction memory:\n{memory_context}\n\n"
+        f"Self-improving evaluation rubric:\n{evaluation_patch}\n\n"
+        f"Grounding Map:\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
+    )
     output = _chat(
         client,
         model,
@@ -3134,6 +3319,14 @@ def _run_verification_agent(
             "如果无法判断，就输出 {\"pass\": true, \"errors\": []}，不要输出 Markdown 或解释。\n\n"
             "合法格式：{\"pass\": true/false, \"errors\": [\"具体错误1\"]}\n\n"
             f"原始输出：\n{output}"
+        )
+        repair_prompt = (
+            "Convert the following Verifier Agent output into valid JSON only. "
+            "If the output does not contain enough information, return "
+            "{\"passed\": true, \"hard_failures\": [], \"soft_warnings\": [], \"patch_suggestions\": []}.\n\n"
+            "Required schema: "
+            "{\"passed\": true/false, \"hard_failures\": [], \"soft_warnings\": [], \"patch_suggestions\": []}\n\n"
+            f"Raw output:\n{output}"
         )
         repaired_output = _chat(
             client,
@@ -3512,22 +3705,86 @@ def _parse_verification_result(output: str) -> VerificationResult:
         payload = json.loads(_extract_json_object(output))
     except Exception as exc:
         return VerificationResult(False, [f"Verifier Agent 输出不是合法 JSON：{exc}"])
+    hard_failures = _normalize_verification_items(payload.get("hard_failures") or [])
+    soft_warnings = _normalize_verification_items(payload.get("soft_warnings") or [])
+    patch_suggestions = _normalize_verification_items(payload.get("patch_suggestions") or [])
     errors = payload.get("errors") or []
     if not isinstance(errors, list):
         errors = [str(errors)]
     cleaned_errors = [_clean_xml_text(str(error)).strip() for error in errors if str(error).strip()]
-    passed = bool(payload.get("pass")) and not cleaned_errors
-    if not passed and not cleaned_errors:
-        cleaned_errors = ["Verifier Agent 判定失败，但未给出具体错误。"]
-    return VerificationResult(passed, cleaned_errors)
+    if cleaned_errors and not hard_failures:
+        hard_failures = [
+            {
+                "type": "legacy_error",
+                "claim": "",
+                "reason": error,
+            }
+            for error in cleaned_errors
+        ]
+    passed_value = payload.get("passed", payload.get("pass", False))
+    if (
+        not bool(passed_value)
+        and not hard_failures
+        and not soft_warnings
+        and not patch_suggestions
+        and not _verification_output_is_format_error(cleaned_errors)
+    ):
+        hard_failures = [
+            {
+                "type": "verifier_failed_without_reason",
+                "claim": "",
+                "reason": "Verifier Agent returned passed=false without hard failure details.",
+            }
+        ]
+        cleaned_errors.append(hard_failures[0]["reason"])
+    passed = not hard_failures
+    if hard_failures:
+        for failure in hard_failures:
+            reason = failure.get("reason", "") or failure.get("message", "")
+            if reason and reason not in cleaned_errors:
+                cleaned_errors.append(reason)
+    return VerificationResult(
+        passed,
+        cleaned_errors,
+        hard_failures=hard_failures,
+        soft_warnings=soft_warnings,
+        patch_suggestions=patch_suggestions,
+    )
 
 
 def _verification_should_block_report(result: VerificationResult) -> bool:
-    return not result.passed and not _verification_failed_due_to_format(result)
+    return bool(result.hard_failures) and not _verification_failed_due_to_format(result)
 
 
 def _verification_failed_due_to_format(result: VerificationResult) -> bool:
-    return not result.passed and bool(result.errors) and all("输出不是合法 JSON" in error for error in result.errors)
+    return (
+        not result.passed
+        and bool(result.errors)
+        and not result.hard_failures
+        and _verification_output_is_format_error(result.errors)
+    )
+
+
+def _verification_output_is_format_error(errors: list[str]) -> bool:
+    return bool(errors) and all("输出不是合法 JSON" in error for error in errors)
+
+
+def _normalize_verification_items(value: object) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        value = [value] if value else []
+    normalized: list[dict[str, str]] = []
+    for item in value:
+        if isinstance(item, dict):
+            normalized.append(
+                {
+                    str(key): _clean_xml_text(str(val)).strip()
+                    for key, val in item.items()
+                    if val is not None and str(val).strip()
+                }
+            )
+        elif str(item).strip():
+            normalized.append({"type": "message", "claim": "", "reason": _clean_xml_text(str(item)).strip()})
+    return normalized
 
 
 def _extract_json_object(text: str) -> str:

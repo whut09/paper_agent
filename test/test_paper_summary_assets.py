@@ -12,6 +12,7 @@ from paper_agent.paper_summary import (
     PaperWorkflowNode,
     TextLine,
     _asset_display_label,
+    _apply_verifier_patch_suggestions,
     _attach_claims_to_grounding_map,
     _build_prompt_patches,
     _build_grounding_map,
@@ -411,23 +412,94 @@ def test_knowledge_graph_links_claims_to_source_sections():
 def test_verifier_json_parser_is_conservative():
     passed = _parse_verification_result('{"pass": true, "errors": []}')
     failed = _parse_verification_result('```json\n{"pass": false, "errors": ["新增了原文没有的贡献"]}\n```')
+    structured = _parse_verification_result(
+        """{
+            "passed": false,
+            "hard_failures": [
+                {
+                    "type": "unsupported_core_claim",
+                    "claim": "论文提出了新的数据集 XXX",
+                    "reason": "grounding map 中没有数据集 XXX"
+                }
+            ],
+            "soft_warnings": [
+                {
+                    "type": "weak_evidence",
+                    "claim": "方法有较强泛化能力",
+                    "reason": "原文只有单数据集实验"
+                }
+            ],
+            "patch_suggestions": [
+                {
+                    "operation": "delete_claim",
+                    "target": "论文提出了新的数据集 XXX"
+                }
+            ]
+        }"""
+    )
     invalid = _parse_verification_result("not json")
 
     assert passed.passed
     assert not failed.passed
     assert failed.errors == ["新增了原文没有的贡献"]
+    assert failed.hard_failures[0]["type"] == "legacy_error"
+    assert structured.hard_failures[0]["type"] == "unsupported_core_claim"
+    assert structured.soft_warnings[0]["type"] == "weak_evidence"
+    assert structured.patch_suggestions[0]["operation"] == "delete_claim"
     assert not invalid.passed
     assert invalid.errors
 
 
+def test_verifier_soft_warnings_do_not_block_report():
+    warning_only = _parse_verification_result(
+        """{
+            "passed": true,
+            "hard_failures": [],
+            "soft_warnings": [
+                {
+                    "type": "weak_evidence",
+                    "claim": "方法有较强泛化能力",
+                    "reason": "原文只有单数据集实验"
+                }
+            ],
+            "patch_suggestions": []
+        }"""
+    )
+
+    assert warning_only.passed
+    assert warning_only.soft_warnings
+    assert not _verification_should_block_report(warning_only)
+
+
 def test_verifier_format_error_does_not_block_report():
     invalid_json = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object"])
-    unsupported_claim = VerificationResult(False, ["新增了原文没有的贡献"])
-    mixed_guard_error = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object", "Asset Guard: asset id 9 is not in asset manifest"])
+    unsupported_claim = VerificationResult(
+        False,
+        ["新增了原文没有的贡献"],
+        hard_failures=[{"type": "unsupported_core_claim", "claim": "claim", "reason": "新增了原文没有的贡献"}],
+    )
+    mixed_guard_error = VerificationResult(
+        False,
+        ["Verifier Agent 输出不是合法 JSON：missing JSON object", "Asset Guard: asset id 9 is not in asset manifest"],
+        hard_failures=[{"type": "guard_failure", "claim": "", "reason": "Asset Guard: asset id 9 is not in asset manifest"}],
+    )
 
     assert not _verification_should_block_report(invalid_json)
     assert _verification_should_block_report(unsupported_claim)
     assert _verification_should_block_report(mixed_guard_error)
+
+
+def test_verifier_patch_suggestions_apply_one_revision_pass():
+    summary = """## 方法主线
+论文提出了新的数据集 XXX。
+方法使用已有数据集验证。"""
+    revised = _apply_verifier_patch_suggestions(
+        summary,
+        [{"operation": "delete_claim", "target": "论文提出了新的数据集 XXX。"}],
+    )
+
+    assert "新的数据集 XXX" not in revised
+    assert "已有数据集" in revised
 
 
 def test_two_column_prose_after_table_is_not_table_row():

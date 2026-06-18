@@ -84,6 +84,40 @@ Harness 还内置一组 Guard，用来把常见失败模式变成可检查结果
 | Loop Guard | 反复修不收敛 | 最多修复 N 次，保留失败原因 |
 | Memory Guard | 错误反馈污染全局规则 | memory 分 paper-level / global-level，带 category 和 confidence |
 
+Verifier Agent 也升级为明确的门禁策略，而不是只返回一串 critic 文本。它要求结构化 JSON：
+
+```json
+{
+  "passed": false,
+  "hard_failures": [
+    {
+      "type": "unsupported_core_claim",
+      "claim": "论文提出了新的数据集 XXX",
+      "reason": "grounding map 中没有数据集 XXX"
+    }
+  ],
+  "soft_warnings": [
+    {
+      "type": "weak_evidence",
+      "claim": "方法有较强泛化能力",
+      "reason": "原文只有单数据集实验"
+    }
+  ],
+  "patch_suggestions": [
+    {
+      "operation": "delete_claim",
+      "target": "论文提出了新的数据集 XXX"
+    }
+  ]
+}
+```
+
+门禁策略是：
+
+- `hard_failures > 0`：停止 `GenerateDocx`，不生成 Word，并写出 verifier 报告。
+- `soft_warnings > 0`：允许生成 Word，但写入 `trace.json` 和 `verification.json`，用于后续审计。
+- `patch_suggestions > 0`：先进入一次 revision loop，尝试删除或替换无证据 claim，再重新运行 Verifier。
+
 ## 网页端效果
 
 启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。
