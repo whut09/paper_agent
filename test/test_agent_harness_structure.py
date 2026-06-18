@@ -1,4 +1,15 @@
-from paper_agent.agents import ExtractSections, ParsePaper, SummarizeContribution, VerifyClaims
+from paper_agent.agents import (
+    AGENT_CONTRACTS,
+    EXTRACTOR_AGENT_CONTRACT,
+    READER_AGENT_CONTRACT,
+    REFLECTOR_AGENT_CONTRACT,
+    SYNTHESIZER_AGENT_CONTRACT,
+    VERIFIER_AGENT_CONTRACT,
+    ExtractSections,
+    ParsePaper,
+    SummarizeContribution,
+    VerifyClaims,
+)
 from paper_agent.evaluation.validators import _parse_verification_result
 from pathlib import Path
 
@@ -31,6 +42,36 @@ def test_agent_harness_facades_export_core_objects():
     assert ExtractSections is paper_summary.ExtractSections
     assert SummarizeContribution is paper_summary.SummarizeContribution
     assert VerifyClaims is paper_summary.VerifyClaims
+
+
+def test_agent_contracts_describe_engineering_boundaries():
+    assert set(AGENT_CONTRACTS) == {
+        "ReaderAgent",
+        "ExtractorAgent",
+        "SynthesizerAgent",
+        "VerifierAgent",
+        "ReflectorAgent",
+    }
+    assert "PaperSource" in READER_AGENT_CONTRACT.outputs
+    assert "EvidenceMap" in EXTRACTOR_AGENT_CONTRACT.outputs
+    assert "DraftReport" in SYNTHESIZER_AGENT_CONTRACT.outputs
+    assert "VerificationReport" in VERIFIER_AGENT_CONTRACT.outputs
+    assert "PromptPatch" in REFLECTOR_AGENT_CONTRACT.outputs
+    assert not READER_AGENT_CONTRACT.llm_required
+    assert not EXTRACTOR_AGENT_CONTRACT.llm_required
+    assert SYNTHESIZER_AGENT_CONTRACT.llm_required
+    assert VERIFIER_AGENT_CONTRACT.llm_required
+
+
+def test_default_workflow_nodes_bind_agent_contracts():
+    workflow = PaperWorkflow.default()
+
+    assert workflow.nodes["PreparePaper"].agent_contract is READER_AGENT_CONTRACT
+    assert workflow.nodes["ParsePaper"].agent_contract is READER_AGENT_CONTRACT
+    assert workflow.nodes["ExtractSections"].agent_contract is EXTRACTOR_AGENT_CONTRACT
+    assert workflow.nodes["SummarizeContribution"].agent_contract is SYNTHESIZER_AGENT_CONTRACT
+    assert workflow.nodes["ExtractMethods"].agent_contract is SYNTHESIZER_AGENT_CONTRACT
+    assert workflow.nodes["VerifyClaims"].agent_contract is VERIFIER_AGENT_CONTRACT
 
 
 def test_memory_and_evaluation_facades_are_callable():
@@ -83,6 +124,7 @@ def test_workflow_records_structured_node_results():
     assert result.node_results["Structured"].status == "warning"
     assert result.node_results["Structured"].metrics["tokens"] == 12
     assert result.agent_trace[-1]["status"] == "warning"
+    assert result.agent_trace[-1]["contract"] == ""
 
 
 def test_workflow_records_failed_node_result_before_reraising():

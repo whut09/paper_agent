@@ -56,6 +56,14 @@ paper_agent/
 
 Harness 层的节点协议已经开始结构化：每个节点声明 `requires` / `produces`，执行后写入 `NodeResult`，包含 `status`、`outputs`、`evidence`、`artifacts`、`errors`、`warnings` 和 `metrics`。这让 ParsePaper、ExtractEvidence、SynthesizeReport、VerifyClaims、GenerateDocx 这类节点都可以被检查、统计和回放。
 
+Agent 也从简单 role enum 升级为 Agent Contract：
+
+- `ReaderAgent`：读取 PDF / Word / link，输出 `PaperSource`、`PageBlock`、`RawText`、`RawAsset`，这是纯规则/工具节点，不要求 LLM。
+- `ExtractorAgent`：抽取 section、caption、formula、asset，输出 `EvidenceMap`、`AssetManifest`、`FormulaList`、`KnowledgeGraph`，优先由规则和解析工具完成。
+- `SynthesizerAgent`：生成结构化精读笔记，输出 `DraftReport` 和 `ClaimList`，这是 LLM 节点。
+- `VerifierAgent`：检查 claim grounding、asset 引用和格式，输出 `VerificationReport` 和 `FixedReport`，可结合 LLM 与规则校验。
+- `ReflectorAgent`：从用户反馈生成 `CorrectionMemory`、`PromptPatch` 和 `RubricPatch`，服务 Loop Engineering。
+
 ## 网页端效果
 
 启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。
