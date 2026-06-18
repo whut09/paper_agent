@@ -3097,7 +3097,7 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
         if asset_id < 1 or asset_id > asset_count:
             errors.append(f"asset id {asset_id} is not in asset manifest")
             continue
-        nearby = _nearby_text_for_asset_marker(summary, match.start())
+        nearby = _asset_reference_text_for_marker(summary, match.start())
         asset = assets[asset_id - 1]
         if _asset_reference_kind_mismatch(nearby, asset):
             errors.append(f"asset id {asset_id} kind mismatch: text references {nearby[:80]!r}, manifest kind is {asset.kind}")
@@ -3196,13 +3196,25 @@ def _memory_guard(memories: list[CorrectionMemory]) -> GuardResult:
     )
 
 
-def _nearby_text_for_asset_marker(summary: str, marker_start: int, radius: int = 180) -> str:
-    left = max(0, marker_start - radius)
-    right = min(len(summary), marker_start + radius)
-    return _clean_xml_text(summary[left:right])
+def _asset_reference_text_for_marker(summary: str, marker_start: int) -> str:
+    line_start = summary.rfind("\n", 0, marker_start) + 1
+    line_end = summary.find("\n", marker_start)
+    if line_end < 0:
+        line_end = len(summary)
+    current_line = summary[line_start:line_end].strip()
+    previous_text = summary[:line_start].splitlines()
+    previous_line = ""
+    for line in reversed(previous_text):
+        stripped = line.strip()
+        if stripped and not re.fullmatch(r"\[\[ASSET:[^\]]+\]\]", stripped):
+            previous_line = stripped
+            break
+    return _clean_xml_text("\n".join(part for part in (previous_line, current_line) if part))
 
 
 def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
+    if not text.strip():
+        return False
     compact = _compact_asset_label(_original_asset_label(asset))
     mentions_table = bool(re.search(r"表\s*\d|Table\s*\d|Tab\.\s*\d", text, flags=re.IGNORECASE))
     mentions_figure = bool(re.search(r"图\s*\d|Figure\s*\d|Fig\.\s*\d", text, flags=re.IGNORECASE))

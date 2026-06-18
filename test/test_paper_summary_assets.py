@@ -360,6 +360,27 @@ def test_asset_guard_fails_invalid_and_mismatched_assets():
     assert any("not in asset manifest" in error for error in invalid.errors)
 
 
+def test_asset_guard_ignores_distant_reference_text_for_formula_marker():
+    assets = [PaperAsset("formula", 1, Path("formula.png"), "关键公式截图：normalized advantage")]
+    summary = """如表2所示，训练配置保持一致。
+
+对 `k` 个 response 的 reward 做归一化，得到 normalized advantage。
+[[ASSET:1]]"""
+
+    result = _asset_guard(summary, assets)
+
+    assert result.status == "passed"
+
+
+def test_asset_guard_still_fails_adjacent_reference_kind_mismatch():
+    assets = [PaperAsset("formula", 1, Path("formula.png"), "关键公式截图：normalized advantage")]
+
+    result = _asset_guard("如图3所示。\n[[ASSET:1]]", assets)
+
+    assert result.status == "failed"
+    assert any("kind mismatch" in error for error in result.errors)
+
+
 def test_harness_guards_report_coverage_warnings():
     guards = _run_harness_guards(
         "# Title\n\n## 摘要\n内容。\n",
