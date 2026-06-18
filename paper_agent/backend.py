@@ -122,6 +122,8 @@ def create_summary_feedback():
             payload.get("corrected", ""),
             note=payload.get("note", ""),
             category=payload.get("category", "summary"),
+            scope=payload.get("scope") or "paper",
+            confidence=payload.get("confidence") if payload.get("confidence") is not None else 1.0,
         )
     except ValueError as exc:
         return {"state": "error", "message": str(exc)}, 400

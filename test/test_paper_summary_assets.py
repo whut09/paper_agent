@@ -19,7 +19,9 @@ from paper_agent.paper_summary import (
     _caption_is_figure,
     _caption_is_table,
     _caption_text_and_rect,
+    _asset_guard,
     _correction_memory_context,
+    _evidence_guard,
     _ensure_asset_markers,
     _enforce_core_original_title,
     _extract_abstract_from_text,
@@ -27,6 +29,7 @@ from paper_agent.paper_summary import (
     _extract_verifiable_claims,
     _load_correction_memories,
     _expand_table_rect_to_borders,
+    _memory_guard,
     _missing_asset_references,
     _paragraph,
     _prompt_patch_context,
@@ -39,6 +42,7 @@ from paper_agent.paper_summary import (
     _visual_rect_for_caption,
     _verification_should_block_report,
     _with_asset_references,
+    _run_harness_guards,
     get_self_improving_prompt_patches,
     record_summary_correction,
     summarize_paper,
@@ -179,6 +183,7 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         assert "run_id" in trace_text
         assert "grounding_map" in grounding_text
         assert "verification" in verification_text
+        assert "guards" in verification_text
         assert "paper:paper" in graph_text
         assert "agent_trace" in graph_text
 
@@ -192,6 +197,7 @@ def test_correction_memory_records_and_loads_by_paper_id():
             "图表引用必须按原始 caption 类型",
             note="不要让无 caption 图伪装成表格编号",
             category="asset_reference",
+            confidence=0.9,
             memory_path=memory_path,
         )
         record_summary_correction(
@@ -205,8 +211,30 @@ def test_correction_memory_records_and_loads_by_paper_id():
         context = _correction_memory_context(memories)
 
         assert len(memories) == 1
+        assert memories[0].scope == "paper"
+        assert memories[0].confidence == 0.9
         assert "图表引用" in context
         assert "无 caption 图" in context
+
+
+def test_memory_guard_warns_about_global_low_confidence_rules():
+    with TemporaryDirectory() as tmp:
+        memory_path = Path(tmp) / "corrections.jsonl"
+        record_summary_correction(
+            "global",
+            "错误规则",
+            "低置信度规则",
+            category="asset_reference",
+            scope="global",
+            confidence=0.2,
+            memory_path=memory_path,
+        )
+        memories = _load_correction_memories("Any Paper", memory_path=memory_path)
+        result = _memory_guard(memories)
+
+        assert result.status == "warning"
+        assert result.metrics["global_memory_count"] == 1
+        assert result.metrics["low_confidence_count"] == 1
 
 
 def test_self_improving_prompt_patches_route_feedback_by_target():
@@ -308,6 +336,43 @@ def test_grounding_map_attaches_claim_source_section():
     assert grounded["claims"][0]["source_title"] == "Method"
 
 
+def test_evidence_guard_fails_ungrounded_claims():
+    result = _evidence_guard(
+        {
+            "claims": [
+                {"claim": "模型显著提升所有数据集表现", "source_section": ""},
+                {"claim": "方法使用 OCR", "source_section": "2"},
+            ]
+        }
+    )
+
+    assert result.status == "failed"
+    assert result.metrics["ungrounded_count"] == 1
+
+
+def test_asset_guard_fails_invalid_and_mismatched_assets():
+    assets = [PaperAsset("figure", 1, Path("figure.png"), "Figure 2. Trend")]
+    invalid = _asset_guard("如表2所示。\n[[ASSET:1]]\n[[ASSET:9]]", assets)
+
+    assert invalid.status == "failed"
+    assert any("kind mismatch" in error for error in invalid.errors)
+    assert any("not in asset manifest" in error for error in invalid.errors)
+
+
+def test_harness_guards_report_coverage_warnings():
+    guards = _run_harness_guards(
+        "# Title\n\n## 摘要\n内容。\n",
+        {"intro": [], "method": [{"section_id": "2", "title": "Method", "text": "method"}], "experiments": [], "claims": []},
+        [],
+        "Title",
+        [],
+    )
+    by_name = {guard.name: guard for guard in guards}
+
+    assert by_name["Coverage Guard"].status == "warning"
+    assert any("方法" in warning or "method" in warning for warning in by_name["Coverage Guard"].warnings)
+
+
 def test_knowledge_graph_extracts_research_nodes_and_edges():
     grounding_map = {
         "intro": [{"section_id": "1", "title": "Introduction", "text": "SWE-Agent studies tool-use for GitHub interaction."}],
@@ -358,9 +423,11 @@ def test_verifier_json_parser_is_conservative():
 def test_verifier_format_error_does_not_block_report():
     invalid_json = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object"])
     unsupported_claim = VerificationResult(False, ["新增了原文没有的贡献"])
+    mixed_guard_error = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object", "Asset Guard: asset id 9 is not in asset manifest"])
 
     assert not _verification_should_block_report(invalid_json)
     assert _verification_should_block_report(unsupported_claim)
+    assert _verification_should_block_report(mixed_guard_error)
 
 
 def test_two_column_prose_after_table_is_not_table_row():

@@ -193,6 +193,8 @@ class CorrectionMemory:
     corrected: str
     note: str = ""
     category: str = "summary"
+    scope: str = "paper"
+    confidence: float = 1.0
     created_at: str = ""
 
 
@@ -201,6 +203,23 @@ class PromptPatch:
     target: str
     content: str
     source_category: str = "summary"
+
+
+@dataclass(frozen=True)
+class GuardSpec:
+    name: str
+    problem: str
+    implementation: str
+    blocking: bool = False
+
+
+@dataclass
+class GuardResult:
+    name: str
+    status: str = "passed"
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -329,6 +348,48 @@ AGENT_CONTRACTS = {
 }
 
 
+GUARD_SPECS = {
+    "Evidence Guard": GuardSpec(
+        "Evidence Guard",
+        "总结幻觉、无证据 claim",
+        "claim 必须映射到 section / abstract / figure caption",
+        blocking=True,
+    ),
+    "Asset Guard": GuardSpec(
+        "Asset Guard",
+        "图表引用错、表图混用",
+        "[[ASSET:id]] 必须来自 asset manifest，kind 必须匹配",
+        blocking=True,
+    ),
+    "Coverage Guard": GuardSpec(
+        "Coverage Guard",
+        "漏掉方法/实验/局限",
+        "检查摘要、方法、实验、局限是否有覆盖",
+    ),
+    "Format Guard": GuardSpec(
+        "Format Guard",
+        "Word 生成失败、markdown 格式乱",
+        "检查标题层级、占位符、空章节",
+        blocking=True,
+    ),
+    "Citation Guard": GuardSpec(
+        "Citation Guard",
+        "DOI、年份、机构乱编",
+        "核心元信息必须来自原文 front matter",
+    ),
+    "Loop Guard": GuardSpec(
+        "Loop Guard",
+        "反复修不收敛",
+        "最多修复 N 次，保留失败原因",
+    ),
+    "Memory Guard": GuardSpec(
+        "Memory Guard",
+        "错误反馈污染全局规则",
+        "memory 分 paper-level / global-level，带 category 和 confidence",
+    ),
+}
+
+
 @dataclass
 class PaperWorkflowContext:
     input_path: str
@@ -359,6 +420,7 @@ class PaperWorkflowContext:
     chunk_notes: list[str] = field(default_factory=list)
     summary: str = ""
     verification: VerificationResult | None = None
+    guard_results: list[GuardResult] = field(default_factory=list)
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
@@ -599,7 +661,7 @@ class VerifyClaims(PaperWorkflowNode):
         if context.client is None or context.config is None:
             raise ValueError("VerifyClaims requires an initialized Codex client.")
         context.report(0.78, "校验标题、摘要和图表引用...")
-        context.summary, context.verification = _verify_summary_claims(
+        context.summary, context.verification, context.guard_results = _verify_summary_claims(
             context.summary,
             context.text,
             context.grounding_map,
@@ -656,6 +718,14 @@ def _normalize_node_result(
     result.metrics.setdefault("asset_count", len(context.assets))
     result.metrics.setdefault("claim_count", len(context.grounding_map.get("claims", [])))
     result.metrics.setdefault("chunk_count", len(context.chunk_notes))
+    result.metrics.setdefault(
+        "guard_failed_count",
+        len([guard for guard in context.guard_results if guard.status == "failed"]),
+    )
+    result.metrics.setdefault(
+        "guard_warning_count",
+        len([guard for guard in context.guard_results if guard.status == "warning"]),
+    )
     if result.errors and result.status == "success":
         result.status = "failed"
     elif result.warnings and result.status == "success":
@@ -716,6 +786,7 @@ def _write_harness_sidecars(context: PaperWorkflowContext) -> None:
             {
                 "run_id": context.run_id,
                 "verification": _verification_payload(context.verification),
+                "guards": [_guard_payload(result) for result in context.guard_results],
             },
             ensure_ascii=False,
             indent=2,
@@ -739,6 +810,17 @@ def _verification_payload(verification: VerificationResult | None) -> dict:
     if verification is None:
         return {"passed": False, "errors": ["verification not available"]}
     return {"passed": verification.passed, "errors": list(verification.errors)}
+
+
+def _guard_payload(result: GuardResult) -> dict:
+    return {
+        "name": result.name,
+        "status": result.status,
+        "errors": list(result.errors),
+        "warnings": list(result.warnings),
+        "metrics": dict(result.metrics),
+        "spec": GUARD_SPECS[result.name].__dict__ if result.name in GUARD_SPECS else {},
+    }
 
 
 def _node_output_snapshot(node: PaperWorkflowNode, context: PaperWorkflowContext) -> dict:
@@ -2362,6 +2444,8 @@ def record_summary_correction(
     *,
     note: str = "",
     category: str = "summary",
+    scope: str = "paper",
+    confidence: float = 1.0,
     memory_path: str | Path | None = None,
 ) -> Path:
     """Store user feedback as correction memory for future paper summaries."""
@@ -2371,8 +2455,12 @@ def record_summary_correction(
         corrected=_clean_xml_text(corrected).strip(),
         note=_clean_xml_text(note).strip(),
         category=_clean_xml_text(category).strip() or "summary",
+        scope=_clean_xml_text(scope).strip() or "paper",
+        confidence=_clamped_confidence(confidence),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
+    if memory.paper_id == "global":
+        memory.scope = "global"
     if not memory.original and not memory.corrected and not memory.note:
         raise ValueError("Correction memory requires original, corrected, or note content.")
     path = _correction_memory_path(memory_path)
@@ -2410,6 +2498,11 @@ def _load_correction_memories(
             corrected=str(payload.get("corrected", "")),
             note=str(payload.get("note", "")),
             category=str(payload.get("category", "summary") or "summary"),
+            scope=str(
+                payload.get("scope", "")
+                or ("global" if _paper_memory_id(str(payload.get("paper_id", ""))) == "global" else "paper")
+            ),
+            confidence=_clamped_confidence(payload.get("confidence", 1.0)),
             created_at=str(payload.get("created_at", "")),
         )
         if normalized_paper_id and memory.paper_id not in {"", "global", normalized_paper_id}:
@@ -2432,8 +2525,17 @@ def _correction_memory_context(memories: list[CorrectionMemory], limit: int = 8)
             pieces.append(f"改为：{memory.corrected}")
         if memory.note:
             pieces.append(f"规则：{memory.note}")
+        if memory.scope or memory.confidence < 1:
+            pieces.append(f"scope={memory.scope}, confidence={memory.confidence:.2f}")
         lines.append("；".join(pieces))
     return "\n".join(f"- {line}" for line in lines)
+
+
+def _clamped_confidence(value: object) -> float:
+    try:
+        return max(0.0, min(1.0, float(value)))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def get_self_improving_prompt_patches(
@@ -2654,7 +2756,7 @@ def _summarize_with_codex(
             correction_memories,
             prompt_patches,
         )
-        verified_summary, _verification = _verify_summary_claims(
+        verified_summary, _verification, _guard_results = _verify_summary_claims(
             summary,
             paper_text,
             _build_grounding_map(paper_text),
@@ -2756,7 +2858,7 @@ def _verify_summary_claims(
     assets: list[PaperAsset],
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
-) -> tuple[str, VerificationResult]:
+) -> tuple[str, VerificationResult, list[GuardResult]]:
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
@@ -2764,11 +2866,228 @@ def _verify_summary_claims(
     summary = _ensure_asset_markers(summary, assets)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
+    guard_results = _run_harness_guards(
+        summary,
+        grounded_map,
+        assets,
+        paper_title,
+        correction_memories or [],
+    )
     verification = _run_verification_agent(client, model, paper_text, grounded_map, correction_memories or [], prompt_patches)
+    guard_errors = _blocking_guard_errors(guard_results)
+    if guard_errors:
+        verification.errors.extend(guard_errors)
+        verification.passed = False
     if _verification_should_block_report(verification):
         details = "\n".join(f"- {error}" for error in verification.errors[:8])
         raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
-    return summary, verification
+    return summary, verification, guard_results
+
+
+def _run_harness_guards(
+    summary: str,
+    grounded_map: dict[str, list[dict[str, str]]],
+    assets: list[PaperAsset],
+    paper_title: str,
+    memories: list[CorrectionMemory],
+) -> list[GuardResult]:
+    return [
+        _evidence_guard(grounded_map),
+        _asset_guard(summary, assets),
+        _coverage_guard(summary, grounded_map),
+        _format_guard(summary),
+        _citation_guard(summary, paper_title),
+        _loop_guard(),
+        _memory_guard(memories),
+    ]
+
+
+def _blocking_guard_errors(results: list[GuardResult]) -> list[str]:
+    errors: list[str] = []
+    for result in results:
+        spec = GUARD_SPECS.get(result.name)
+        if spec and spec.blocking and result.errors:
+            errors.extend(f"{result.name}: {error}" for error in result.errors)
+    return errors
+
+
+def _guard_result(
+    name: str,
+    errors: list[str] | None = None,
+    warnings: list[str] | None = None,
+    metrics: dict | None = None,
+) -> GuardResult:
+    errors = errors or []
+    warnings = warnings or []
+    status = "failed" if errors else "warning" if warnings else "passed"
+    return GuardResult(name=name, status=status, errors=errors, warnings=warnings, metrics=metrics or {})
+
+
+def _evidence_guard(grounded_map: dict[str, list[dict[str, str]]]) -> GuardResult:
+    claims = grounded_map.get("claims", [])
+    errors = [
+        f"claim_{index} lacks direct evidence: {claim.get('claim', '')[:120]}"
+        for index, claim in enumerate(claims, 1)
+        if not claim.get("source_section")
+    ]
+    return _guard_result(
+        "Evidence Guard",
+        errors=errors,
+        metrics={"claim_count": len(claims), "ungrounded_count": len(errors)},
+    )
+
+
+def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
+    errors: list[str] = []
+    asset_count = len(assets)
+    for match in re.finditer(r"\[\[ASSET:([^\]]+)\]\]", summary):
+        raw_id = match.group(1).strip()
+        if not raw_id.isdigit():
+            errors.append(f"asset placeholder is not numeric: [[ASSET:{raw_id}]]")
+            continue
+        asset_id = int(raw_id)
+        if asset_id < 1 or asset_id > asset_count:
+            errors.append(f"asset id {asset_id} is not in asset manifest")
+            continue
+        nearby = _nearby_text_for_asset_marker(summary, match.start())
+        asset = assets[asset_id - 1]
+        if _asset_reference_kind_mismatch(nearby, asset):
+            errors.append(f"asset id {asset_id} kind mismatch: text references {nearby[:80]!r}, manifest kind is {asset.kind}")
+    return _guard_result(
+        "Asset Guard",
+        errors=errors,
+        metrics={
+            "asset_count": asset_count,
+            "placeholder_count": len(re.findall(r"\[\[ASSET:", summary)),
+        },
+    )
+
+
+def _coverage_guard(
+    summary: str,
+    grounded_map: dict[str, list[dict[str, str]]],
+) -> GuardResult:
+    warnings: list[str] = []
+    section_text = "\n".join(re.findall(r"(?m)^#{1,3}\s+(.+)$", summary))
+    checks = {
+        "摘要": bool(re.search(r"摘要", section_text)),
+        "方法": bool(re.search(r"方法|机制|流程", section_text)),
+        "实验": bool(re.search(r"结果|实验|评估|消融", section_text)),
+        "局限": bool(re.search(r"局限|限制|不足", section_text)),
+    }
+    for name, present in checks.items():
+        if not present:
+            warnings.append(f"{name} coverage is missing")
+    if grounded_map.get("method") and not checks["方法"]:
+        warnings.append("method evidence exists but method section is not covered")
+    if grounded_map.get("experiments") and not checks["实验"]:
+        warnings.append("experiment evidence exists but result/experiment section is not covered")
+    return _guard_result(
+        "Coverage Guard",
+        warnings=warnings,
+        metrics={f"{key}_covered": value for key, value in checks.items()},
+    )
+
+
+def _format_guard(summary: str) -> GuardResult:
+    errors: list[str] = []
+    warnings: list[str] = []
+    if re.search(r"\[\[ASSET:[^\]\d]+", summary):
+        errors.append("malformed asset placeholder")
+    headings = [(len(match.group(1)), match.group(2).strip()) for match in re.finditer(r"(?m)^(#{1,6})\s+(.+)$", summary)]
+    for (prev_level, _), (level, title) in zip(headings, headings[1:]):
+        if level - prev_level > 1:
+            warnings.append(f"heading level jumps before {title}")
+    empty_sections = _empty_markdown_sections(summary)
+    warnings.extend(f"empty section: {title}" for title in empty_sections[:6])
+    return _guard_result("Format Guard", errors=errors, warnings=warnings, metrics={"heading_count": len(headings)})
+
+
+def _citation_guard(summary: str, paper_title: str) -> GuardResult:
+    warnings: list[str] = []
+    core = _section_body(summary, "核心信息")
+    if paper_title and paper_title not in core:
+        warnings.append("core title does not match extracted front matter title")
+    for field in ("DOI", "发表时间", "机构"):
+        match = re.search(rf"(?m)^[-*]\s*{field}\s*[:：]\s*(.+)$", core)
+        if match and re.search(r"未知|未提及|N/A|原文未", match.group(1), flags=re.IGNORECASE):
+            warnings.append(f"{field} contains unspecified placeholder")
+    return _guard_result("Citation Guard", warnings=warnings)
+
+
+def _loop_guard(max_repairs: int = 2, repair_attempts: int = 0) -> GuardResult:
+    warnings = []
+    if repair_attempts > max_repairs:
+        warnings.append(f"repair attempts exceeded max_repair={max_repairs}")
+    return _guard_result(
+        "Loop Guard",
+        warnings=warnings,
+        metrics={"max_repairs": max_repairs, "repair_attempts": repair_attempts},
+    )
+
+
+def _memory_guard(memories: list[CorrectionMemory]) -> GuardResult:
+    warnings: list[str] = []
+    global_count = sum(1 for memory in memories if memory.scope == "global" or memory.paper_id == "global")
+    if global_count > max(5, len(memories) // 2) and memories:
+        warnings.append("too many global correction memories may pollute paper-level behavior")
+    missing_category = sum(1 for memory in memories if not memory.category)
+    if missing_category:
+        warnings.append(f"{missing_category} correction memories have no category")
+    low_confidence = sum(1 for memory in memories if memory.confidence < 0.5)
+    if low_confidence:
+        warnings.append(f"{low_confidence} correction memories have low confidence")
+    return _guard_result(
+        "Memory Guard",
+        warnings=warnings,
+        metrics={
+            "memory_count": len(memories),
+            "global_memory_count": global_count,
+            "low_confidence_count": low_confidence,
+        },
+    )
+
+
+def _nearby_text_for_asset_marker(summary: str, marker_start: int, radius: int = 180) -> str:
+    left = max(0, marker_start - radius)
+    right = min(len(summary), marker_start + radius)
+    return _clean_xml_text(summary[left:right])
+
+
+def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
+    compact = _compact_asset_label(_original_asset_label(asset))
+    mentions_table = bool(re.search(r"表\s*\d|Table\s*\d|Tab\.\s*\d", text, flags=re.IGNORECASE))
+    mentions_figure = bool(re.search(r"图\s*\d|Figure\s*\d|Fig\.\s*\d", text, flags=re.IGNORECASE))
+    mentions_formula = bool(re.search(r"公式\s*\d|Equation\s*\d|Eq\.\s*\d", text, flags=re.IGNORECASE))
+    if compact and compact in text:
+        return False
+    if asset.kind == "table" and (mentions_figure or mentions_formula):
+        return True
+    if asset.kind == "figure" and (mentions_table or mentions_formula):
+        return True
+    if asset.kind == "formula" and (mentions_table or mentions_figure):
+        return True
+    return False
+
+
+def _empty_markdown_sections(summary: str) -> list[str]:
+    blocks = re.split(r"(?m)(?=^#{1,6}\s+)", summary)
+    empty: list[str] = []
+    for block in blocks:
+        lines = block.splitlines()
+        if not lines or not lines[0].startswith("#"):
+            continue
+        title = lines[0].lstrip("#").strip()
+        body = "\n".join(lines[1:]).strip()
+        if not body:
+            empty.append(title)
+    return empty
+
+
+def _section_body(summary: str, title: str) -> str:
+    pattern = re.compile(rf"(?ms)^##\s*{re.escape(title)}\s*\n(.*?)(?=^## |\Z)")
+    match = pattern.search(summary)
+    return match.group(1) if match else ""
 
 
 def _run_verification_agent(
@@ -3208,7 +3527,7 @@ def _verification_should_block_report(result: VerificationResult) -> bool:
 
 
 def _verification_failed_due_to_format(result: VerificationResult) -> bool:
-    return not result.passed and any("输出不是合法 JSON" in error for error in result.errors)
+    return not result.passed and bool(result.errors) and all("输出不是合法 JSON" in error for error in result.errors)
 
 
 def _extract_json_object(text: str) -> str:

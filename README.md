@@ -72,6 +72,18 @@ Agent 也从简单 role enum 升级为 Agent Contract：
 - `*-verification.json`：Verifier Agent 的通过状态和错误列表。
 - `*-knowledge-graph.json`：论文概念、方法、数据集、评估节点及其关系。
 
+Harness 还内置一组 Guard，用来把常见失败模式变成可检查结果：
+
+| Guard | 解决什么问题 | 实现方式 |
+| --- | --- | --- |
+| Evidence Guard | 总结幻觉、无证据 claim | claim 必须映射到 section / abstract / figure caption |
+| Asset Guard | 图表引用错、表图混用 | `[[ASSET:id]]` 必须来自 asset manifest，kind 必须匹配 |
+| Coverage Guard | 漏掉方法/实验/局限 | 检查摘要、方法、实验、局限是否有覆盖 |
+| Format Guard | Word 生成失败、Markdown 格式乱 | 检查标题层级、占位符、空章节 |
+| Citation Guard | DOI、年份、机构乱编 | 核心元信息必须来自原文 front matter |
+| Loop Guard | 反复修不收敛 | 最多修复 N 次，保留失败原因 |
+| Memory Guard | 错误反馈污染全局规则 | memory 分 paper-level / global-level，带 category 和 confidence |
+
 ## 网页端效果
 
 启动后访问 `http://localhost:7860/`，可以从文件或链接输入论文，等待解析和总结完成后，在页面上看到 Word 总结效果，并下载生成的 `.docx` 文件。

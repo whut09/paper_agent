@@ -10,6 +10,7 @@ from paper_agent.agents import (
     SummarizeContribution,
     VerifyClaims,
 )
+from paper_agent.evaluation.guards import GUARD_SPECS
 from paper_agent.evaluation.validators import _parse_verification_result
 from pathlib import Path
 
@@ -61,6 +62,22 @@ def test_agent_contracts_describe_engineering_boundaries():
     assert not EXTRACTOR_AGENT_CONTRACT.llm_required
     assert SYNTHESIZER_AGENT_CONTRACT.llm_required
     assert VERIFIER_AGENT_CONTRACT.llm_required
+
+
+def test_guard_registry_documents_harness_value():
+    assert set(GUARD_SPECS) == {
+        "Evidence Guard",
+        "Asset Guard",
+        "Coverage Guard",
+        "Format Guard",
+        "Citation Guard",
+        "Loop Guard",
+        "Memory Guard",
+    }
+    assert GUARD_SPECS["Evidence Guard"].blocking
+    assert GUARD_SPECS["Asset Guard"].blocking
+    assert "claim" in GUARD_SPECS["Evidence Guard"].implementation
+    assert "asset manifest" in GUARD_SPECS["Asset Guard"].implementation
 
 
 def test_default_workflow_nodes_bind_agent_contracts():
