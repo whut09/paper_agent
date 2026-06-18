@@ -168,8 +168,17 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         GenerateReport().run(context)
 
         assert context.docx_path and context.docx_path.exists()
+        assert context.trace_path and context.trace_path.exists()
+        assert context.grounding_map_path and context.grounding_map_path.exists()
+        assert context.verification_path and context.verification_path.exists()
         assert context.knowledge_graph_path and context.knowledge_graph_path.exists()
+        trace_text = context.trace_path.read_text(encoding="utf-8")
+        grounding_text = context.grounding_map_path.read_text(encoding="utf-8")
+        verification_text = context.verification_path.read_text(encoding="utf-8")
         graph_text = context.knowledge_graph_path.read_text(encoding="utf-8")
+        assert "run_id" in trace_text
+        assert "grounding_map" in grounding_text
+        assert "verification" in verification_text
         assert "paper:paper" in graph_text
         assert "agent_trace" in graph_text
 

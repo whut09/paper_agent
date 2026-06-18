@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -338,6 +339,7 @@ class PaperWorkflowContext:
     max_assets: int
     progress: ProgressCallback | None = None
     cancellation_event: asyncio.Event | None = None
+    run_id: str = field(default_factory=lambda: f"{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}")
     output: Path | None = None
     source_path: Path | None = None
     pdf_path: Path | None = None
@@ -357,9 +359,12 @@ class PaperWorkflowContext:
     chunk_notes: list[str] = field(default_factory=list)
     summary: str = ""
     verification: VerificationResult | None = None
-    agent_trace: list[dict[str, str]] = field(default_factory=list)
+    agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
+    trace_path: Path | None = None
+    grounding_map_path: Path | None = None
+    verification_path: Path | None = None
     knowledge_graph_path: Path | None = None
 
     def report(self, value: float, desc: str) -> None:
@@ -446,12 +451,14 @@ class PaperWorkflow:
                             elapsed,
                         )
                         context.node_results[node.name] = result
-                        context.agent_trace.append(_node_trace_entry(node, result))
+                        context.agent_trace.append(_node_trace_entry(context, node, result))
                         raise
                     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
                     result = _normalize_node_result(node, node_result, context, elapsed)
                     context.node_results[node.name] = result
-                    context.agent_trace.append(_node_trace_entry(node, result))
+                    context.agent_trace.append(_node_trace_entry(context, node, result))
+                    if "trace.json" in node.produces:
+                        _write_harness_sidecars(context)
                     completed.add(name)
                     pending.remove(name)
             return context
@@ -613,7 +620,7 @@ class GenerateReport(PaperWorkflowNode):
     agent_role = PaperAgentRole.SYNTHESIZER
     agent_contract = SYNTHESIZER_AGENT_CONTRACT
     requires = ["verified_report", "asset_manifest"]
-    produces = ["docx", "trace.json", "kg.json"]
+    produces = ["docx", "trace.json", "grounding_map.json", "verification.json", "knowledge_graph.json"]
 
     def run(self, context: PaperWorkflowContext) -> None:
         if context.output is None or context.source_path is None:
@@ -621,19 +628,12 @@ class GenerateReport(PaperWorkflowNode):
         context.check_cancelled()
         context.report(0.85, "写入 Word 文档...")
         context.docx_path = context.output / f"{context.paper_name}-summary.docx"
+        context.trace_path = context.output / f"{context.paper_name}-trace.json"
+        context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
+        context.verification_path = context.output / f"{context.paper_name}-verification.json"
+        context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
         _write_docx(context.docx_path, context.source_path.name, context.summary, context.assets)
-        if context.knowledge_graph:
-            context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
-            graph_payload = {
-                **context.knowledge_graph,
-                "metadata": {
-                    "agent_trace": context.agent_trace,
-                },
-            }
-            context.knowledge_graph_path.write_text(
-                json.dumps(graph_payload, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+        _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
 
 
@@ -651,6 +651,7 @@ def _normalize_node_result(
         result.outputs = _node_output_snapshot(node, context)
     if not result.artifacts:
         result.artifacts = _node_artifacts_snapshot(node, context)
+    result.metrics.setdefault("duration_ms", int(round(elapsed_seconds * 1000)))
     result.metrics.setdefault("elapsed_seconds", round(elapsed_seconds, 4))
     result.metrics.setdefault("asset_count", len(context.assets))
     result.metrics.setdefault("claim_count", len(context.grounding_map.get("claims", [])))
@@ -662,17 +663,82 @@ def _normalize_node_result(
     return result
 
 
-def _node_trace_entry(node: PaperWorkflowNode, result: NodeResult) -> dict[str, str]:
+def _node_trace_entry(context: PaperWorkflowContext, node: PaperWorkflowNode, result: NodeResult) -> dict:
     contract = node.agent_contract
     return {
+        "run_id": context.run_id,
         "agent": node.agent_role.value,
         "contract": contract.name if contract else "",
-        "llm_required": str(bool(contract and contract.llm_required)).lower(),
+        "llm_required": bool(contract and contract.llm_required),
         "node": node.name,
+        "input_keys": list(node.requires),
+        "output_keys": list(node.produces),
         "status": result.status,
-        "errors": str(len(result.errors)),
-        "warnings": str(len(result.warnings)),
+        "errors": list(result.errors),
+        "warnings": list(result.warnings),
+        "metrics": dict(result.metrics),
+        "artifacts": list(result.artifacts),
     }
+
+
+def _write_harness_sidecars(context: PaperWorkflowContext) -> None:
+    if context.output is None or not context.paper_name:
+        return
+    context.trace_path = context.trace_path or context.output / f"{context.paper_name}-trace.json"
+    context.grounding_map_path = context.grounding_map_path or context.output / f"{context.paper_name}-grounding-map.json"
+    context.verification_path = context.verification_path or context.output / f"{context.paper_name}-verification.json"
+    context.knowledge_graph_path = context.knowledge_graph_path or context.output / f"{context.paper_name}-knowledge-graph.json"
+
+    trace = []
+    for entry in context.agent_trace:
+        item = dict(entry)
+        item["run_id"] = context.run_id
+        trace.append(item)
+    context.trace_path.write_text(
+        json.dumps(
+            {
+                "run_id": context.run_id,
+                "paper_name": context.paper_name,
+                "source_path": str(context.source_path) if context.source_path else "",
+                "nodes": trace,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    context.grounding_map_path.write_text(
+        json.dumps({"run_id": context.run_id, "grounding_map": context.grounding_map}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    context.verification_path.write_text(
+        json.dumps(
+            {
+                "run_id": context.run_id,
+                "verification": _verification_payload(context.verification),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    graph_payload = {
+        **(context.knowledge_graph or {"nodes": [], "edges": []}),
+        "metadata": {
+            "run_id": context.run_id,
+            "agent_trace": trace,
+        },
+    }
+    context.knowledge_graph_path.write_text(
+        json.dumps(graph_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _verification_payload(verification: VerificationResult | None) -> dict:
+    if verification is None:
+        return {"passed": False, "errors": ["verification not available"]}
+    return {"passed": verification.passed, "errors": list(verification.errors)}
 
 
 def _node_output_snapshot(node: PaperWorkflowNode, context: PaperWorkflowContext) -> dict:
@@ -703,7 +769,9 @@ def _context_output_value(name: str, context: PaperWorkflowContext) -> object | 
         "verified_report": context.summary,
         "verification_report": context.verification,
         "docx": context.docx_path,
-        "kg.json": context.knowledge_graph_path,
+        "grounding_map.json": context.grounding_map_path,
+        "verification.json": context.verification_path,
+        "knowledge_graph.json": context.knowledge_graph_path,
         "trace.json": context.agent_trace,
     }
     value = mapping.get(name)
@@ -732,7 +800,13 @@ def _node_artifacts_snapshot(node: PaperWorkflowNode, context: PaperWorkflowCont
         artifacts.extend(str(asset.path) for asset in context.assets if asset.path)
     if "docx" in node.produces and context.docx_path:
         artifacts.append(str(context.docx_path))
-    if "kg.json" in node.produces and context.knowledge_graph_path:
+    if "trace.json" in node.produces and context.trace_path:
+        artifacts.append(str(context.trace_path))
+    if "grounding_map.json" in node.produces and context.grounding_map_path:
+        artifacts.append(str(context.grounding_map_path))
+    if "verification.json" in node.produces and context.verification_path:
+        artifacts.append(str(context.verification_path))
+    if "knowledge_graph.json" in node.produces and context.knowledge_graph_path:
         artifacts.append(str(context.knowledge_graph_path))
     return artifacts
 

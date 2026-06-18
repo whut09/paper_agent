@@ -125,6 +125,12 @@ def test_workflow_records_structured_node_results():
     assert result.node_results["Structured"].metrics["tokens"] == 12
     assert result.agent_trace[-1]["status"] == "warning"
     assert result.agent_trace[-1]["contract"] == ""
+    assert result.agent_trace[-1]["run_id"] == result.run_id
+    assert result.agent_trace[-1]["input_keys"] == ["chunk_notes"]
+    assert result.agent_trace[-1]["output_keys"] == ["draft_report"]
+    assert result.agent_trace[-1]["warnings"] == ["soft issue"]
+    assert result.agent_trace[-1]["metrics"]["tokens"] == 12
+    assert "duration_ms" in result.agent_trace[-1]["metrics"]
 
 
 def test_workflow_records_failed_node_result_before_reraising():
@@ -154,3 +160,4 @@ def test_workflow_records_failed_node_result_before_reraising():
     assert context.node_results["Failing"].status == "failed"
     assert context.node_results["Failing"].errors == ["boom"]
     assert context.agent_trace[-1]["status"] == "failed"
+    assert context.agent_trace[-1]["errors"] == ["boom"]
