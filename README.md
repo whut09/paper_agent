@@ -1,8 +1,10 @@
 # PaperAgent
 
-PaperAgent 是一个面向论文精读的本地 Agent Harness。它不是只把论文丢给大模型做一次摘要，而是把 PDF / Word 解析、正文与图表抽取、证据定位、多 Agent 协作、Verifier 校验、Word 报告生成和用户反馈学习组织成一条可运行、可检查、可迭代的工程链路。
+**Grounded Paper Reading Agent Harness：让论文总结从一次性生成，变成可追踪、可验证、可迭代的 Agent 工作流。**
 
-它可以读取 PDF、DOC、DOCX 或论文链接，自动抽取正文、图表、表格和公式等素材，调用兼容 OpenAI SDK 的大模型接口生成中文论文精读报告，最后导出可编辑的 Word 文档。核心目标是把“读论文”变成一个有 Harness 约束的 Agent 工作流：每个结论尽量回到原文证据，每次用户修正都能反哺下一次抽取、总结和评估。
+PaperAgent 是一个面向科研论文理解的本地 Agent Harness。它把论文解析、证据抽取、图表/公式定位、结构化总结、Claim Verifier、Word 报告生成和用户反馈学习组织成一条可观测、可验证、可迭代的工作流。
+
+它不是简单的“PDF 丢给大模型做摘要”，而是通过 Reader、Extractor、Synthesizer、Verifier 等角色，以及 Grounding Map、Asset Manifest、Correction Memory、Prompt Patch 和 Agent Trace 等工程组件，尽量保证每个关键结论都能回到原文证据，每次用户修正都能反哺后续总结。
 
 <p align="center">
   <img src="./assets/demo.svg" width="900" alt="PaperAgent 论文总结流程动画">
