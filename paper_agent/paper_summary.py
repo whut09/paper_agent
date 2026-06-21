@@ -3216,10 +3216,16 @@ def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
     if not text.strip():
         return False
     compact = _compact_asset_label(_original_asset_label(asset))
-    mentions_table = bool(re.search(r"表\s*\d|Table\s*\d|Tab\.\s*\d", text, flags=re.IGNORECASE))
-    mentions_figure = bool(re.search(r"图\s*\d|Figure\s*\d|Fig\.\s*\d", text, flags=re.IGNORECASE))
-    mentions_formula = bool(re.search(r"公式\s*\d|Equation\s*\d|Eq\.\s*\d", text, flags=re.IGNORECASE))
     if compact and compact in text:
+        return False
+    mentions_table = _asset_reference_mentions_kind(text, "table")
+    mentions_figure = _asset_reference_mentions_kind(text, "figure")
+    mentions_formula = _asset_reference_mentions_kind(text, "formula")
+    if asset.kind == "table" and mentions_table:
+        return False
+    if asset.kind == "figure" and mentions_figure:
+        return False
+    if asset.kind == "formula" and mentions_formula:
         return False
     if asset.kind == "table" and (mentions_figure or mentions_formula):
         return True
@@ -3228,6 +3234,15 @@ def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
     if asset.kind == "formula" and (mentions_table or mentions_figure):
         return True
     return False
+
+
+def _asset_reference_mentions_kind(text: str, kind: str) -> bool:
+    patterns = {
+        "table": r"表\s*\d|表格|Table\s*\d|Tab\.\s*\d",
+        "figure": r"图\s*\d|图片|图像|曲线|Figure\s*\d|Fig\.\s*\d",
+        "formula": r"公式\s*\d|公式截图|方程|Equation\s*\d|Eq\.\s*\d",
+    }
+    return bool(re.search(patterns[kind], text, flags=re.IGNORECASE))
 
 
 def _empty_markdown_sections(summary: str) -> list[str]:

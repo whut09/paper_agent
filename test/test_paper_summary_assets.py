@@ -372,6 +372,16 @@ def test_asset_guard_ignores_distant_reference_text_for_formula_marker():
     assert result.status == "passed"
 
 
+def test_asset_guard_accepts_table_reference_with_nearby_figure_position_text():
+    assets = [PaperAsset("table", 1, Path("table.png"), "Table 1. Performance comparison")]
+    summary = """第1页表格截图位于图1附近，包含 32MB Constraint、Ours/µVLM、RFNet、InceptionNet、ResNet-50。
+[[ASSET:1]]"""
+
+    result = _asset_guard(summary, assets)
+
+    assert result.status == "passed"
+
+
 def test_asset_guard_still_fails_adjacent_reference_kind_mismatch():
     assets = [PaperAsset("formula", 1, Path("formula.png"), "关键公式截图：normalized advantage")]
 
