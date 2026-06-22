@@ -32,6 +32,7 @@ from paper_agent.paper_summary import (
     _expand_table_rect_to_borders,
     _memory_guard,
     _missing_asset_references,
+    _normalize_final_sections,
     _paragraph,
     _prompt_patch_context,
     _parse_verification_result,
@@ -619,6 +620,24 @@ def test_core_info_title_uses_original_paper_title():
 
     assert "- 标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
     assert "text-to-linear-image generation" not in result
+
+
+def test_background_sections_normalize_to_background_and_problem():
+    summary = """# Title
+
+## 研究背景
+本文讨论长文档理解为什么困难。
+
+## 研究问题
+已有方法难以定位证据。
+"""
+
+    result = _normalize_final_sections(summary)
+
+    assert result.count("## 背景与问题") == 1
+    assert "## 背景与问题" in result
+    assert "## 研究背景" not in result
+    assert "## 研究问题" not in result
 
 
 def test_heading3_background_only_wraps_text():

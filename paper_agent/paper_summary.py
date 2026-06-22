@@ -39,15 +39,16 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 
 必须遵守：
 1. 证据优先：只能依据论文正文、图表标题/上下文和抽取到的表格文本写结论；原文没有提及的信息、术语、数据集、指标、模型名、应用场景或结论一律省略，不要写“原文未明确说明”“未提及”“未知”等占位句。
-2. 技术细节优先：优先解释问题定义、方法机制、训练/推理链路、关键公式、关键数字、消融和局限。
-3. 中文笔记：除模型名、数据集名、指标名、论文术语、代码库名等稳定专有名词外，不要夹杂整句英文。
-4. 不要把正文写成全篇 bullet list。只有 `## 核心信息` 使用 `- 字段名: 值`；其他章节优先使用自然段和 `###` 小标题。
-5. 图表占位符优先：把重要图、表截图放在对应解释段落附近，使用 `[[ASSET:编号]]` 独占一行表示截图位置；不要创建独立“图表精读”章节，也不要把截图集中放到文末。
-6. `ASSET` 编号只是程序内部占位符，不是最终 Word 中的图、表、公式编号。正文不要把 `ASSET` 编号写成“公式 2”这类引用；必须使用可用图表截图里给出的“最终引用标签”。
-7. 保留原图表和公式编号：解释图、表、公式时尽量保留 Fig. 1、Table 2、Equation 8、(8) 等原始编号；如果无法确定编号，说明它来自第几页的截图。
-8. 不要输出思考过程，不要输出 `<think>`、`<thinking>`、代码块、HTML、JSON。
-9. 关键公式必须解读。优先使用“TexTeller 公式识别结果”中的 LaTeX；如果没有识别结果，可以重写 1 到 3 个最核心公式的可读文本形式，例如 `Δvision = Ctext / Cvision`；如果公式抽取不可靠，使用可用的公式截图占位符并解释含义。
-10. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
+2. 背景先行：面向不了解该方向的读者，先解释研究背景、任务为什么重要、已有方法卡在哪里、本文要解决什么具体问题。
+3. 技术细节优先：优先解释问题定义、方法机制、训练/推理链路、关键公式、关键数字、消融和局限。
+4. 中文笔记：除模型名、数据集名、指标名、论文术语、代码库名等稳定专有名词外，不要夹杂整句英文。
+5. 不要把正文写成全篇 bullet list。只有 `## 核心信息` 使用 `- 字段名: 值`；其他章节优先使用自然段和 `###` 小标题。
+6. 图表占位符优先：把重要图、表截图放在对应解释段落附近，使用 `[[ASSET:编号]]` 独占一行表示截图位置；不要创建独立“图表精读”章节，也不要把截图集中放到文末。
+7. `ASSET` 编号只是程序内部占位符，不是最终 Word 中的图、表、公式编号。正文不要把 `ASSET` 编号写成“公式 2”这类引用；必须使用可用图表截图里给出的“最终引用标签”。
+8. 保留原图表和公式编号：解释图、表、公式时尽量保留 Fig. 1、Table 2、Equation 8、(8) 等原始编号；如果无法确定编号，说明它来自第几页的截图。
+9. 不要输出思考过程，不要输出 `<think>`、`<thinking>`、代码块、HTML、JSON。
+10. 关键公式必须解读。优先使用“TexTeller 公式识别结果”中的 LaTeX；如果没有识别结果，可以重写 1 到 3 个最核心公式的可读文本形式，例如 `Δvision = Ctext / Cvision`；如果公式抽取不可靠，使用可用的公式截图占位符并解释含义。
+11. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
 """
 
 SYNTHESIZER_SYSTEM_PROMPT = DEEP_PAPER_NOTE_SYSTEM_PROMPT
@@ -83,14 +84,14 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 ## 摘要
 必须优先使用“原文摘要证据”写成忠实中文摘要；不要加入后来评价。只有原文摘要证据为空时，才省略本节，不要写占位句。
 
+## 背景与问题
+面向不了解该方向的读者，用 2 到 4 个自然段讲清楚：研究背景是什么、这个任务为什么重要、已有方法或现实流程哪里不够好、本文具体想解决什么问题。只能使用引言、摘要、任务定义或相关工作中有证据支持的信息；不要泛泛写行业套话。
+
 ## 创新点
 用 3 到 5 个短段落说明真实创新点；不要写成每行都以 `-` 开头的长列表。每个创新点都要说明它解决什么问题、为什么重要。
 
 ## 一句话总结
 回答这篇论文真正解决什么问题；只写原文直接提到或由原文证据直接支持的内容。
-
-## 研究问题
-说明痛点、已有方法不足、任务定义和问题边界。
 
 ## 数据与任务定义
 说明输入、任务、数据集、评价指标和实验边界。原文没有提及的项目直接省略，不要写占位句。
@@ -2831,6 +2832,10 @@ def _summarize_chunks_with_codex(
         user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
 只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
+如果本段包含 introduction、abstract、related work、problem statement 或任务定义，请优先抽取：
+- 研究背景：这类问题为什么存在、为什么重要。
+- 要解决的问题：已有方法/现实流程的不足、本文聚焦的痛点和边界。
+- 读者入口：不了解该方向的人需要先知道的任务设定、输入输出和应用场景。
 
 历史用户修正规则：
 {memory_context}
@@ -3914,6 +3919,8 @@ def _postprocess_summary(text: str) -> str:
 def _normalize_final_sections(text: str) -> str:
     text = text.replace("标题翻译", "中文标题")
     text = re.sub(r"(?m)^##\s*(?:原文摘要翻译|摘要翻译)\s*$", "## 摘要", text)
+    text = re.sub(r"(?m)^##\s*(?:研究背景|背景介绍|背景|研究问题|问题定义|问题与背景)\s*$", "## 背景与问题", text)
+    text = _merge_background_problem_sections(text)
     text = text.replace("原文摘要未完整抽取", "摘要未完整抽取")
     text = re.sub(r"(?m)^##\s*我的笔记\s*$", "## 总结", text)
     text = re.sub(r"(?ms)(?:^|\n)##\s*引用\s*\n.*?(?=\n## |\Z)", "\n", text)
@@ -3924,6 +3931,28 @@ def _normalize_final_sections(text: str) -> str:
     text = text.replace("翻译", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _merge_background_problem_sections(text: str) -> str:
+    blocks = re.split(r"(?m)(?=^##\s+)", text)
+    merged_bodies: list[str] = []
+    result: list[str] = []
+    placeholder = "__PAPER_AGENT_BACKGROUND_AND_PROBLEM__"
+    inserted = False
+    for block in blocks:
+        if re.match(r"(?m)^##\s*背景与问题\s*$", block.splitlines()[0] if block.splitlines() else ""):
+            body = re.sub(r"(?m)^##\s*背景与问题\s*\n?", "", block, count=1).strip()
+            if body:
+                merged_bodies.append(body)
+            if not inserted:
+                result.append(placeholder)
+                inserted = True
+            continue
+        result.append(block)
+    if not inserted:
+        return text
+    merged = "## 背景与问题\n" + "\n\n".join(merged_bodies).strip() + "\n\n"
+    return "".join(result).replace(placeholder, merged)
 
 
 def _clean_core_info_section(text: str) -> str:
