@@ -210,6 +210,10 @@ class CorrectionMemory:
     scope: str = "paper"
     confidence: float = 1.0
     created_at: str = ""
+    hit_count: int = 0
+    last_used_at: str = ""
+    disabled: bool = False
+    promoted_from: str = ""
 
 
 @dataclass
@@ -217,6 +221,35 @@ class PromptPatch:
     target: str
     content: str
     source_category: str = "summary"
+
+
+@dataclass(frozen=True)
+class MemoryPolicy:
+    min_confidence: float = 0.5
+    min_promote_hits: int = 2
+
+    def should_inject(self, memory: CorrectionMemory, selected: list[CorrectionMemory]) -> bool:
+        if memory.disabled:
+            return False
+        if memory.confidence < self.min_confidence:
+            return False
+        return not self.conflicts(memory, selected)
+
+    def conflicts(self, memory: CorrectionMemory, selected: list[CorrectionMemory]) -> bool:
+        for other in selected:
+            if _memory_conflicts(memory, other):
+                return True
+        return False
+
+    def can_promote(self, memory: CorrectionMemory, target_scope: str, *, evaluation_passed: bool = False) -> bool:
+        target_scope = _normalize_memory_scope(target_scope)
+        if memory.disabled or memory.confidence < self.min_confidence:
+            return False
+        if memory.hit_count < self.min_promote_hits:
+            return False
+        if target_scope == "global" and not evaluation_passed:
+            return False
+        return target_scope in {"domain", "global"} and memory.scope != target_scope
 
 
 @dataclass(frozen=True)
@@ -2292,18 +2325,17 @@ def record_summary_correction(
     memory_path: str | Path | None = None,
 ) -> Path:
     """Store user feedback as correction memory for future paper summaries."""
+    normalized_paper_id = _paper_memory_id(paper_id)
     memory = CorrectionMemory(
-        paper_id=_paper_memory_id(paper_id),
+        paper_id=normalized_paper_id,
         original=_clean_xml_text(original).strip(),
         corrected=_clean_xml_text(corrected).strip(),
         note=_clean_xml_text(note).strip(),
         category=_clean_xml_text(category).strip() or "summary",
-        scope=_clean_xml_text(scope).strip() or "paper",
+        scope="paper",
         confidence=_clamped_confidence(confidence),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
-    if memory.paper_id == "global":
-        memory.scope = "global"
     if not memory.original and not memory.corrected and not memory.note:
         raise ValueError("Correction memory requires original, corrected, or note content.")
     path = _correction_memory_path(memory_path)
@@ -2318,6 +2350,7 @@ def _load_correction_memories(
     *,
     limit: int = 20,
     memory_path: str | Path | None = None,
+    policy: MemoryPolicy | None = None,
 ) -> list[CorrectionMemory]:
     path = _correction_memory_path(memory_path)
     if not path.exists():
@@ -2335,25 +2368,201 @@ def _load_correction_memories(
             payload = json.loads(line)
         except json.JSONDecodeError:
             continue
-        memory = CorrectionMemory(
-            paper_id=_paper_memory_id(str(payload.get("paper_id", ""))),
-            original=str(payload.get("original", "")),
-            corrected=str(payload.get("corrected", "")),
-            note=str(payload.get("note", "")),
-            category=str(payload.get("category", "summary") or "summary"),
-            scope=str(
-                payload.get("scope", "")
-                or ("global" if _paper_memory_id(str(payload.get("paper_id", ""))) == "global" else "paper")
-            ),
-            confidence=_clamped_confidence(payload.get("confidence", 1.0)),
-            created_at=str(payload.get("created_at", "")),
-        )
-        if normalized_paper_id and memory.paper_id not in {"", "global", normalized_paper_id}:
+        memory = _memory_from_payload(payload)
+        if not _memory_applies_to_paper(memory, normalized_paper_id):
             continue
         memories.append(memory)
         if len(memories) >= limit:
             break
-    return list(reversed(memories))
+    selected = _select_memories_for_injection(list(reversed(memories)), policy or MemoryPolicy())
+    _mark_memories_used(path, selected)
+    return selected
+
+
+def list_correction_memories(
+    *,
+    memory_path: str | Path | None = None,
+    include_disabled: bool = True,
+) -> list[dict[str, object]]:
+    memories = _read_all_correction_memories(memory_path)
+    rows = []
+    for index, memory in enumerate(memories, 1):
+        if memory.disabled and not include_disabled:
+            continue
+        payload = dict(memory.__dict__)
+        payload["index"] = index
+        rows.append(payload)
+    return rows
+
+
+def disable_correction_memory(index: int, *, memory_path: str | Path | None = None) -> Path:
+    memories = _read_all_correction_memories(memory_path)
+    memory_index = index - 1
+    if memory_index < 0 or memory_index >= len(memories):
+        raise IndexError(f"memory index out of range: {index}")
+    memory = memories[memory_index]
+    memories[memory_index] = CorrectionMemory(**{**memory.__dict__, "disabled": True})
+    return _write_all_correction_memories(memories, memory_path)
+
+
+def promote_correction_memory(
+    index: int,
+    target_scope: str,
+    *,
+    memory_path: str | Path | None = None,
+    evaluation_passed: bool = False,
+    policy: MemoryPolicy | None = None,
+) -> Path:
+    memories = _read_all_correction_memories(memory_path)
+    memory_index = index - 1
+    if memory_index < 0 or memory_index >= len(memories):
+        raise IndexError(f"memory index out of range: {index}")
+    memory = memories[memory_index]
+    memory_policy = policy or MemoryPolicy()
+    target_scope = _normalize_memory_scope(target_scope)
+    if not memory_policy.can_promote(memory, target_scope, evaluation_passed=evaluation_passed):
+        raise ValueError("memory does not satisfy promotion policy")
+    promoted = CorrectionMemory(
+        **{
+            **memory.__dict__,
+            "scope": target_scope,
+            "paper_id": "global" if target_scope == "global" else memory.paper_id,
+            "promoted_from": memory.promoted_from or f"{memory.scope}:{memory.paper_id}:{index}",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_used_at": "",
+            "disabled": False,
+        }
+    )
+    memories.append(promoted)
+    return _write_all_correction_memories(memories, memory_path)
+
+
+def _read_all_correction_memories(memory_path: str | Path | None = None) -> list[CorrectionMemory]:
+    path = _correction_memory_path(memory_path)
+    if not path.exists():
+        return []
+    memories: list[CorrectionMemory] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            memories.append(_memory_from_payload(json.loads(line)))
+        except json.JSONDecodeError:
+            continue
+    return memories
+
+
+def _write_all_correction_memories(
+    memories: list[CorrectionMemory],
+    memory_path: str | Path | None = None,
+) -> Path:
+    path = _correction_memory_path(memory_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    content = "\n".join(json.dumps(memory.__dict__, ensure_ascii=False) for memory in memories)
+    path.write_text((content + "\n") if content else "", encoding="utf-8")
+    return path
+
+
+def _mark_memories_used(path: Path, selected: list[CorrectionMemory]) -> None:
+    if not selected or not path.exists():
+        return
+    selected_keys = {_memory_key(memory) for memory in selected}
+    memories = _read_all_correction_memories(path)
+    now = datetime.now(timezone.utc).isoformat()
+    updated = []
+    changed = False
+    for memory in memories:
+        if _memory_key(memory) in selected_keys:
+            updated.append(CorrectionMemory(**{**memory.__dict__, "hit_count": memory.hit_count + 1, "last_used_at": now}))
+            changed = True
+        else:
+            updated.append(memory)
+    if changed:
+        _write_all_correction_memories(updated, path)
+
+
+def _memory_key(memory: CorrectionMemory) -> tuple[str, str, str, str, str]:
+    return (
+        memory.created_at,
+        memory.paper_id,
+        memory.scope,
+        _normalize_memory_text(memory.original),
+        _normalize_memory_text(memory.corrected),
+    )
+
+
+def _memory_from_payload(payload: dict) -> CorrectionMemory:
+    scope = _normalize_memory_scope(str(payload.get("scope", "")))
+    paper_id = _paper_memory_id(str(payload.get("paper_id", "")))
+    if not scope:
+        scope = "global" if paper_id == "global" else "paper"
+    return CorrectionMemory(
+        paper_id=paper_id,
+        original=str(payload.get("original", "")),
+        corrected=str(payload.get("corrected", "")),
+        note=str(payload.get("note", "")),
+        category=str(payload.get("category", "summary") or "summary"),
+        scope=scope,
+        confidence=_clamped_confidence(payload.get("confidence", 1.0)),
+        created_at=str(payload.get("created_at", "")),
+        hit_count=_safe_int(payload.get("hit_count", 0)),
+        last_used_at=str(payload.get("last_used_at", "")),
+        disabled=bool(payload.get("disabled", False)),
+        promoted_from=str(payload.get("promoted_from", "")),
+    )
+
+
+def _normalize_memory_scope(scope: str) -> str:
+    normalized = (scope or "").strip().lower()
+    return normalized if normalized in {"paper", "domain", "global"} else ""
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _memory_applies_to_paper(memory: CorrectionMemory, normalized_paper_id: str) -> bool:
+    if memory.disabled:
+        return False
+    if memory.scope == "global" or memory.paper_id == "global":
+        return True
+    if memory.scope == "domain":
+        return True
+    return not normalized_paper_id or memory.paper_id == normalized_paper_id
+
+
+def _select_memories_for_injection(
+    memories: list[CorrectionMemory],
+    policy: MemoryPolicy,
+) -> list[CorrectionMemory]:
+    selected: list[CorrectionMemory] = []
+    for memory in sorted(memories, key=_memory_scope_priority):
+        if policy.should_inject(memory, selected):
+            selected.append(memory)
+    return selected
+
+
+def _memory_scope_priority(memory: CorrectionMemory) -> tuple[int, str]:
+    return {"paper": 0, "domain": 1, "global": 2}.get(memory.scope, 3), memory.created_at
+
+
+def _memory_conflicts(left: CorrectionMemory, right: CorrectionMemory) -> bool:
+    if not left.original or not right.original:
+        return False
+    if _normalize_memory_text(left.original) != _normalize_memory_text(right.original):
+        return False
+    return _normalize_memory_text(left.corrected) != _normalize_memory_text(right.corrected)
+
+
+def _normalize_memory_text(text: str) -> str:
+    return re.sub(r"\s+", "", _clean_xml_text(text).lower())
 
 
 def _correction_memory_context(memories: list[CorrectionMemory], limit: int = 8) -> str:
@@ -2368,8 +2577,9 @@ def _correction_memory_context(memories: list[CorrectionMemory], limit: int = 8)
             pieces.append(f"改为：{memory.corrected}")
         if memory.note:
             pieces.append(f"规则：{memory.note}")
-        if memory.scope or memory.confidence < 1:
-            pieces.append(f"scope={memory.scope}, confidence={memory.confidence:.2f}")
+        pieces.append(
+            f"scope={memory.scope}, confidence={memory.confidence:.2f}, hits={memory.hit_count}"
+        )
         lines.append("；".join(pieces))
     return "\n".join(f"- {line}" for line in lines)
 
@@ -3033,6 +3243,7 @@ def _loop_guard(max_repairs: int = 2, repair_attempts: int = 0) -> GuardResult:
 def _memory_guard(memories: list[CorrectionMemory]) -> GuardResult:
     warnings: list[str] = []
     global_count = sum(1 for memory in memories if memory.scope == "global" or memory.paper_id == "global")
+    disabled_count = sum(1 for memory in memories if memory.disabled)
     if global_count > max(5, len(memories) // 2) and memories:
         warnings.append("too many global correction memories may pollute paper-level behavior")
     missing_category = sum(1 for memory in memories if not memory.category)
@@ -3047,6 +3258,7 @@ def _memory_guard(memories: list[CorrectionMemory]) -> GuardResult:
         metrics={
             "memory_count": len(memories),
             "global_memory_count": global_count,
+            "disabled_memory_count": disabled_count,
             "low_confidence_count": low_confidence,
         },
     )

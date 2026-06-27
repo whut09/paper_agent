@@ -218,6 +218,22 @@ def parse_args(args: Optional[List[str]]) -> argparse.Namespace:
         eval_parser.add_argument("command", choices=["eval"])
         eval_parser.add_argument("--cases", default="evaluation/golden_cases")
         return eval_parser.parse_args(args=raw_args)
+    if raw_args and raw_args[0] == "memory":
+        memory_parser = argparse.ArgumentParser(description="Manage PaperAgent correction memory.")
+        memory_parser.add_argument("command", choices=["memory"])
+        subparsers = memory_parser.add_subparsers(dest="memory_action", required=True)
+        list_parser = subparsers.add_parser("list")
+        list_parser.add_argument("--memory-path", default=None)
+        list_parser.add_argument("--active-only", action="store_true")
+        disable_parser = subparsers.add_parser("disable")
+        disable_parser.add_argument("index", type=int)
+        disable_parser.add_argument("--memory-path", default=None)
+        promote_parser = subparsers.add_parser("promote")
+        promote_parser.add_argument("index", type=int)
+        promote_parser.add_argument("--scope", choices=["domain", "global"], default="domain")
+        promote_parser.add_argument("--evaluation-passed", action="store_true")
+        promote_parser.add_argument("--memory-path", default=None)
+        return memory_parser.parse_args(args=raw_args)
 
     parsed_args = create_parser().parse_args(args=raw_args)
 
@@ -288,6 +304,9 @@ def main(args: Optional[List[str]] = None) -> int:
         from paper_agent.evaluation.runner import main as eval_main
 
         return eval_main(["--cases", parsed_args.cases])
+
+    if getattr(parsed_args, "command", "") == "memory":
+        return _memory_cli(parsed_args)
 
     if parsed_args.interactive:
         from paper_agent.gui import setup_gui
@@ -535,6 +554,38 @@ def yadt_main(parsed_args) -> int:
             except OSError:
                 pass
     return 0
+
+
+def _memory_cli(parsed_args: argparse.Namespace) -> int:
+    import json
+
+    from paper_agent.memory import (
+        disable_correction_memory,
+        list_correction_memories,
+        promote_correction_memory,
+    )
+
+    if parsed_args.memory_action == "list":
+        rows = list_correction_memories(
+            memory_path=parsed_args.memory_path,
+            include_disabled=not parsed_args.active_only,
+        )
+        print(json.dumps({"memories": rows}, ensure_ascii=False, indent=2))
+        return 0
+    if parsed_args.memory_action == "disable":
+        path = disable_correction_memory(parsed_args.index, memory_path=parsed_args.memory_path)
+        print(json.dumps({"state": "disabled", "path": str(path)}, ensure_ascii=False))
+        return 0
+    if parsed_args.memory_action == "promote":
+        path = promote_correction_memory(
+            parsed_args.index,
+            parsed_args.scope,
+            memory_path=parsed_args.memory_path,
+            evaluation_passed=parsed_args.evaluation_passed,
+        )
+        print(json.dumps({"state": "promoted", "path": str(path), "scope": parsed_args.scope}, ensure_ascii=False))
+        return 0
+    raise ValueError(f"Unsupported memory action: {parsed_args.memory_action}")
 
 
 if __name__ == "__main__":

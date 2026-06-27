@@ -8,6 +8,7 @@ from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkfl
 from paper_agent.schemas.evidence import EvidenceMap
 from paper_agent.paper_summary import (
     GenerateReport,
+    CorrectionMemory,
     PaperAsset,
     TextLine,
     _asset_display_label,
@@ -221,23 +222,21 @@ def test_correction_memory_records_and_loads_by_paper_id():
 
 
 def test_memory_guard_warns_about_global_low_confidence_rules():
-    with TemporaryDirectory() as tmp:
-        memory_path = Path(tmp) / "corrections.jsonl"
-        record_summary_correction(
+    memories = [
+        CorrectionMemory(
             "global",
             "错误规则",
             "低置信度规则",
             category="asset_reference",
             scope="global",
             confidence=0.2,
-            memory_path=memory_path,
         )
-        memories = _load_correction_memories("Any Paper", memory_path=memory_path)
-        result = _memory_guard(memories)
+    ]
+    result = _memory_guard(memories)
 
-        assert result.status == "warning"
-        assert result.metrics["global_memory_count"] == 1
-        assert result.metrics["low_confidence_count"] == 1
+    assert result.status == "warning"
+    assert result.metrics["global_memory_count"] == 1
+    assert result.metrics["low_confidence_count"] == 1
 
 
 def test_self_improving_prompt_patches_route_feedback_by_target():
