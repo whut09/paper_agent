@@ -1858,6 +1858,8 @@ def _visual_rect_for_caption(
     while changed:
         changed = False
         for region in candidates:
+            if not _figure_region_belongs_to_group(region, seed, group):
+                continue
             if _rect_overlap_fraction(region, group) > 0.05 or _rect_gap(region, group) <= 45:
                 before = tuple(group)
                 group |= region
@@ -1867,6 +1869,16 @@ def _visual_rect_for_caption(
     if group.is_empty or group.width < 40 or group.height < 30:
         return None
     return group
+
+
+def _figure_region_belongs_to_group(region: fitz.Rect, seed: fitz.Rect, group: fitz.Rect) -> bool:
+    if _rect_overlap_fraction(region, seed) > 0.02 or _rect_overlap_fraction(region, group) > 0.02:
+        return True
+    seed_overlap = _horizontal_overlap_fraction(region, seed.x0 - 8, seed.x1 + 8)
+    group_overlap = _horizontal_overlap_fraction(region, group.x0 - 8, group.x1 + 8)
+    if max(seed_overlap, group_overlap) < 0.2:
+        return False
+    return _rect_gap(region, group) <= 38
 
 
 def _figure_upper_barrier_y(

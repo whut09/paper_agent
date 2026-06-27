@@ -742,6 +742,33 @@ def test_captioned_figure_crop_does_not_cross_previous_table():
     assert rect.y1 < 680
 
 
+def test_captioned_figure_crop_does_not_absorb_left_column_body():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            return {"blocks": []}
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(48, 180, 285, 440)},
+                {"rect": fitz.Rect(405, 175, 548, 260)},
+                {"rect": fitz.Rect(393, 278, 548, 392)},
+            ]
+
+    lines = [
+        line("Over the past decades, researchers have abstracted", 48, 188, 284, 202),
+        line("various degradation phenomena into independent IR tasks,", 48, 206, 284, 220),
+        line("Figure 1: The five stages of human process of IR", 393, 416, 552, 430),
+    ]
+
+    rect = _visual_rect_for_caption(FakePage(), lines[-1].rect, lines)
+
+    assert rect is not None
+    assert rect.x0 > 360
+    assert rect.x1 < 570
+
+
 def test_figure_caption_does_not_absorb_following_body_text():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)
