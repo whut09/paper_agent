@@ -56,7 +56,7 @@ jobs:
       is_release: ${{ steps.check-version.outputs.tag }}
       version: ${{ steps.check-version.outputs.tag && steps.get-release-version.outputs.version || steps.get-dev-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: true
           fetch-depth: 2
@@ -165,7 +165,7 @@ jobs:
     if: needs.check-repository.outputs.is_main_repo == 'true' && needs.check-repository.outputs.is_doc_only != 'true'
     steps:
       - name: checkout babeldoc metadata
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: funstory-ai/BabelDOC
           path: babeldoctemp1234567
@@ -178,7 +178,7 @@ jobs:
           path: ~/.cache/babeldoc
           key: test-1-babeldoc-assets-${{ hashFiles('babeldoctemp1234567/babeldoc/assets/embedding_assets_metadata.py') }}
       - name: 检出代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Setup uv with Python ${{ env.WIN_EXE_PYTHON_VERSION }}
         uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41 # v7.1.2
@@ -214,7 +214,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: 检出代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download build artifact
         uses: actions/download-artifact@v8
@@ -279,7 +279,7 @@ jobs:
     outputs:
       tag_name: ${{ steps.release-drafter.outputs.tag_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: true
           fetch-depth: 2
@@ -303,7 +303,7 @@ jobs:
       needs.release-draft.result == 'success'
     steps:
       - name: 检出代码
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Download build artifact
         uses: actions/download-artifact@v8
