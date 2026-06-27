@@ -2913,6 +2913,10 @@ def _integrate_summary_with_codex(
             f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
             f"历史用户修正规则：\n{memory_context}\n\n"
             f"自优化总结提示词：\n{summarization_patch}\n\n"
+            "完整性硬性要求：最终输出必须包含这些二级章节："
+            "## 核心信息、## 摘要、## 背景与问题、## 创新点、## 一句话总结、"
+            "## 方法主线、## 关键结果、## 深度分析、## 局限、## 总结。"
+            "如果证据较少，也要用已有证据写成短段落；不要输出计划、过程说明或“我先/接着我会”这类话。\n\n"
             f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
             f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
             f"关键公式候选：\n{formula_context}\n\n"
@@ -3040,10 +3044,25 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
         raise ValueError("Revision requires a verification report.")
     context.verification.revision_attempted = True
     context.revision_attempts += 1
-    revised_summary = _apply_verifier_patch_suggestions(
-        context.summary,
-        context.verification.patch_suggestions,
-    )
+    if _verification_needs_full_report_rewrite(context.verification) and context.client is not None and context.config is not None:
+        revised_summary = _integrate_summary_with_codex(
+            context.client,
+            context.config.model,
+            context.chunk_notes,
+            context.assets,
+            context.summary_language,
+            context.abstract,
+            context.formulas,
+            _recognized_formula_context(context.assets),
+            context.paper_title,
+            context.correction_memories,
+            context.prompt_patches,
+        )
+    else:
+        revised_summary = _apply_verifier_patch_suggestions(
+            context.summary,
+            context.verification.patch_suggestions,
+        )
     if revised_summary != context.summary:
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
@@ -3061,6 +3080,22 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
             *_verification_warning_messages(context.verification),
         ],
         metrics={"revision_attempts": context.revision_attempts},
+    )
+
+
+def _verification_needs_full_report_rewrite(verification: VerificationResult) -> bool:
+    reasons = "\n".join(
+        str(failure.get("reason", ""))
+        for failure in verification.hard_failures
+    )
+    return any(
+        token in reasons
+        for token in (
+            "missing required section",
+            "required section is too short",
+            "empty required section",
+            "model process preface",
+        )
     )
 
 
@@ -3227,13 +3262,76 @@ def _format_guard(summary: str) -> GuardResult:
     warnings: list[str] = []
     if re.search(r"\[\[ASSET:[^\]\d]+", summary):
         errors.append("malformed asset placeholder")
+    if _contains_process_preface(summary):
+        errors.append("report contains model process preface")
     headings = [(len(match.group(1)), match.group(2).strip()) for match in re.finditer(r"(?m)^(#{1,6})\s+(.+)$", summary)]
     for (prev_level, _), (level, title) in zip(headings, headings[1:]):
         if level - prev_level > 1:
             warnings.append(f"heading level jumps before {title}")
     empty_sections = _empty_markdown_sections(summary)
-    warnings.extend(f"empty section: {title}" for title in empty_sections[:6])
+    errors.extend(f"empty required section: {title}" for title in empty_sections if title in _required_report_sections())
+    warnings.extend(f"empty section: {title}" for title in empty_sections[:6] if title not in _required_report_sections())
+    for section in _missing_required_report_sections(summary):
+        errors.append(f"missing required section: {section}")
+    for section in _too_short_required_sections(summary):
+        errors.append(f"required section is too short: {section}")
     return _guard_result("Format Guard", errors=errors, warnings=warnings, metrics={"heading_count": len(headings)})
+
+
+def _required_report_sections() -> set[str]:
+    return {
+        "核心信息",
+        "摘要",
+        "背景与问题",
+        "创新点",
+        "一句话总结",
+        "方法主线",
+        "关键结果",
+        "深度分析",
+        "局限",
+        "总结",
+    }
+
+
+def _missing_required_report_sections(summary: str) -> list[str]:
+    present = {
+        match.group(1).strip()
+        for match in re.finditer(r"(?m)^##\s+(.+?)\s*$", summary)
+    }
+    return [section for section in _required_report_sections() if section not in present]
+
+
+def _too_short_required_sections(summary: str) -> list[str]:
+    too_short: list[str] = []
+    min_chars = {
+        "摘要": 80,
+        "背景与问题": 120,
+        "创新点": 80,
+        "一句话总结": 25,
+        "方法主线": 140,
+        "关键结果": 100,
+        "深度分析": 80,
+        "局限": 40,
+        "总结": 60,
+    }
+    for section, minimum in min_chars.items():
+        body = re.sub(r"\[\[ASSET:\d+\]\]", "", _section_body(summary, section))
+        body = re.sub(r"(?m)^#{1,6}\s+.*$", "", body)
+        body = re.sub(r"\s+", "", _clean_xml_text(body))
+        if body and len(body) < minimum:
+            too_short.append(section)
+    return too_short
+
+
+def _contains_process_preface(summary: str) -> bool:
+    first_lines = "\n".join(line.strip() for line in summary.splitlines()[:8] if line.strip())
+    return bool(
+        re.search(
+            r"(我先|接着我|然后我|下面我|我会|我将|先把|补齐缺失|整合成完整|避免把未证实信息|校对公式|process|I will|I'll)",
+            first_lines,
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _citation_guard(summary: str, paper_title: str) -> GuardResult:
@@ -4042,9 +4140,20 @@ def _postprocess_summary(text: str) -> str:
     text = _clean_xml_text(text)
     text = _strip_thinking(text)
     text = _strip_markdown_fences(text)
+    text = _strip_preface_before_markdown_report(text)
     text = _textualize_latex(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _strip_preface_before_markdown_report(text: str) -> str:
+    match = re.search(r"(?m)^#\s+\S", text)
+    if match:
+        return text[match.start() :]
+    match = re.search(r"(?m)^##\s+\S", text)
+    if match:
+        return text[match.start() :]
+    return text
 
 
 def _normalize_final_sections(text: str) -> str:

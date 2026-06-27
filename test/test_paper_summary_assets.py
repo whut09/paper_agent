@@ -29,9 +29,11 @@ from paper_agent.paper_summary import (
     _extract_abstract_from_text,
     _fallback_visual_rect_for_caption,
     _extract_verifiable_claims,
+    _format_guard,
     _load_correction_memories,
     _expand_table_rect_to_borders,
     _memory_guard,
+    _postprocess_summary,
     _missing_asset_references,
     _normalize_final_sections,
     _paragraph,
@@ -431,6 +433,30 @@ def test_harness_guards_report_coverage_warnings():
 
     assert by_name["Coverage Guard"].status == "warning"
     assert any("方法" in warning or "method" in warning for warning in by_name["Coverage Guard"].warnings)
+
+
+def test_postprocess_strips_model_process_preface_before_report():
+    summary = _postprocess_summary(
+        "我先把分段笔记去重、纠错并整合成完整 Markdown。\n\n"
+        "# 论文精读笔记\n\n"
+        "## 核心信息\n正文"
+    )
+
+    assert summary.startswith("# 论文精读笔记")
+    assert "我先把分段笔记" not in summary
+
+
+def test_format_guard_blocks_incomplete_report_and_process_preface():
+    result = _format_guard(
+        "我先把分段笔记去重、纠错并整合成完整 Markdown。\n\n"
+        "# 论文精读笔记\n\n"
+        "## 方法主线\n如图2所示。\n[[ASSET:1]]"
+    )
+
+    assert result.status == "failed"
+    assert any("model process preface" in error for error in result.errors)
+    assert any("missing required section" in error for error in result.errors)
+    assert any("required section is too short: 方法主线" in error for error in result.errors)
 
 
 def test_knowledge_graph_extracts_research_nodes_and_edges():
