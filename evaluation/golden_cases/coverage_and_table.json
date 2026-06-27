@@ -1,0 +1,19 @@
+{
+  "name": "coverage_and_table",
+  "input_text": "1 Introduction\nThe task is to produce traceable paper notes.\n\n2 Method\nThe harness stores a grounding map and agent trace.\n\n3 Results\nTable 1 reports pass rates for three golden cases.",
+  "assets": [
+    {
+      "kind": "table",
+      "number": 1,
+      "caption": "Table 1 reports pass rates"
+    }
+  ],
+  "expected_claims": [
+    "The harness stores a grounding map and agent trace.",
+    "Table 1 reports pass rates for three golden cases."
+  ],
+  "forbidden_claims": [
+    "The system uses human annotation for every paper."
+  ],
+  "expected_sections": ["intro", "method", "results"]
+}

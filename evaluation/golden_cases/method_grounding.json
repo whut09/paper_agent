@@ -1,0 +1,13 @@
+{
+  "name": "method_grounding",
+  "input_text": "1 Introduction\nPaperAgent studies grounded paper reading for reliable evidence checks.\n\n2 Method\nThe method builds a reader agent, extractor agent, and verifier agent. The verifier checks each core claim against evidence ids.\n\n3 Experiments\nExperiments evaluate the harness on synthetic document understanding cases.",
+  "assets": [],
+  "expected_claims": [
+    "The method builds a reader agent, extractor agent, and verifier agent.",
+    "The verifier checks each core claim against evidence ids."
+  ],
+  "forbidden_claims": [
+    "The paper introduces a new large-scale benchmark dataset."
+  ],
+  "expected_sections": ["intro", "method", "experiments"]
+}

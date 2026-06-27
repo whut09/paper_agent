@@ -212,7 +212,14 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def parse_args(args: Optional[List[str]]) -> argparse.Namespace:
-    parsed_args = create_parser().parse_args(args=args)
+    raw_args = sys.argv[1:] if args is None else args
+    if raw_args and raw_args[0] == "eval":
+        eval_parser = argparse.ArgumentParser(description="Run PaperAgent evaluation harness.")
+        eval_parser.add_argument("command", choices=["eval"])
+        eval_parser.add_argument("--cases", default="evaluation/golden_cases")
+        return eval_parser.parse_args(args=raw_args)
+
+    parsed_args = create_parser().parse_args(args=raw_args)
 
     if parsed_args.pages:
         pages = []
@@ -269,13 +276,18 @@ def main(args: Optional[List[str]] = None) -> int:
     logging.getLogger("http11").setLevel("CRITICAL")
     logging.getLogger("http11").propagate = False
 
-    if parsed_args.config:
+    if getattr(parsed_args, "config", None):
         from paper_agent.config import ConfigManager
 
         ConfigManager.custome_config(parsed_args.config)
 
-    if parsed_args.debug:
+    if getattr(parsed_args, "debug", False):
         log.setLevel(logging.DEBUG)
+
+    if getattr(parsed_args, "command", "") == "eval":
+        from paper_agent.evaluation.runner import main as eval_main
+
+        return eval_main(["--cases", parsed_args.cases])
 
     if parsed_args.interactive:
         from paper_agent.gui import setup_gui

@@ -1,0 +1,16 @@
+{
+  "name": "asset_reference",
+  "input_text": "1 Introduction\nThe system summarizes figures and tables.\n\n2 Method\nFigure 1 shows the agent workflow with Reader, Extractor, and Verifier components.\n\n3 Experiments\nThe workflow is checked with asset manifest validation.",
+  "assets": [
+    {
+      "kind": "figure",
+      "number": 1,
+      "caption": "Figure 1 shows the agent workflow"
+    }
+  ],
+  "expected_claims": [
+    "Figure 1 shows the agent workflow with Reader, Extractor, and Verifier components."
+  ],
+  "forbidden_claims": [],
+  "expected_sections": ["method"]
+}

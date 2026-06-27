@@ -71,6 +71,10 @@ jobs:
         run: |
           uv run pytest .
 
+      - name: Test - Evaluation Harness
+        run: |
+          uv run pytest test/test_evaluation_harness.py
+
       - name: Test - Translate a PDF file with plain text only
         run: uv run paper_agent ./test/file/translate.cli.plain.text.pdf -o ./test/file
 
