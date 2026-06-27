@@ -3,6 +3,7 @@ import cgi
 import os
 import shutil
 import socket
+import time
 import uuid
 from asyncio import CancelledError
 from pathlib import Path
@@ -71,6 +72,10 @@ def verify_recaptcha(response):
     return result.get("success")
 
 
+DOWNLOAD_CHUNK_SIZE = 64 * 1024
+DOWNLOAD_RETRIES = 3
+
+
 def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> str:
     """
     This function downloads a file from a URL and saves it to a specified path.
@@ -83,31 +88,52 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
     Returns:
         - The path of the downloaded file
     """
-    chunk_size = 1024
-    total_size = 0
     session = requests.Session()
     session.trust_env = not get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY")
+    target: Path | None = None
+    temp_target: Path | None = None
+    last_error: requests.exceptions.RequestException | None = None
     try:
-        with session.get(url, stream=True, timeout=(8, 30)) as response:
-            response.raise_for_status()
-            content = response.headers.get("Content-Disposition")
-            try:  # filename from header
-                _, params = cgi.parse_header(content)
-                filename = params["filename"]
-            except Exception:  # filename from url
-                filename = Path(unquote(urlparse(url).path)).name or "paper"
-            filename = os.path.splitext(os.path.basename(filename))[0] + ".pdf"
-            target = save_path / filename
-            with open(target, "wb") as file:
-                for chunk in response.iter_content(chunk_size=chunk_size):
-                    if not chunk:
-                        continue
-                    total_size += len(chunk)
-                    if size_limit and total_size > size_limit:
-                        target.unlink(missing_ok=True)
+        for attempt in range(DOWNLOAD_RETRIES):
+            resume_from = temp_target.stat().st_size if temp_target and temp_target.exists() else 0
+            headers = {"Range": f"bytes={resume_from}-"} if resume_from else None
+            try:
+                with session.get(url, stream=True, timeout=(8, 45), headers=headers) as response:
+                    response.raise_for_status()
+                    if target is None:
+                        target = save_path / _download_filename(url, response)
+                        temp_target = target.with_name(f"{target.name}.part")
+                        resume_from = temp_target.stat().st_size if temp_target.exists() else 0
+                    if resume_from and response.status_code != 206:
+                        temp_target.unlink(missing_ok=True)
+                        resume_from = 0
+                    expected_size = _download_expected_size(response, resume_from)
+                    if size_limit and expected_size and expected_size > size_limit:
+                        temp_target.unlink(missing_ok=True)
                         raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
-                    file.write(chunk)
-            return str(target)
+                    total_size = resume_from
+                    mode = "ab" if resume_from else "wb"
+                    with open(temp_target, mode) as file:
+                        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                            if not chunk:
+                                continue
+                            total_size += len(chunk)
+                            if size_limit and total_size > size_limit:
+                                temp_target.unlink(missing_ok=True)
+                                raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+                            file.write(chunk)
+                    if expected_size and total_size < expected_size:
+                        raise requests.exceptions.ChunkedEncodingError(
+                            f"incomplete download: {total_size} bytes read, {expected_size} expected"
+                        )
+                    temp_target.replace(target)
+                    return str(target)
+            except requests.exceptions.RequestException as exc:
+                last_error = exc
+                if attempt + 1 >= DOWNLOAD_RETRIES:
+                    break
+                time.sleep(0.8 * (attempt + 1))
+        raise last_error or requests.exceptions.ConnectionError("download failed")
     except gr.Error:
         raise
     except requests.exceptions.RequestException as exc:
@@ -118,7 +144,31 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
                 "如果代理不稳定，可以在 config.local.json 中设置 "
                 '"PAPER_AGENT_DOWNLOAD_NO_PROXY": true 后重启，或改用文件上传。'
             )
-        raise gr.Error(f"论文链接下载失败：{exc}。{proxy_hint}") from exc
+        retry_hint = "已自动重试下载但仍失败；可以再次点击生成，或先在浏览器下载 PDF 后使用文件上传。"
+        raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
+
+
+def _download_filename(url: str, response: requests.Response) -> str:
+    content = response.headers.get("Content-Disposition")
+    try:
+        _, params = cgi.parse_header(content)
+        filename = params["filename"]
+    except Exception:
+        filename = Path(unquote(urlparse(url).path)).name or "paper"
+    return os.path.splitext(os.path.basename(filename))[0] + ".pdf"
+
+
+def _download_expected_size(response: requests.Response, resume_from: int) -> int | None:
+    content_range = response.headers.get("Content-Range", "")
+    if "/" in content_range:
+        total = content_range.rsplit("/", 1)[-1].strip()
+        if total.isdigit():
+            return int(total)
+    content_length = response.headers.get("Content-Length")
+    if content_length and content_length.isdigit():
+        length = int(content_length)
+        return resume_from + length if response.status_code == 206 else length
+    return None
 
 
 def stop_summary_file(state: dict) -> None:
