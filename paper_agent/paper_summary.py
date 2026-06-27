@@ -4624,9 +4624,14 @@ def _document_xml(
             body.append(_image_paragraph(source, asset_id, rel_id))
             used_assets.add(asset_id)
 
-    if assets and not used_assets:
+    remaining_assets = [
+        (asset_id, asset)
+        for asset_id, asset in asset_by_id.items()
+        if asset_id not in used_assets
+    ]
+    if remaining_assets:
         body.append(_paragraph("关键图表", "Heading1"))
-        for asset_id, asset in asset_by_id.items():
+        for asset_id, asset in remaining_assets:
             media = media_by_id.get(asset_id)
             if not media:
                 continue
