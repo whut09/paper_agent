@@ -39,6 +39,7 @@ from paper_agent.paper_summary import (
     _paragraph,
     _prompt_patch_context,
     _parse_verification_result,
+    _verification_format_warning,
     _resolve_codex_config,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
@@ -459,6 +460,27 @@ def test_format_guard_blocks_incomplete_report_and_process_preface():
     assert any("required section is too short: 方法主线" in error for error in result.errors)
 
 
+def test_format_guard_does_not_mark_parent_section_empty_when_it_has_children():
+    result = _format_guard(
+        "## 核心信息\n- 标题: Test\n\n"
+        "## 摘要\n这是一段足够长的摘要，用来描述论文提出的问题、方法和实验结论，避免被误判为空章节。\n\n"
+        "## 背景与问题\n这是一段足够长的背景说明，解释任务为什么存在、已有方法的问题以及本文试图解决的具体痛点，确保章节有信息量。\n\n"
+        "## 创新点\n本文围绕方法设计、训练流程和实验验证给出改进，并解释每个改进解决的问题和意义。\n\n"
+        "## 一句话总结\n本文解决了一个具体研究问题并给出可验证的方法。\n\n"
+        "## 方法主线\n"
+        "### 机制流程\n"
+        "方法先分析输入退化，再选择专家工具，最后聚合多个阶段的恢复结果，形成可解释的图像复原流程。\n"
+        "### 关键公式\n"
+        "核心公式用于描述阶段选择和工具调度之间的关系，并约束不同专家输出的融合方式。\n\n"
+        "## 关键结果\n实验结果比较了多个基线、约束条件和退化场景，说明方法在主要指标上取得更稳定的表现。\n\n"
+        "## 深度分析\n论文证据显示主要收益来自分阶段退化建模和专家工具调度，但证据仍集中在有限任务设置中。\n\n"
+        "## 局限\n实验覆盖范围有限，部署复杂度和更多退化组合下的泛化仍需要进一步验证。\n\n"
+        "## 总结\n这篇论文给出了一个围绕退化先验和专家调度的图像复原框架，复现时应重点关注阶段划分和工具选择。"
+    )
+
+    assert "empty required section: 方法主线" not in result.errors
+
+
 def test_knowledge_graph_extracts_research_nodes_and_edges():
     grounding_map = {
         "intro": [{"section_id": "1", "title": "Introduction", "text": "SWE-Agent studies tool-use for GitHub interaction."}],
@@ -585,6 +607,17 @@ def test_verifier_format_error_does_not_block_report():
     assert not _verification_should_block_report(invalid_json)
     assert _verification_should_block_report(unsupported_claim)
     assert _verification_should_block_report(mixed_guard_error)
+
+
+def test_verifier_format_error_is_recorded_as_soft_warning():
+    invalid_json = VerificationResult(False, ["Verifier Agent 输出不是合法 JSON：missing JSON object"])
+
+    result = _verification_format_warning(invalid_json)
+
+    assert result.passed
+    assert not result.errors
+    assert result.soft_warnings[0]["type"] == "verifier_format_warning"
+    assert "missing JSON object" in result.soft_warnings[0]["reason"]
 
 
 def test_verifier_patch_suggestions_apply_one_revision_pass():

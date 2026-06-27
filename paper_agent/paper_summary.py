@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -3433,13 +3434,23 @@ def _asset_reference_mentions_kind(text: str, kind: str) -> bool:
 def _empty_markdown_sections(summary: str) -> list[str]:
     blocks = re.split(r"(?m)(?=^#{1,6}\s+)", summary)
     empty: list[str] = []
-    for block in blocks:
+    for index, block in enumerate(blocks):
         lines = block.splitlines()
         if not lines or not lines[0].startswith("#"):
             continue
         title = lines[0].lstrip("#").strip()
         body = "\n".join(lines[1:]).strip()
-        if not body:
+        level = len(lines[0]) - len(lines[0].lstrip("#"))
+        has_child_section = False
+        for next_block in blocks[index + 1 :]:
+            next_lines = next_block.splitlines()
+            next_heading = next_lines[0].strip() if next_lines else ""
+            if not next_heading.startswith("#"):
+                continue
+            next_level = len(next_heading) - len(next_heading.lstrip("#"))
+            has_child_section = next_level > level
+            break
+        if not body and not has_child_section:
             empty.append(title)
     return empty
 
@@ -3536,7 +3547,23 @@ def _run_verification_agent(
         repaired = _parse_verification_result(repaired_output)
         if not _verification_failed_due_to_format(repaired):
             return repaired
+        return _verification_format_warning(verification)
     return verification
+
+
+def _verification_format_warning(verification: VerificationResult) -> VerificationResult:
+    message = "; ".join(verification.errors) or "Verifier Agent output was not valid JSON."
+    return VerificationResult(
+        True,
+        [],
+        soft_warnings=[
+            {
+                "type": "verifier_format_warning",
+                "claim": "",
+                "reason": message,
+            }
+        ],
+    )
 
 
 def _extract_verifiable_claims(summary: str, limit: int = 24) -> list[dict[str, str]]:
@@ -4076,22 +4103,55 @@ def _chat(
     user_prompt: str,
     system_prompt: str = DEEP_PAPER_NOTE_SYSTEM_PROMPT,
 ) -> str:
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-        )
-    except openai.APIConnectionError as exc:
+    max_attempts = 4
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.2,
+            )
+            content = response.choices[0].message.content or ""
+            return _postprocess_summary(content)
+        except openai.APIStatusError as exc:
+            last_error = exc
+            if not _is_retryable_openai_status(exc) or attempt + 1 >= max_attempts:
+                break
+            time.sleep(_chat_retry_delay(attempt))
+        except openai.APIConnectionError as exc:
+            last_error = exc
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(_chat_retry_delay(attempt))
+    if isinstance(last_error, openai.APIStatusError):
+        raise RuntimeError(_openai_status_error_message(last_error, max_attempts)) from last_error
+    if isinstance(last_error, openai.APIConnectionError):
         raise RuntimeError(
-            "Codex 接口连接失败：服务端断开或网络链路不稳定。程序已默认不继承系统代理；"
-            "如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
-        ) from exc
-    content = response.choices[0].message.content or ""
-    return _postprocess_summary(content)
+            f"Codex 接口连接失败，已重试 {max_attempts} 次仍未成功：服务端断开或网络链路不稳定。"
+            "程序已默认不继承系统代理；如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
+        ) from last_error
+    raise RuntimeError("Codex 接口调用失败：未返回有效响应。")
+
+
+def _is_retryable_openai_status(exc: openai.APIStatusError) -> bool:
+    return int(getattr(exc, "status_code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504}
+
+
+def _chat_retry_delay(attempt: int) -> float:
+    return min(12.0, 1.5 * (2**attempt))
+
+
+def _openai_status_error_message(exc: openai.APIStatusError, attempts: int) -> str:
+    status_code = int(getattr(exc, "status_code", 0) or 0)
+    if status_code == 503:
+        return f"Codex 接口暂时不可用（503 Service Unavailable），已重试 {attempts} 次仍失败，请稍后重试。"
+    if status_code:
+        return f"Codex 接口返回 HTTP {status_code}，已重试 {attempts} 次仍失败：{exc}"
+    return f"Codex 接口请求失败，已重试 {attempts} 次仍失败：{exc}"
 
 
 def _replace_missing_abstract(
