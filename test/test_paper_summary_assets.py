@@ -3,13 +3,11 @@ from tempfile import TemporaryDirectory
 
 import fitz
 
+from paper_agent.agents.contracts import PaperAgentRole
+from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.paper_summary import (
     GenerateReport,
-    PaperAgentRole,
     PaperAsset,
-    PaperWorkflow,
-    PaperWorkflowContext,
-    PaperWorkflowNode,
     TextLine,
     _asset_display_label,
     _apply_verifier_patch_suggestions,
@@ -342,8 +340,8 @@ def test_evidence_guard_fails_ungrounded_claims():
     result = _evidence_guard(
         {
             "claims": [
-                {"claim": "模型显著提升所有数据集表现", "source_section": ""},
-                {"claim": "方法使用 OCR", "source_section": "2"},
+                {"claim": "?????????????", "source_section": ""},
+                {"claim": "???? OCR", "source_section": "2"},
             ]
         }
     )

@@ -1,6 +1,6 @@
 """Graph workflow facade."""
 
-from paper_agent.paper_summary import PaperWorkflow, summarize_paper
+from paper_agent.harness.executor import PaperWorkflow
+from paper_agent.paper_summary import summarize_paper
 
 __all__ = ["PaperWorkflow", "summarize_paper"]
-

@@ -32,17 +32,41 @@ def test_app_facades_import_without_optional_runtime_dependencies():
 
 def test_agent_harness_facades_export_core_objects():
     from paper_agent import paper_summary
+    from paper_agent.harness.context import PaperWorkflowContext as ContextModuleContext
+    from paper_agent.harness.executor import PaperWorkflow as ExecutorModuleWorkflow
+    from paper_agent.harness.node import PaperWorkflowNode as NodeModuleWorkflowNode
 
-    assert PaperWorkflow is paper_summary.PaperWorkflow
-    assert PaperContext is paper_summary.PaperWorkflowContext
-    assert PaperWorkflowContext is paper_summary.PaperWorkflowContext
-    assert PaperWorkflowNode is paper_summary.PaperWorkflowNode
+    assert PaperWorkflow is ExecutorModuleWorkflow
+    assert PaperContext is ContextModuleContext
+    assert PaperWorkflowContext is ContextModuleContext
+    assert PaperWorkflowNode is NodeModuleWorkflowNode
     assert PaperAsset is paper_summary.PaperAsset
     assert VerificationResult is paper_summary.VerificationResult
     assert ParsePaper is paper_summary.ParsePaper
     assert ExtractSections is paper_summary.ExtractSections
     assert SummarizeContribution is paper_summary.SummarizeContribution
     assert VerifyClaims is paper_summary.VerifyClaims
+
+
+def test_paper_summary_does_not_reverse_export_core_harness_classes():
+    from paper_agent import paper_summary
+
+    for name in (
+        "AgentContract",
+        "EXTRACTOR_AGENT_CONTRACT",
+        "HarnessNode",
+        "NodeResult",
+        "PaperAgentRole",
+        "PaperContext",
+        "PaperWorkflow",
+        "PaperWorkflowContext",
+        "PaperWorkflowNode",
+        "READER_AGENT_CONTRACT",
+        "REFLECTOR_AGENT_CONTRACT",
+        "SYNTHESIZER_AGENT_CONTRACT",
+        "VERIFIER_AGENT_CONTRACT",
+    ):
+        assert not hasattr(paper_summary, name)
 
 
 def test_agent_contracts_describe_engineering_boundaries():
