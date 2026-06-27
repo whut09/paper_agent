@@ -8,11 +8,14 @@ from paper_agent.agents import (
     ExtractSections,
     ParsePaper,
     SummarizeContribution,
+    ReviseReport,
     VerifyClaims,
 )
+from paper_agent.harness.policy import GateDecision, GatePolicy
 from paper_agent.evaluation.guards import GUARD_SPECS
 from paper_agent.evaluation.validators import _parse_verification_result
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from paper_agent.harness import NodeResult, PaperContext, PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.memory import get_self_improving_prompt_patches, record_summary_correction
@@ -46,6 +49,7 @@ def test_agent_harness_facades_export_core_objects():
     assert ExtractSections is paper_summary.ExtractSections
     assert SummarizeContribution is paper_summary.SummarizeContribution
     assert VerifyClaims is paper_summary.VerifyClaims
+    assert ReviseReport is paper_summary.ReviseReport
 
 
 def test_paper_summary_does_not_reverse_export_core_harness_classes():
@@ -113,6 +117,27 @@ def test_default_workflow_nodes_bind_agent_contracts():
     assert workflow.nodes["SummarizeContribution"].agent_contract is SYNTHESIZER_AGENT_CONTRACT
     assert workflow.nodes["ExtractMethods"].agent_contract is SYNTHESIZER_AGENT_CONTRACT
     assert workflow.nodes["VerifyClaims"].agent_contract is VERIFIER_AGENT_CONTRACT
+    assert workflow.nodes["ReviseReport"].agent_contract is VERIFIER_AGENT_CONTRACT
+
+
+def test_gate_policy_covers_pass_warn_revise_block():
+    from paper_agent.schemas import VerificationResult
+
+    policy = GatePolicy(max_revision_attempts=2)
+    assert policy.decide(VerificationResult(True)) == GateDecision.PASS
+    assert policy.decide(
+        VerificationResult(
+            True,
+            soft_warnings=[{"type": "weak_evidence", "reason": "single dataset"}],
+        )
+    ) == GateDecision.WARN
+    needs_revision = VerificationResult(
+        False,
+        hard_failures=[{"type": "unsupported_core_claim", "reason": "not grounded"}],
+        patch_suggestions=[{"operation": "delete_claim", "target": "bad claim"}],
+    )
+    assert policy.decide(needs_revision, revision_attempts=0) == GateDecision.REVISE
+    assert policy.decide(needs_revision, revision_attempts=2) == GateDecision.BLOCK
 
 
 def test_memory_and_evaluation_facades_are_callable():
@@ -202,3 +227,90 @@ def test_workflow_records_failed_node_result_before_reraising():
     assert context.node_results["Failing"].errors == ["boom"]
     assert context.agent_trace[-1]["status"] == "failed"
     assert context.agent_trace[-1]["errors"] == ["boom"]
+
+
+def test_workflow_revision_loop_rechecks_after_revise():
+    from paper_agent.schemas import VerificationResult
+
+    class FakeVerify(PaperWorkflowNode):
+        name = "VerifyClaims"
+        produces = ["verification_report"]
+
+        def run(self, context: PaperWorkflowContext):
+            if context.revision_attempts == 0:
+                context.summary = "论文提出了新的数据集 XXX。\n方法使用已有数据集验证。"
+                context.verification = VerificationResult(
+                    False,
+                    hard_failures=[{"type": "unsupported_core_claim", "reason": "not grounded"}],
+                    patch_suggestions=[{"operation": "delete_claim", "target": "论文提出了新的数据集 XXX。"}],
+                )
+            else:
+                context.verification = VerificationResult(True)
+
+    class FinalNode(PaperWorkflowNode):
+        name = "GenerateReport"
+        depends_on = ("ReviseReport",)
+        produces = ["docx"]
+
+        def run(self, context: PaperWorkflowContext):
+            context.chunk_notes.append("generated")
+
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=Path("."),
+        pages=None,
+        summary_language="中文",
+        codex_envs={},
+        max_assets=0,
+    )
+
+    result = PaperWorkflow([FakeVerify(), ReviseReport(), FinalNode()]).run(context)
+
+    assert result.revision_attempts == 1
+    assert "新的数据集 XXX" not in result.summary
+    assert [item["decision"] for item in result.gate_history] == ["revise", "pass"]
+    assert result.chunk_notes == ["generated"]
+
+
+def test_workflow_blocks_after_revision_limit_and_writes_failure_report():
+    from paper_agent.schemas import VerificationResult
+
+    class AlwaysFailVerify(PaperWorkflowNode):
+        name = "VerifyClaims"
+        produces = ["verification_report"]
+
+        def run(self, context: PaperWorkflowContext):
+            context.verification = VerificationResult(
+                False,
+                hard_failures=[{"type": "unsupported_core_claim", "claim": "bad", "reason": "not grounded"}],
+            )
+
+    class FinalNode(PaperWorkflowNode):
+        name = "GenerateReport"
+        depends_on = ("ReviseReport",)
+        produces = ["docx"]
+
+        def run(self, context: PaperWorkflowContext):
+            context.chunk_notes.append("should-not-run")
+
+    with TemporaryDirectory() as temp_dir:
+        context = PaperWorkflowContext(
+            input_path="paper.pdf",
+            output_dir=Path(temp_dir),
+            pages=None,
+            summary_language="中文",
+            codex_envs={},
+            max_assets=0,
+        )
+        context.output = Path(temp_dir)
+        context.paper_name = "paper"
+
+        result = PaperWorkflow([AlwaysFailVerify(), ReviseReport(), FinalNode()]).run(context)
+
+        assert result.gate_decision == "block"
+        assert result.revision_attempts == 2
+        assert result.chunk_notes == []
+        assert result.docx_path is None
+        assert result.verification_failed_path is not None
+        assert result.verification_failed_path.exists()
+        assert "Verifier Agent 未通过" in result.verification_failed_path.read_text(encoding="utf-8")

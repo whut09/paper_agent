@@ -30,6 +30,7 @@ from paper_agent.agents.contracts import (
 from paper_agent.harness.context import PaperWorkflowContext as _PaperWorkflowContext, ProgressCallback as _ProgressCallback
 from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
+from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
 
 _TEXTELLER_FAILED = False
 DEFAULT_MAX_ASSETS = 13
@@ -424,9 +425,54 @@ class VerifyClaims(_PaperWorkflowNode):
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
 
 
+class ReviseReport(_PaperWorkflowNode):
+    name = "ReviseReport"
+    depends_on = ("VerifyClaims",)
+    agent_role = _PaperAgentRole.CRITIC
+    agent_contract = _VERIFIER_AGENT_CONTRACT
+    requires = ["verification_report", "draft_report"]
+    produces = ["gate_decision", "verified_report", "verification-failed.md"]
+
+    def run(self, context: _PaperWorkflowContext) -> _NodeResult:
+        if context.verification is None:
+            raise ValueError("ReviseReport requires a verification report.")
+        policy = _GatePolicy()
+        decision = policy.decide(context.verification, context.revision_attempts)
+        context.gate_decision = decision.value
+        context.gate_history.append(
+            {
+                "attempt": context.revision_attempts,
+                "decision": decision.value,
+                "hard_failures": len(context.verification.hard_failures),
+                "soft_warnings": len(context.verification.soft_warnings),
+                "patch_suggestions": len(context.verification.patch_suggestions),
+            }
+        )
+        if decision == _GateDecision.REVISE:
+            return _revise_report_once(context)
+        if decision == _GateDecision.BLOCK:
+            context.verification_failed_path = _write_verification_failed_report(context)
+            return _NodeResult(
+                status="failed",
+                outputs={"gate_decision": decision.value},
+                artifacts=[str(context.verification_failed_path)],
+                errors=_verification_failure_details(context.verification).splitlines(),
+                warnings=_verification_warning_messages(context.verification),
+                metrics={"revision_attempts": context.revision_attempts},
+            )
+        warnings = _verification_warning_messages(context.verification)
+        status = "warning" if decision == _GateDecision.WARN or warnings else "success"
+        return _NodeResult(
+            status=status,
+            outputs={"gate_decision": decision.value, "verified_report": context.summary[:240]},
+            warnings=warnings,
+            metrics={"revision_attempts": context.revision_attempts},
+        )
+
+
 class GenerateReport(_PaperWorkflowNode):
     name = "GenerateReport"
-    depends_on = ("VerifyClaims",)
+    depends_on = ("ReviseReport",)
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
     requires = ["verified_report", "asset_manifest"]
@@ -532,6 +578,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "run_id": context.run_id,
                 "paper_name": context.paper_name,
                 "source_path": str(context.source_path) if context.source_path else "",
+                "gate_decision": context.gate_decision,
+                "gate_history": list(context.gate_history),
                 "nodes": trace,
             },
             ensure_ascii=False,
@@ -547,6 +595,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         json.dumps(
             {
                 "run_id": context.run_id,
+                "gate_decision": context.gate_decision,
+                "gate_history": list(context.gate_history),
                 "verification": _verification_payload(context.verification),
                 "guards": [_guard_payload(result) for result in context.guard_results],
             },
@@ -628,7 +678,10 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "draft_report": context.summary,
         "verified_report": context.summary,
         "verification_report": context.verification,
+        "gate_decision": context.gate_decision,
+        "gate_history": context.gate_history,
         "docx": context.docx_path,
+        "verification-failed.md": context.verification_failed_path,
         "grounding_map.json": context.grounding_map_path,
         "verification.json": context.verification_path,
         "knowledge_graph.json": context.knowledge_graph_path,
@@ -667,6 +720,8 @@ def _node_artifacts_snapshot(node: _PaperWorkflowNode, context: _PaperWorkflowCo
         artifacts.extend(str(asset.path) for asset in context.assets if asset.path)
     if "docx" in node.produces and context.docx_path:
         artifacts.append(str(context.docx_path))
+    if "verification-failed.md" in node.produces and context.verification_failed_path:
+        artifacts.append(str(context.verification_failed_path))
     if "trace.json" in node.produces and context.trace_path:
         artifacts.append(str(context.trace_path))
     if "grounding_map.json" in node.produces and context.grounding_map_path:
@@ -703,6 +758,8 @@ def summarize_paper(
     )
     result = (workflow or _PaperWorkflow.default()).run(context)
     if result.docx_path is None:
+        if result.verification_failed_path is not None:
+            return str(result.verification_failed_path)
         raise RuntimeError("Paper workflow finished without generating a report.")
     return str(result.docx_path)
 
@@ -2670,40 +2727,10 @@ def _verify_summary_claims(
         correction_memories or [],
         prompt_patches,
     )
-    if verification.patch_suggestions:
-        verification.revision_attempted = True
-        revised_summary = _apply_verifier_patch_suggestions(summary, verification.patch_suggestions)
-        if revised_summary != summary:
-            summary = _postprocess_summary(revised_summary)
-            summary = _normalize_final_sections(summary)
-            summary = _enforce_core_original_title(summary, paper_title)
-            summary = _ensure_asset_markers(summary, assets)
-            claims = _extract_verifiable_claims(summary)
-            grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
-            guard_results = _run_harness_guards(
-                summary,
-                grounded_map,
-                assets,
-                paper_title,
-                correction_memories or [],
-            )
-            verification = _run_verification_agent(
-                client,
-                model,
-                paper_text,
-                grounded_map,
-                correction_memories or [],
-                prompt_patches,
-            )
-            verification.revision_attempted = True
-            verification.revision_applied = True
     guard_errors = _blocking_guard_errors(guard_results)
     if guard_errors:
         _add_guard_failures_to_verification(verification, guard_errors)
         verification.passed = False
-    if _verification_should_block_report(verification):
-        details = _verification_failure_details(verification)
-        raise RuntimeError(f"Verifier Agent 未通过，已停止生成报告：\n{details}")
     return summary, verification, guard_results
 
 
@@ -2776,6 +2803,83 @@ def _verification_warning_messages(verification: VerificationResult) -> list[str
     elif verification.revision_attempted and verification.patch_suggestions:
         warnings.append("Verifier revision loop could not apply patch suggestions automatically")
     return warnings
+
+
+def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
+    if context.verification is None:
+        raise ValueError("Revision requires a verification report.")
+    context.verification.revision_attempted = True
+    context.revision_attempts += 1
+    revised_summary = _apply_verifier_patch_suggestions(
+        context.summary,
+        context.verification.patch_suggestions,
+    )
+    if revised_summary != context.summary:
+        context.summary = _postprocess_summary(revised_summary)
+        context.summary = _normalize_final_sections(context.summary)
+        context.summary = _enforce_core_original_title(context.summary, context.paper_title)
+        context.summary = _ensure_asset_markers(context.summary, context.assets)
+        context.verification.revision_applied = True
+    return _NodeResult(
+        status="warning",
+        outputs={
+            "gate_decision": _GateDecision.REVISE.value,
+            "revision_attempt": context.revision_attempts,
+        },
+        warnings=[
+            f"Verifier requested revision attempt {context.revision_attempts}/2",
+            *_verification_warning_messages(context.verification),
+        ],
+        metrics={"revision_attempts": context.revision_attempts},
+    )
+
+
+def _write_verification_failed_report(context: _PaperWorkflowContext) -> Path:
+    if context.output is None:
+        raise ValueError("Verification failure report requires an output directory.")
+    paper_name = context.paper_name or Path(context.input_path).stem or "paper"
+    path = context.output / f"{paper_name}-verification-failed.md"
+    verification = context.verification
+    lines = [
+        "# Verifier Agent 未通过",
+        "",
+        f"- run_id: {context.run_id}",
+        f"- paper: {paper_name}",
+        f"- revision_attempts: {context.revision_attempts}",
+        f"- gate_decision: {_GateDecision.BLOCK.value}",
+        "",
+        "## Hard Failures",
+    ]
+    if verification and verification.hard_failures:
+        for failure in verification.hard_failures:
+            failure_type = failure.get("type", "hard_failure")
+            claim = failure.get("claim", "")
+            reason = failure.get("reason", "") or failure.get("message", "")
+            lines.append(f"- **{failure_type}**: {reason}")
+            if claim:
+                lines.append(f"  - claim: {claim}")
+    elif verification:
+        lines.extend(f"- {error}" for error in verification.errors)
+    else:
+        lines.append("- verification report is not available")
+    lines.extend(["", "## Soft Warnings"])
+    if verification and verification.soft_warnings:
+        for warning in verification.soft_warnings:
+            warning_type = warning.get("type", "soft_warning")
+            claim = warning.get("claim", "")
+            reason = warning.get("reason", "") or warning.get("message", "")
+            lines.append(f"- **{warning_type}**: {reason}")
+            if claim:
+                lines.append(f"  - claim: {claim}")
+    else:
+        lines.append("- none")
+    lines.extend(["", "## Patch Suggestions"])
+    if verification and verification.patch_suggestions:
+        lines.extend(f"- `{item.get('operation', 'patch')}`: {item.get('target', '')}" for item in verification.patch_suggestions)
+    else:
+        lines.append("- none")
+    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return path
 
 
 def _apply_verifier_patch_suggestions(summary: str, suggestions: list[dict[str, str]]) -> str:
@@ -3531,7 +3635,7 @@ def _parse_verification_result(output: str) -> VerificationResult:
 
 
 def _verification_should_block_report(result: VerificationResult) -> bool:
-    return bool(result.hard_failures) and not _verification_failed_due_to_format(result)
+    return _GatePolicy().decide(result, revision_attempts=2) == _GateDecision.BLOCK
 
 
 def _verification_failed_due_to_format(result: VerificationResult) -> bool:
@@ -4156,12 +4260,18 @@ def _target_section_for_asset(asset: PaperAsset) -> str:
     return "方法主线"
 
 
-def _write_docx(path: Path, paper_filename: str, summary: str, assets: list[PaperAsset]) -> None:
+def _write_docx(
+    path: Path,
+    paper_filename: str,
+    summary: str,
+    assets: list[PaperAsset],
+    verification_warnings: list[str] | None = None,
+) -> None:
     media_files = [
         (asset.path, f"image{i + 1}.png", f"rId{i + 4}")
         for i, asset in enumerate(assets)
     ]
-    document_xml = _document_xml(paper_filename, summary, assets, media_files)
+    document_xml = _document_xml(paper_filename, summary, assets, media_files, verification_warnings or [])
     rels_xml = _document_rels(media_files)
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as docx:
@@ -4184,6 +4294,7 @@ def _document_xml(
     summary: str,
     assets: list[PaperAsset],
     media_files: list[tuple[Path, str, str]],
+    verification_warnings: list[str] | None = None,
 ) -> str:
     summary = _normalize_final_sections(_postprocess_summary(summary))
     body = [
@@ -4262,6 +4373,11 @@ def _document_xml(
             body.append(_paragraph(_asset_reference_sentence(label), "AssetLead"))
             body.append(_image_paragraph(source, asset_id, rel_id))
             used_assets.add(asset_id)
+
+    if verification_warnings:
+        body.append(_paragraph("附录：Verifier Warnings", "Heading1"))
+        for warning in verification_warnings:
+            body.append(_paragraph(_normalize_markdown_line(warning), None))
 
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"

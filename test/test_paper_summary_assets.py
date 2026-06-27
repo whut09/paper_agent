@@ -20,6 +20,7 @@ from paper_agent.paper_summary import (
     _caption_text_and_rect,
     _asset_guard,
     _correction_memory_context,
+    _document_xml,
     _evidence_guard,
     _ensure_asset_markers,
     _enforce_core_original_title,
@@ -127,6 +128,7 @@ def test_default_workflow_declares_multi_agent_roles():
     assert roles["SummarizeContribution"] == PaperAgentRole.SYNTHESIZER
     assert roles["ExtractMethods"] == PaperAgentRole.SYNTHESIZER
     assert roles["VerifyClaims"] == PaperAgentRole.CRITIC
+    assert roles["ReviseReport"] == PaperAgentRole.CRITIC
     assert roles["GenerateReport"] == PaperAgentRole.SYNTHESIZER
 
 
@@ -499,6 +501,19 @@ def test_verifier_soft_warnings_do_not_block_report():
     assert warning_only.passed
     assert warning_only.soft_warnings
     assert not _verification_should_block_report(warning_only)
+
+
+def test_docx_document_xml_appends_verifier_warnings():
+    xml = _document_xml(
+        "paper.pdf",
+        "# 测试论文\n## 方法主线\n方法描述。",
+        [],
+        [],
+        ["weak_evidence: 原文只有单数据集实验"],
+    )
+
+    assert "附录：Verifier Warnings" in xml
+    assert "weak_evidence: 原文只有单数据集实验" in xml
 
 
 def test_verifier_format_error_does_not_block_report():

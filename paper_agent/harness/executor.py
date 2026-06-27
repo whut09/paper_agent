@@ -26,6 +26,7 @@ class PaperWorkflow:
             GenerateReport,
             ParsePaper,
             PreparePaper,
+            ReviseReport,
             SummarizeContribution,
             VerifyClaims,
         )
@@ -38,6 +39,7 @@ class PaperWorkflow:
                 SummarizeContribution(),
                 ExtractMethods(),
                 VerifyClaims(),
+                ReviseReport(),
                 GenerateReport(),
             ]
         )
@@ -82,7 +84,16 @@ class PaperWorkflow:
                     if "trace.json" in node.produces:
                         _write_harness_sidecars(context)
                     pending.remove(name)
-                    completed.add(name)
+                    if name == "ReviseReport" and context.gate_decision == "revise":
+                        completed.discard("VerifyClaims")
+                        pending.update({"VerifyClaims", "ReviseReport"})
+                    elif name == "ReviseReport" and context.gate_decision == "block":
+                        _write_harness_sidecars(context)
+                        pending.clear()
+                        completed.add(name)
+                        break
+                    else:
+                        completed.add(name)
             return context
         finally:
             context.close()

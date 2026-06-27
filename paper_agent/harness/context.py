@@ -51,9 +51,13 @@ class PaperWorkflowContext:
     summary: str = ""
     verification: Any | None = None
     guard_results: list[Any] = field(default_factory=list)
+    gate_decision: str = ""
+    gate_history: list[dict[str, Any]] = field(default_factory=list)
+    revision_attempts: int = 0
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
+    verification_failed_path: Path | None = None
     trace_path: Path | None = None
     grounding_map_path: Path | None = None
     verification_path: Path | None = None

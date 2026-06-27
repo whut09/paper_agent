@@ -23,6 +23,7 @@ _LAZY_EXPORTS = {
     "ExtractMethods": "paper_agent.agents.synthesizer",
     "GenerateReport": "paper_agent.agents.synthesizer",
     "SummarizeContribution": "paper_agent.agents.synthesizer",
+    "ReviseReport": "paper_agent.agents.verifier",
     "VerifyClaims": "paper_agent.agents.verifier",
 }
 
@@ -48,6 +49,7 @@ __all__ = [
     "PreparePaper",
     "READER_AGENT_CONTRACT",
     "REFLECTOR_AGENT_CONTRACT",
+    "ReviseReport",
     "SYNTHESIZER_AGENT_CONTRACT",
     "SummarizeContribution",
     "VERIFIER_AGENT_CONTRACT",
