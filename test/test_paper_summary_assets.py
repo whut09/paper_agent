@@ -160,6 +160,27 @@ def test_summarize_paper_accepts_custom_workflow():
     assert result == "custom-summary.docx"
 
 
+def test_summarize_paper_raises_when_verifier_blocks_report():
+    class BlockedWorkflow:
+        def run(self, context):
+            context.output = Path(context.output_dir)
+            context.output.mkdir(parents=True, exist_ok=True)
+            context.verification_failed_path = context.output / "paper-verification-failed.md"
+            context.verification_failed_path.write_text("blocked", encoding="utf-8")
+            return context
+
+    with TemporaryDirectory() as tmp:
+        try:
+            summarize_paper("paper.pdf", Path(tmp), workflow=BlockedWorkflow())
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("Expected blocked verification to raise")
+
+    assert "Verifier Agent 未通过" in message
+    assert "verification-failed.md" in message
+
+
 def test_generate_report_writes_knowledge_graph_sidecar():
     with TemporaryDirectory() as tmp:
         context = workflow_context()

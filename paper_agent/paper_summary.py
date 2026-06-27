@@ -793,7 +793,14 @@ def summarize_paper(
     result = (workflow or _PaperWorkflow.default()).run(context)
     if result.docx_path is None:
         if result.verification_failed_path is not None:
-            return str(result.verification_failed_path)
+            details = ""
+            if result.verification is not None:
+                details = _verification_failure_details(result.verification)
+            report_hint = f"\n失败详情已写入：{result.verification_failed_path}"
+            message = "Verifier Agent 未通过，已停止生成 Word 报告。"
+            if details:
+                message = f"{message}\n{details}"
+            raise RuntimeError(f"{message}{report_hint}")
         raise RuntimeError("Paper workflow finished without generating a report.")
     return str(result.docx_path)
 
