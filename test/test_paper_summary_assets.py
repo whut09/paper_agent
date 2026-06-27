@@ -5,6 +5,7 @@ import fitz
 
 from paper_agent.agents.contracts import PaperAgentRole
 from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
+from paper_agent.schemas.evidence import EvidenceMap
 from paper_agent.paper_summary import (
     GenerateReport,
     PaperAsset,
@@ -312,9 +313,11 @@ Experiments compare the agent on multimodal QA benchmarks and ablation studies.
 
     grounding_map = _build_grounding_map(paper_text)
 
+    assert isinstance(grounding_map, EvidenceMap)
     assert grounding_map["intro"][0]["section_id"] == "1"
     assert grounding_map["method"][0]["section_id"] == "2"
     assert grounding_map["experiments"][0]["section_id"] == "3"
+    assert grounding_map["evidence"][0]["id"].startswith("evidence-intro")
 
 
 def test_grounding_map_attaches_claim_source_section():
@@ -336,20 +339,24 @@ def test_grounding_map_attaches_claim_source_section():
 
     assert grounded["claims"][0]["source_section"] == "2"
     assert grounded["claims"][0]["source_title"] == "Method"
+    assert grounded["claims"][0]["evidence_ids"]
+    assert grounded["claim_groundings"][0]["evidence_ids"] == grounded["claims"][0]["evidence_ids"]
 
 
 def test_evidence_guard_fails_ungrounded_claims():
     result = _evidence_guard(
         {
             "claims": [
-                {"claim": "?????????????", "source_section": ""},
-                {"claim": "???? OCR", "source_section": "2"},
+                {"claim": "模型显著提升所有数据集表现", "core": True, "evidence_ids": []},
+                {"claim": "方法使用 OCR", "core": True, "evidence_ids": ["evidence-method-2"]},
+                {"claim": "非核心背景描述", "core": False, "evidence_ids": []},
             ]
         }
     )
 
     assert result.status == "failed"
     assert result.metrics["ungrounded_count"] == 1
+    assert "evidence_ids" in result.errors[0]
 
 
 def test_asset_guard_fails_invalid_and_mismatched_assets():

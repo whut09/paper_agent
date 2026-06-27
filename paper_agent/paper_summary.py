@@ -31,6 +31,7 @@ from paper_agent.harness.context import PaperWorkflowContext as _PaperWorkflowCo
 from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
 from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
+from paper_agent.schemas.evidence import Claim as _Claim, ClaimGrounding as _ClaimGrounding, Evidence as _Evidence, EvidenceMap as _EvidenceMap
 
 _TEXTELLER_FAILED = False
 DEFAULT_MAX_ASSETS = 13
@@ -2929,9 +2930,9 @@ def _guard_result(
 def _evidence_guard(grounded_map: dict[str, list[dict[str, str]]]) -> GuardResult:
     claims = grounded_map.get("claims", [])
     errors = [
-        f"claim_{index} lacks direct evidence: {claim.get('claim', '')[:120]}"
+        f"claim_{index} lacks evidence_ids: {claim.get('claim', claim.get('text', ''))[:120]}"
         for index, claim in enumerate(claims, 1)
-        if not claim.get("source_section")
+        if bool(claim.get("core", True)) and not claim.get("evidence_ids")
     ]
     return _guard_result(
         "Evidence Guard",
@@ -3142,35 +3143,22 @@ def _run_verification_agent(
             ],
         )
 
-    evidence = _verification_evidence_text(paper_text, grounding_map)
+    evidence_payload = _verification_evidence_text(paper_text, grounding_map)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
     evaluation_patch = _prompt_patch_context(patches, "evaluation")
     prompt = (
-        "你是论文总结 Verifier Agent。你的任务不是润色总结，而是判断总结中的关键 claim 是否被原文证据支持。\n\n"
-        "必须遵守：\n"
-        "1. claim 必须能在原文证据中找到直接支持，不能靠常识或猜测补全。\n"
-        "2. method / 方法相关 claim 必须能在 method、approach、model、training、algorithm、implementation 等方法相关段落中找到依据。\n"
-        "3. contribution / 创新点相关 claim 不能新增原文没有声明的贡献、能力、数据集、指标或应用场景。\n"
-        "4. 每个 claim 已带有 source_section/source_title；如果 source_section 为空、指向错误章节，或 method claim 没有落在 method bucket，也必须报错。\n"
-        "5. 只输出 JSON，不要输出 Markdown，不要解释过程。\n\n"
-        "输出格式：\n"
-        "{\"pass\": true/false, \"errors\": [\"具体错误1\", \"具体错误2\"]}\n\n"
-        f"历史用户修正规则：\n{memory_context}\n\n"
-        f"自优化评估 Rubric：\n{evaluation_patch}\n\n"
-        f"Grounding Map：\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
-    )
-    prompt = (
         "You are the Verifier Agent for a paper-understanding harness. "
-        "Your job is not to polish the report; your job is to decide whether every important claim is grounded.\n\n"
+        "Your job is not to polish the report; your job is to decide whether every structured Claim is grounded by Evidence.\n\n"
         "Gate policy:\n"
-        "1. A claim must have direct support in the grounding map. Do not use common sense to fill gaps.\n"
-        "2. Method claims must be supported by method/approach/model/training/algorithm/implementation evidence.\n"
-        "3. Contribution claims must not invent datasets, metrics, capabilities, applications, or novelty not stated in the paper.\n"
-        "4. Weak or narrow evidence should be a soft warning, not a hard failure.\n"
-        "5. If a claim can be repaired safely, add a patch suggestion. Prefer delete_claim for unsupported additions.\n"
-        "6. Output JSON only. Do not output Markdown.\n\n"
+        "1. Each core Claim must have at least one evidence_id that points to an Evidence item.\n"
+        "2. A Claim must have direct support in its linked Evidence text. Do not use common sense to fill gaps.\n"
+        "3. Method claims must be supported by method/approach/model/training/algorithm/implementation Evidence.\n"
+        "4. Contribution claims must not invent datasets, metrics, capabilities, applications, or novelty not stated in the paper.\n"
+        "5. Weak or narrow evidence should be a soft warning, not a hard failure.\n"
+        "6. If a claim can be repaired safely, add a patch suggestion. Prefer delete_claim for unsupported additions.\n"
+        "7. Output JSON only. Do not output Markdown.\n\n"
         "Required JSON schema:\n"
         "{\n"
         "  \"passed\": true/false,\n"
@@ -3186,7 +3174,7 @@ def _run_verification_agent(
         "}\n\n"
         f"User correction memory:\n{memory_context}\n\n"
         f"Self-improving evaluation rubric:\n{evaluation_patch}\n\n"
-        f"Grounding Map:\n{json.dumps(evidence, ensure_ascii=False, indent=2)}"
+        f"Claim/Evidence payload:\n{json.dumps(evidence_payload, ensure_ascii=False, indent=2)}"
     )
     output = _chat(
         client,
@@ -3238,46 +3226,55 @@ def _extract_verifiable_claims(summary: str, limit: int = 24) -> list[dict[str, 
         for sentence in _split_claim_sentences(normalized):
             if not _claim_is_verifiable(sentence):
                 continue
+            claim_id = f"claim-{len(claims) + 1}"
             claims.append(
-                {
-                    "section": current_section or "正文",
-                    "type": _claim_type(current_section, sentence),
-                    "claim": sentence,
-                }
+                _Claim(
+                    id=claim_id,
+                    section=current_section or "正文",
+                    type=_claim_type(current_section, sentence),
+                    text=sentence,
+                    core=True,
+                ).to_dict()
             )
             if len(claims) >= limit:
                 return claims
     return claims
 
 
-def _build_grounding_map(paper_text: str) -> dict[str, list[dict[str, str]]]:
+def _build_grounding_map(paper_text: str) -> _EvidenceMap:
     sections = _extract_grounding_sections(paper_text)
-    result: dict[str, list[dict[str, str]]] = {
-        "intro": [],
-        "method": [],
-        "experiments": [],
-        "claims": [],
-    }
+    result = _EvidenceMap()
+    evidence_items: list[dict[str, str]] = []
     for section in sections:
         bucket = section.category if section.category in result else ""
         if not bucket:
             continue
-        result[bucket].append(
-            {
-                "section_id": section.section_id,
-                "title": section.title,
-                "text": section.text[:5000],
-            }
-        )
+        evidence = _Evidence(
+            id=_evidence_id(section.category, section.section_id, len(evidence_items) + 1),
+            section_id=section.section_id,
+            title=section.title,
+            category=section.category,
+            text=section.text[:5000],
+        ).to_dict()
+        evidence_items.append(evidence)
+        result[bucket].append(evidence)
     if not any(result[key] for key in ("intro", "method", "experiments")) and paper_text.strip():
-        result["intro"].append(
-            {
-                "section_id": "document",
-                "title": "Document",
-                "text": paper_text[:5000],
-            }
-        )
+        evidence = _Evidence(
+            id="evidence-document",
+            section_id="document",
+            title="Document",
+            category="intro",
+            text=paper_text[:5000],
+        ).to_dict()
+        result["intro"].append(evidence)
+        evidence_items.append(evidence)
+    result["evidence"] = evidence_items
     return result
+
+
+def _evidence_id(category: str, section_id: str, fallback_index: int) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9]+", "-", section_id or str(fallback_index)).strip("-").lower()
+    return f"evidence-{category}-{normalized or fallback_index}"
 
 
 def _extract_grounding_sections(paper_text: str) -> list[GroundingSection]:
@@ -3334,22 +3331,70 @@ def _grounding_section_category(title: str) -> str:
 def _attach_claims_to_grounding_map(
     grounding_map: dict[str, list[dict[str, str]]],
     claims: list[dict[str, str]],
-) -> dict[str, list[dict[str, str]]]:
-    result = {key: [dict(item) for item in value] for key, value in grounding_map.items()}
+) -> _EvidenceMap:
+    result = _EvidenceMap.coerce(grounding_map)
+    result["evidence"] = _ensure_evidence_items(result)
+    evidence_ids_by_section = {
+        (item.get("category", ""), item.get("section_id", "")): item.get("id", "")
+        for item in result["evidence"]
+    }
+    for bucket in ("intro", "method", "experiments"):
+        for index, section in enumerate(result.get(bucket, []), 1):
+            section.setdefault("category", bucket)
+            section.setdefault(
+                "id",
+                evidence_ids_by_section.get((bucket, section.get("section_id", "")))
+                or _evidence_id(bucket, section.get("section_id", ""), index),
+            )
     result.setdefault("claims", [])
+    result.setdefault("claim_groundings", [])
     source_sections = [
         section
         for key in ("intro", "method", "experiments")
         for section in result.get(key, [])
     ]
     result["claims"] = []
+    result["claim_groundings"] = []
     for claim in claims:
-        source = _best_source_section_for_claim(claim.get("claim", ""), source_sections)
-        grounded = dict(claim)
+        claim_text = claim.get("claim", claim.get("text", ""))
+        claim_id = claim.get("id") or f"claim-{len(result['claims']) + 1}"
+        source = _best_source_section_for_claim(claim_text, source_sections)
+        evidence_ids = [source.get("id", "")] if source and source.get("id") else []
+        grounded = _Claim(
+            id=claim_id,
+            text=claim_text,
+            section=claim.get("section", ""),
+            type=claim.get("type", "claim"),
+            core=bool(claim.get("core", True)),
+            evidence_ids=evidence_ids,
+        ).to_dict()
         grounded["source_section"] = source.get("section_id", "") if source else ""
         grounded["source_title"] = source.get("title", "") if source else ""
         result["claims"].append(grounded)
+        result["claim_groundings"].append(
+            _ClaimGrounding(
+                claim_id=claim_id,
+                evidence_ids=evidence_ids,
+                source_section=grounded["source_section"],
+                source_title=grounded["source_title"],
+                score=1.0 if evidence_ids else 0.0,
+            ).to_dict()
+        )
     return result
+
+
+def _ensure_evidence_items(grounding_map: dict[str, list[dict[str, str]]]) -> list[dict[str, str]]:
+    existing = [dict(item) for item in grounding_map.get("evidence", [])]
+    if existing:
+        return existing
+    evidence_items: list[dict[str, str]] = []
+    for bucket in ("intro", "method", "experiments"):
+        for index, section in enumerate(grounding_map.get(bucket, []), 1):
+            evidence = dict(section)
+            evidence.setdefault("category", bucket)
+            evidence.setdefault("id", _evidence_id(bucket, evidence.get("section_id", ""), index))
+            evidence_items.append(evidence)
+    return evidence_items
 
 
 def _build_knowledge_graph(
@@ -3556,7 +3601,8 @@ def _verification_evidence_text(
     grounding_map: dict[str, list[dict[str, str]]] | None = None,
     max_chars: int = 24000,
 ) -> dict[str, object]:
-    grounding_map = grounding_map or _build_grounding_map(paper_text)
+    grounding_map = _EvidenceMap.coerce(grounding_map or _build_grounding_map(paper_text))
+    evidence_items = _ensure_evidence_items(grounding_map)
     chunks = _chunk_text(paper_text, max_chars // 3)
     fallback = paper_text if len(paper_text) <= max_chars else ""
     if not fallback:
@@ -3565,10 +3611,14 @@ def _verification_evidence_text(
         result = _section_window_for_verifier(paper_text, ("experiment", "evaluation", "result", "ablation", "analysis"))
         fallback = "\n\n".join(part for part in (head, method, result) if part)[:max_chars]
     return {
-        "intro": grounding_map.get("intro", []),
-        "method": grounding_map.get("method", []),
-        "experiments": grounding_map.get("experiments", []),
         "claims": grounding_map.get("claims", []),
+        "evidence": evidence_items,
+        "claim_groundings": grounding_map.get("claim_groundings", []),
+        "sections": {
+            "intro": grounding_map.get("intro", []),
+            "method": grounding_map.get("method", []),
+            "experiments": grounding_map.get("experiments", []),
+        },
         "fallback_evidence": fallback,
     }
 
