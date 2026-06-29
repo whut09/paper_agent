@@ -33,6 +33,7 @@ from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
 from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
 from paper_agent.schemas.evidence import Claim as _Claim, ClaimGrounding as _ClaimGrounding, Evidence as _Evidence, EvidenceMap as _EvidenceMap
+from paper_agent.skill_prompts import load_paper_skill_reference
 
 _TEXTELLER_FAILED = False
 DEFAULT_MAX_ASSETS = 13
@@ -60,7 +61,6 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 11. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
 """
 
-SYNTHESIZER_SYSTEM_PROMPT = DEEP_PAPER_NOTE_SYSTEM_PROMPT
 CRITIC_SYSTEM_PROMPT = (
     "You are the Critic agent in a research-paper multi-agent pipeline. "
     "You verify paper-summary claims against structured grounding evidence. "
@@ -139,6 +139,16 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 - 除 `## 核心信息` 外，不要让大多数行以 `-` 开头。
 - 原文没有提及的字段、章节和小节直接省略；不要输出“原文未明确说明”“未提及”“未知”“N/A”等占位内容。
 """
+
+
+SYNTHESIZER_SYSTEM_PROMPT = load_paper_skill_reference(
+    "summary-system-prompt.md",
+    DEEP_PAPER_NOTE_SYSTEM_PROMPT,
+)
+FINAL_NOTE_PROMPT = load_paper_skill_reference(
+    "final-note-prompt.md",
+    FINAL_NOTE_PROMPT,
+)
 
 
 @dataclass

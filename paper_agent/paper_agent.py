@@ -213,6 +213,23 @@ def create_parser() -> argparse.ArgumentParser:
 
 def parse_args(args: Optional[List[str]]) -> argparse.Namespace:
     raw_args = sys.argv[1:] if args is None else args
+    if raw_args and raw_args[0] == "summarize":
+        summarize_parser = argparse.ArgumentParser(description="Generate a grounded PaperAgent Word summary.")
+        summarize_parser.add_argument("command", choices=["summarize"])
+        summarize_parser.add_argument("file", help="Path to a PDF, DOC, or DOCX paper.")
+        summarize_parser.add_argument("--output", "-o", default="paper_agent_files", help="Output directory.")
+        summarize_parser.add_argument("--config", type=str, help="config file.")
+        summarize_parser.add_argument("--pages", "-p", type=str, help="The list of page numbers to summarize.")
+        summarize_parser.add_argument("--summary-language", default="中文", help="Summary language.")
+        summarize_parser.add_argument("--max-assets", type=int, default=None, help="Maximum number of figure/table/formula assets.")
+        parsed = summarize_parser.parse_args(args=raw_args)
+        if parsed.pages:
+            parsed.raw_pages = parsed.pages
+            parsed.pages = _parse_page_ranges(parsed.pages)
+        else:
+            parsed.raw_pages = ""
+            parsed.pages = None
+        return parsed
     if raw_args and raw_args[0] == "eval":
         eval_parser = argparse.ArgumentParser(description="Run PaperAgent evaluation harness.")
         eval_parser.add_argument("command", choices=["eval"])
@@ -238,17 +255,24 @@ def parse_args(args: Optional[List[str]]) -> argparse.Namespace:
     parsed_args = create_parser().parse_args(args=raw_args)
 
     if parsed_args.pages:
-        pages = []
-        for p in parsed_args.pages.split(","):
-            if "-" in p:
-                start, end = p.split("-")
-                pages.extend(range(int(start) - 1, int(end)))
-            else:
-                pages.append(int(p) - 1)
         parsed_args.raw_pages = parsed_args.pages
-        parsed_args.pages = pages
+        parsed_args.pages = _parse_page_ranges(parsed_args.pages)
 
     return parsed_args
+
+
+def _parse_page_ranges(value: str) -> list[int]:
+    pages = []
+    for p in value.split(","):
+        p = p.strip()
+        if not p:
+            continue
+        if "-" in p:
+            start, end = p.split("-")
+            pages.extend(range(int(start) - 1, int(end)))
+        else:
+            pages.append(int(p) - 1)
+    return pages
 
 
 def find_all_files_in_directory(directory_path):
@@ -307,6 +331,27 @@ def main(args: Optional[List[str]] = None) -> int:
 
     if getattr(parsed_args, "command", "") == "memory":
         return _memory_cli(parsed_args)
+
+    if getattr(parsed_args, "command", "") == "summarize":
+        from paper_agent.config import ConfigManager
+        from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
+        from paper_agent.harness.workflow import summarize_paper
+
+        output_path = summarize_paper(
+            parsed_args.file,
+            parsed_args.output,
+            pages=parsed_args.pages,
+            summary_language=parsed_args.summary_language,
+            codex_envs={
+                "CODEX_BASE_URL": str(ConfigManager.get("CODEX_BASE_URL", "")),
+                "CODEX_API_KEY": str(ConfigManager.get("CODEX_API_KEY", "")),
+                "CODEX_MODEL": str(ConfigManager.get("CODEX_MODEL", "")),
+                "CODEX_USE_PROXY": str(ConfigManager.get("CODEX_USE_PROXY", "")),
+            },
+            max_assets=parsed_args.max_assets or DEFAULT_MAX_ASSETS,
+        )
+        print(output_path)
+        return 0
 
     if parsed_args.interactive:
         from paper_agent.gui import setup_gui

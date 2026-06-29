@@ -24,6 +24,7 @@ from tencentcloud.tmt.v20180321.tmt_client import TmtClient
 
 from paper_agent.cache import TranslationCache
 from paper_agent.config import ConfigManager
+from paper_agent.skill_prompts import load_paper_skill_reference
 
 
 from tenacity import retry, retry_if_exception_type
@@ -31,6 +32,8 @@ from tenacity import stop_after_attempt
 from tenacity import wait_exponential
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_TRANSLATION_PROMPT = load_paper_skill_reference("translation-prompt.md")
 
 
 def remove_control_characters(s):
@@ -127,6 +130,20 @@ class BaseTranslator:
             pass
         except Exception:
             logging.exception("Error parsing prompt, use the default prompt.")
+
+        if DEFAULT_TRANSLATION_PROMPT:
+            return [
+                {
+                    "role": "user",
+                    "content": Template(DEFAULT_TRANSLATION_PROMPT).safe_substitute(
+                        {
+                            "lang_in": self.lang_in,
+                            "lang_out": self.lang_out,
+                            "text": text,
+                        }
+                    ),
+                }
+            ]
 
         return [
             {

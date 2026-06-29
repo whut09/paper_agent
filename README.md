@@ -371,6 +371,46 @@ python -m paper_agent --version
 python -m paper_agent example.pdf -s openai --config config.local.json
 ```
 
+生成论文精读 Word 总结：
+
+```powershell
+python -m paper_agent summarize example.pdf --output paper_agent_files --config config.local.json
+```
+
+## Agent Skill 集成
+
+PaperAgent 内置了一个标准 Agent Skill：
+
+```text
+paper_agent/skills/paper-agent-paper-reading/
+  SKILL.md
+  references/
+    summary-system-prompt.md
+    final-note-prompt.md
+    translation-prompt.md
+  scripts/
+    paper-agent.mjs
+```
+
+论文总结和论文翻译的核心 prompt 已经放入 skill 的 `references/` 中。运行时会优先读取这些 skill reference；如果文件不存在，才回退到代码内置默认 prompt。也可以通过环境变量指定外部 skill 目录：
+
+```powershell
+$env:PAPER_AGENT_SKILL_DIR="F:\codex\code\paper_agent\paper_agent\skills\paper-agent-paper-reading"
+```
+
+如果安装并构建了 `agent-skill-bridge`，可以直接让 SkillBridge 加载这个 skill 并执行默认入口：
+
+```powershell
+cd F:\codex\code\agent-skill-bridge
+pnpm build
+
+# 结构化论文总结，输出 Word + trace/verification/grounding map
+pnpm skillbridge exec F:\codex\code\paper_agent\paper_agent\skills "总结这篇论文" --enable-scripts --timeout-ms 1200000 --arg=--mode --arg=summarize --arg=--input --arg=F:\path\paper.pdf --arg=--output --arg=F:\path\out --arg=--config --arg=F:\codex\code\paper_agent\config.local.json
+
+# PDF 翻译，沿用 PaperAgent 翻译链路
+pnpm skillbridge exec F:\codex\code\paper_agent\paper_agent\skills "翻译这篇论文" --enable-scripts --timeout-ms 1200000 --arg=--mode --arg=translate --arg=--input --arg=F:\path\paper.pdf --arg=--output --arg=F:\path\out --arg=--config --arg=F:\codex\code\paper_agent\config.local.json --arg=--service --arg=openai
+```
+
 ## 提交前检查
 
 提交到 GitHub 前建议确认没有泄露真实密钥：
