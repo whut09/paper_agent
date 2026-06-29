@@ -392,10 +392,11 @@ paper_agent/skills/paper-agent-paper-reading/
     paper-agent.mjs
 ```
 
-论文总结和论文翻译的核心 prompt 已经放入 skill 的 `references/` 中。运行时会优先读取这些 skill reference；如果文件不存在，才回退到代码内置默认 prompt。也可以通过环境变量指定外部 skill 目录：
+论文总结和论文翻译的核心 prompt 已经放入 skill 的 `references/` 中。运行时会优先通过 SkillBridge 读取这些 skill reference；如果 SkillBridge 不可用或读取失败，才回退到代码内置默认 prompt。也可以通过环境变量指定外部 skill 目录：
 
 ```powershell
 $env:PAPER_AGENT_SKILL_DIR="F:\codex\code\paper_agent\paper_agent\skills\paper-agent-paper-reading"
+$env:PAPER_AGENT_SKILLBRIDGE_ROOT="F:\codex\code\agent-skill-bridge"
 ```
 
 如果安装并构建了 `agent-skill-bridge`，可以直接让 SkillBridge 加载这个 skill 并执行默认入口：
