@@ -9,10 +9,11 @@ import shutil
 import subprocess
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import fitz
 import httpx
@@ -412,6 +413,11 @@ class SummarizeContribution(_PaperWorkflowNode):
             context.summary_language,
             context.correction_memories,
             context.prompt_patches,
+            progress_callback=lambda completed, total: context.report(
+                0.48 + 0.18 * (completed / max(1, total)),
+                f"生成分段笔记 {completed}/{total}...",
+            ),
+            cancellation_check=context.check_cancelled,
         )
 
 
@@ -2864,15 +2870,20 @@ def _summarize_chunks_with_codex(
     summary_language: str,
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> list[str]:
-    chunks = _chunk_text(paper_text, 16000)
-    asset_context = _asset_context(assets, text_preview_chars=700, latex_preview_chars=800)
+    chunks = _chunk_text(paper_text, 14000)
+    asset_context = _asset_context(assets, text_preview_chars=0, latex_preview_chars=300)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
     extraction_patch = _prompt_patch_context(patches, "extraction")
-    chunk_notes = []
-    for idx, chunk in enumerate(chunks, 1):
+    total = len(chunks)
+
+    def summarize_one(idx: int, chunk: str) -> tuple[int, str]:
+        if cancellation_check:
+            cancellation_check()
         user_prompt = f"""请阅读论文第 {idx}/{len(chunks)} 段内容，生成分段笔记。
 总结语言：{summary_language}
 只记录本段原文直接提到或由本段证据直接支持的信息；本段没有提及的内容不要补写，也不要写“未提及”“未知”等占位句。
@@ -2893,8 +2904,34 @@ def _summarize_chunks_with_codex(
 论文内容：
 {chunk}
 """
-        chunk_notes.append(_chat(client, model, user_prompt, system_prompt=SYNTHESIZER_SYSTEM_PROMPT))
-    return chunk_notes
+        return idx, _chat(client, model, user_prompt, system_prompt=SYNTHESIZER_SYSTEM_PROMPT)
+
+    max_workers = min(_codex_summary_concurrency(), total)
+    if max_workers <= 1:
+        chunk_notes = []
+        for idx, chunk in enumerate(chunks, 1):
+            _idx, note = summarize_one(idx, chunk)
+            chunk_notes.append(note)
+            if progress_callback:
+                progress_callback(len(chunk_notes), total)
+        return chunk_notes
+
+    results: list[str] = [""] * total
+    completed = 0
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-summary") as executor:
+        future_to_index = {
+            executor.submit(summarize_one, idx, chunk): idx
+            for idx, chunk in enumerate(chunks, 1)
+        }
+        for future in as_completed(future_to_index):
+            if cancellation_check:
+                cancellation_check()
+            idx, note = future.result()
+            results[idx - 1] = note
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
+    return results
 
 
 def _integrate_summary_with_codex(
@@ -4158,6 +4195,15 @@ def _codex_chat_attempts() -> int:
     except ValueError:
         value = 2
     return max(1, min(value, 4))
+
+
+def _codex_summary_concurrency() -> int:
+    raw_value = _first_value({}, "CODEX_SUMMARY_CONCURRENCY")
+    try:
+        value = int(raw_value) if raw_value else 4
+    except ValueError:
+        value = 4
+    return max(1, min(value, 8))
 
 
 def _chat(
