@@ -11,6 +11,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 PAPER_AGENT_SKILL_ID = "paper-agent-paper-reading"
+_REFERENCE_CACHE: dict[str, str] = {}
 
 
 def paper_agent_skill_root() -> Path:
@@ -39,10 +40,10 @@ def _skillbridge_command() -> tuple[list[str], Path] | None:
     if not cli_entrypoint.exists():
         return None
 
-    if shutil.which("pnpm"):
-        return (["pnpm", "skillbridge"], bridge_root)
     if shutil.which("node"):
         return (["node", str(cli_entrypoint)], bridge_root)
+    if shutil.which("pnpm"):
+        return (["pnpm", "skillbridge"], bridge_root)
     return None
 
 
@@ -61,6 +62,8 @@ def _load_reference_via_skillbridge(reference_name: str) -> str | None:
             cwd=str(cwd),
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=30,
             check=False,
         )
@@ -74,7 +77,7 @@ def _load_reference_via_skillbridge(reference_name: str) -> str | None:
 
     try:
         payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         logger.debug("SkillBridge prompt load did not return JSON.")
         return None
 
@@ -90,8 +93,12 @@ def _load_reference_via_skillbridge(reference_name: str) -> str | None:
 
 
 def load_paper_skill_reference(reference_name: str, default: str = "") -> str:
+    if reference_name in _REFERENCE_CACHE:
+        return _REFERENCE_CACHE[reference_name] or default
+
     bridge_text = _load_reference_via_skillbridge(reference_name)
     if bridge_text:
+        _REFERENCE_CACHE[reference_name] = bridge_text
         return bridge_text
 
     reference_path = paper_agent_skill_root() / "references" / reference_name
@@ -99,7 +106,9 @@ def load_paper_skill_reference(reference_name: str, default: str = "") -> str:
         text = reference_path.read_text(encoding="utf-8").strip()
     except OSError:
         return default
-    return text or default
+    result = text or default
+    _REFERENCE_CACHE[reference_name] = result
+    return result
 
 
 __all__ = [

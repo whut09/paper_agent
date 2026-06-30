@@ -2866,7 +2866,7 @@ def _summarize_chunks_with_codex(
     prompt_patches: list[PromptPatch] | None = None,
 ) -> list[str]:
     chunks = _chunk_text(paper_text, 16000)
-    asset_context = _asset_context(assets)
+    asset_context = _asset_context(assets, text_preview_chars=700, latex_preview_chars=800)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
@@ -2910,13 +2910,13 @@ def _integrate_summary_with_codex(
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
 ) -> str:
-    asset_context = _asset_context(assets)
+    asset_context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=800)
     formula_context = _formula_context(formulas)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
     summarization_patch = _prompt_patch_context(patches, "summarization")
-    final_input = "\n\n".join(f"[Chunk {i + 1}]\n{note}" for i, note in enumerate(chunk_notes))
+    final_input = _compact_chunk_notes_for_final(chunk_notes)
     return _chat(
         client,
         model,
@@ -2935,6 +2935,40 @@ def _integrate_summary_with_codex(
             f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
         ),
         system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+    )
+
+
+def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int = 36000) -> str:
+    if not chunk_notes:
+        return ""
+
+    per_chunk_limit = max(3000, max_total_chars // max(1, len(chunk_notes)))
+    compacted = []
+    total = 0
+    for idx, note in enumerate(chunk_notes, 1):
+        cleaned = _postprocess_summary(note)
+        remaining = max_total_chars - total
+        if remaining <= 0:
+            break
+        limit = min(per_chunk_limit, remaining)
+        chunk_text = _truncate_middle(cleaned, limit)
+        compacted.append(f"[Chunk {idx}]\n{chunk_text}")
+        total += len(chunk_text)
+    return "\n\n".join(compacted)
+
+
+def _truncate_middle(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    if max_chars < 200:
+        return text[:max_chars].rstrip()
+    head = max_chars // 2
+    tail = max_chars - head - 80
+    return (
+        text[:head].rstrip()
+        + "\n\n...[中间内容已压缩以避免最终整合请求过大]...\n\n"
+        + text[-tail:].lstrip()
     )
 
 
@@ -4095,16 +4129,35 @@ def _extract_json_object(text: str) -> str:
 
 
 def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
+    timeout_seconds = _codex_timeout_seconds()
     http_client = httpx.Client(
         trust_env=config.use_proxy,
-        timeout=httpx.Timeout(600.0, connect=30.0),
+        timeout=httpx.Timeout(timeout_seconds, connect=min(20.0, timeout_seconds)),
     )
     return openai.OpenAI(
         base_url=config.base_url,
         api_key=config.api_key,
         http_client=http_client,
-        max_retries=2,
+        max_retries=0,
     )
+
+
+def _codex_timeout_seconds() -> float:
+    raw_value = _first_value({}, "CODEX_TIMEOUT_SECONDS", "CODEX_TIMEOUT")
+    try:
+        value = float(raw_value) if raw_value else 120.0
+    except ValueError:
+        value = 120.0
+    return max(30.0, min(value, 600.0))
+
+
+def _codex_chat_attempts() -> int:
+    raw_value = _first_value({}, "CODEX_CHAT_ATTEMPTS", "CODEX_MAX_RETRIES")
+    try:
+        value = int(raw_value) if raw_value else 2
+    except ValueError:
+        value = 2
+    return max(1, min(value, 4))
 
 
 def _chat(
@@ -4113,7 +4166,7 @@ def _chat(
     user_prompt: str,
     system_prompt: str = DEEP_PAPER_NOTE_SYSTEM_PROMPT,
 ) -> str:
-    max_attempts = 4
+    max_attempts = _codex_chat_attempts()
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:
@@ -4132,6 +4185,11 @@ def _chat(
             if not _is_retryable_openai_status(exc) or attempt + 1 >= max_attempts:
                 break
             time.sleep(_chat_retry_delay(attempt))
+        except openai.APITimeoutError as exc:
+            last_error = exc
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(_chat_retry_delay(attempt))
         except openai.APIConnectionError as exc:
             last_error = exc
             if attempt + 1 >= max_attempts:
@@ -4139,6 +4197,11 @@ def _chat(
             time.sleep(_chat_retry_delay(attempt))
     if isinstance(last_error, openai.APIStatusError):
         raise RuntimeError(_openai_status_error_message(last_error, max_attempts)) from last_error
+    if isinstance(last_error, openai.APITimeoutError):
+        raise RuntimeError(
+            f"Codex 接口响应超时，已重试 {max_attempts} 次仍未成功。"
+            "当前默认单次超时为 120 秒；如果接口确实很慢，可以在 config.local.json 中设置 CODEX_TIMEOUT_SECONDS。"
+        ) from last_error
     if isinstance(last_error, openai.APIConnectionError):
         raise RuntimeError(
             f"Codex 接口连接失败，已重试 {max_attempts} 次仍未成功：服务端断开或网络链路不稳定。"
@@ -4477,7 +4540,11 @@ def _textualize_latex(text: str) -> str:
     return text
 
 
-def _asset_context(assets: list[PaperAsset]) -> str:
+def _asset_context(
+    assets: list[PaperAsset],
+    text_preview_chars: int = 1500,
+    latex_preview_chars: int = 2000,
+) -> str:
     if not assets:
         return "未抽取到图表截图。"
     parts = []
@@ -4492,10 +4559,10 @@ def _asset_context(assets: list[PaperAsset]) -> str:
             f"建议插入章节：{_target_section_for_asset(asset)}，"
             f"caption/context: {_clean_xml_text(asset.caption)}"
         )
-        if asset.text:
-            text += f"\n表格文本预览：\n{_clean_xml_text(asset.text[:1500])}"
-        if asset.latex:
-            text += f"\nTexTeller LaTeX：{_clean_xml_text(asset.latex)}"
+        if asset.text and text_preview_chars > 0:
+            text += f"\n表格文本预览：\n{_clean_xml_text(asset.text[:text_preview_chars])}"
+        if asset.latex and latex_preview_chars > 0:
+            text += f"\nTexTeller LaTeX：{_clean_xml_text(asset.latex[:latex_preview_chars])}"
         parts.append(text)
     return "\n".join(parts)
 

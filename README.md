@@ -323,6 +323,15 @@ copy config.json config.local.json
 
 `CODEX_USE_PROXY` 默认为 `false`，总结接口不会继承系统 `HTTP_PROXY` / `HTTPS_PROXY`。如果你的接口必须走代理，再改成 `true`。
 
+如果总结阶段长时间停在“整合方法、结果和分析”，通常是大模型接口长时间没有返回。默认单次接口超时为 120 秒，默认重试 2 次；确实需要更慢接口时可以在 `config.local.json` 中调整：
+
+```json
+{
+  "CODEX_TIMEOUT_SECONDS": "180",
+  "CODEX_CHAT_ATTEMPTS": "2"
+}
+```
+
 `config.local.json` 已加入 `.gitignore`，不会提交到 GitHub。你当前机器上的真实配置保存在该文件中，本地启动时直接指定它即可。
 
 ## 启动命令
