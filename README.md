@@ -323,17 +323,17 @@ copy config.json config.local.json
 
 `CODEX_USE_PROXY` 默认为 `false`，总结接口不会继承系统 `HTTP_PROXY` / `HTTPS_PROXY`。如果你的接口必须走代理，再改成 `true`。
 
-如果总结阶段长时间停在“整合方法、结果和分析”，通常是大模型接口长时间没有返回。默认单次接口超时为 120 秒，默认重试 2 次；确实需要更慢接口时可以在 `config.local.json` 中调整：
+如果总结阶段长时间停在“调用 Codex 接口生成分段笔记”或“整合方法、结果和分析”，通常是大模型接口长时间没有返回。默认单次接口超时为 90 秒，默认重试 2 次；确实需要更慢接口时可以在 `config.local.json` 中调整：
 
 ```json
 {
-  "CODEX_TIMEOUT_SECONDS": "180",
+  "CODEX_TIMEOUT_SECONDS": "120",
   "CODEX_CHAT_ATTEMPTS": "2",
-  "CODEX_SUMMARY_CONCURRENCY": "4"
+  "CODEX_SUMMARY_CONCURRENCY": "3"
 }
 ```
 
-`CODEX_SUMMARY_CONCURRENCY` 控制分段笔记阶段的并发请求数，默认 `4`。如果接口限流明显，可以降到 `2`；如果本地模型或网关吞吐足够，可以提高到 `6` 或 `8`。
+`CODEX_SUMMARY_CONCURRENCY` 控制分段笔记阶段的并发请求数，默认 `3`。如果接口限流或超时明显，可以降到 `1` 或 `2`；如果本地模型或网关吞吐足够，可以提高到 `4` 到 `6`。
 
 `config.local.json` 已加入 `.gitignore`，不会提交到 GitHub。你当前机器上的真实配置保存在该文件中，本地启动时直接指定它即可。
 

@@ -2904,13 +2904,23 @@ def _summarize_chunks_with_codex(
 论文内容：
 {chunk}
 """
-        return idx, _chat(client, model, user_prompt, system_prompt=SYNTHESIZER_SYSTEM_PROMPT)
+        return idx, _chat(
+            client,
+            model,
+            user_prompt,
+            system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+            max_tokens=1400,
+            max_attempts=1,
+        )
 
     max_workers = min(_codex_summary_concurrency(), total)
     if max_workers <= 1:
         chunk_notes = []
         for idx, chunk in enumerate(chunks, 1):
-            _idx, note = summarize_one(idx, chunk)
+            try:
+                _idx, note = summarize_one(idx, chunk)
+            except Exception as exc:
+                note = _fallback_chunk_note(idx, total, chunk, exc)
             chunk_notes.append(note)
             if progress_callback:
                 progress_callback(len(chunk_notes), total)
@@ -2926,12 +2936,33 @@ def _summarize_chunks_with_codex(
         for future in as_completed(future_to_index):
             if cancellation_check:
                 cancellation_check()
-            idx, note = future.result()
+            idx = future_to_index[future]
+            try:
+                _idx, note = future.result()
+                idx = _idx
+            except Exception as exc:
+                note = _fallback_chunk_note(idx, total, chunks[idx - 1], exc)
             results[idx - 1] = note
             completed += 1
             if progress_callback:
                 progress_callback(completed, total)
     return results
+
+
+def _fallback_chunk_note(idx: int, total: int, chunk: str, exc: Exception) -> str:
+    cleaned = _clean_xml_text(chunk)
+    headings = re.findall(r"(?m)^(?:#{1,4}\s*)?(?:[0-9IVX]+\.?\s+)?[A-Z][A-Za-z0-9 ,:;()/&\\-]{6,90}$", cleaned)
+    sentences = re.split(r"(?<=[。.!?])\s+", cleaned)
+    selected_sentences = [sentence.strip() for sentence in sentences if len(sentence.strip()) > 60][:10]
+    excerpt = "\n".join(selected_sentences) or cleaned[:2200]
+    error = _clean_xml_text(str(exc))[:220]
+    return (
+        f"## Chunk {idx}/{total} 规则兜底笔记\n"
+        f"本段模型分段总结超时或失败，已使用原文摘录兜底，后续整合只能基于这些证据写保守结论。\n"
+        f"错误摘要：{error}\n\n"
+        f"可能章节标题：{'; '.join(headings[:8]) if headings else '未可靠识别'}\n\n"
+        f"原文证据摘录：\n{excerpt[:2600]}"
+    )
 
 
 def _integrate_summary_with_codex(
@@ -2972,6 +3003,7 @@ def _integrate_summary_with_codex(
             f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
         ),
         system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+        max_tokens=5200,
     )
 
 
@@ -3602,6 +3634,7 @@ def _run_verification_agent(
         model,
         prompt,
         system_prompt=CRITIC_SYSTEM_PROMPT,
+        max_tokens=1600,
     )
     verification = _parse_verification_result(output)
     if _verification_failed_due_to_format(verification):
@@ -4182,9 +4215,9 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
 def _codex_timeout_seconds() -> float:
     raw_value = _first_value({}, "CODEX_TIMEOUT_SECONDS", "CODEX_TIMEOUT")
     try:
-        value = float(raw_value) if raw_value else 120.0
+        value = float(raw_value) if raw_value else 90.0
     except ValueError:
-        value = 120.0
+        value = 90.0
     return max(30.0, min(value, 600.0))
 
 
@@ -4200,9 +4233,9 @@ def _codex_chat_attempts() -> int:
 def _codex_summary_concurrency() -> int:
     raw_value = _first_value({}, "CODEX_SUMMARY_CONCURRENCY")
     try:
-        value = int(raw_value) if raw_value else 4
+        value = int(raw_value) if raw_value else 3
     except ValueError:
-        value = 4
+        value = 3
     return max(1, min(value, 8))
 
 
@@ -4211,19 +4244,30 @@ def _chat(
     model: str,
     user_prompt: str,
     system_prompt: str = DEEP_PAPER_NOTE_SYSTEM_PROMPT,
+    max_tokens: int | None = None,
+    max_attempts: int | None = None,
 ) -> str:
-    max_attempts = _codex_chat_attempts()
+    max_attempts = max_attempts or _codex_chat_attempts()
     last_error: Exception | None = None
     for attempt in range(max_attempts):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
+            request = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
-                temperature=0.2,
-            )
+                "temperature": 0.2,
+            }
+            if max_tokens:
+                request["max_tokens"] = max_tokens
+            try:
+                response = client.chat.completions.create(**request)
+            except openai.BadRequestError:
+                if "max_tokens" not in request:
+                    raise
+                request.pop("max_tokens", None)
+                response = client.chat.completions.create(**request)
             content = response.choices[0].message.content or ""
             return _postprocess_summary(content)
         except openai.APIStatusError as exc:
@@ -4246,7 +4290,7 @@ def _chat(
     if isinstance(last_error, openai.APITimeoutError):
         raise RuntimeError(
             f"Codex 接口响应超时，已重试 {max_attempts} 次仍未成功。"
-            "当前默认单次超时为 120 秒；如果接口确实很慢，可以在 config.local.json 中设置 CODEX_TIMEOUT_SECONDS。"
+            f"当前单次超时为 {_codex_timeout_seconds():.0f} 秒；如果接口确实很慢，可以在 config.local.json 中设置 CODEX_TIMEOUT_SECONDS。"
         ) from last_error
     if isinstance(last_error, openai.APIConnectionError):
         raise RuntimeError(
