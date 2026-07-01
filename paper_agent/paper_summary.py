@@ -3008,7 +3008,9 @@ def _integrate_summary_with_codex(
             max_tokens=5200,
         )
     except RuntimeError as exc:
-        return _fallback_integrated_summary(
+        return _fast_integrate_summary_with_codex(
+            client,
+            model,
             chunk_notes,
             assets,
             summary_language,
@@ -3039,7 +3041,9 @@ def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int 
     return "\n\n".join(compacted)
 
 
-def _fallback_integrated_summary(
+def _fast_integrate_summary_with_codex(
+    client: openai.OpenAI,
+    model: str,
     chunk_notes: list[str],
     assets: list[PaperAsset],
     summary_language: str,
@@ -3047,66 +3051,42 @@ def _fallback_integrated_summary(
     formulas: list[str],
     recognized_formulas: str,
     paper_title: str,
-    exc: Exception,
+    original_error: Exception,
 ) -> str:
-    evidence = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=22000)
-    excerpt = _truncate_middle(evidence, 12000)
-    error = _clean_xml_text(str(exc))[:260]
-    title = paper_title or "论文精读笔记"
-    asset_lines = []
-    for idx, asset in enumerate(assets[:8], 1):
-        label = asset.caption or f"第 {asset.page_number} 页 {asset.kind}"
-        asset_lines.append(f"[[ASSET:{idx}]]\n{_clean_xml_text(label)[:180]}")
-    formula_text = "\n".join(formulas[:6]) or recognized_formulas or "未抽取到可靠公式候选。"
-    return _postprocess_summary(
-        f"""# {title}
-
-## 核心信息
-- 标题: {title}
-- 生成方式: LLM 最终整合超时，已使用分段笔记和原文证据自动生成保守版报告
-- 总结语言: {summary_language}
-
-## 摘要
-{_clean_xml_text(abstract)[:1800] if abstract else "摘要证据未可靠抽取；本节依据分段笔记保守生成。"}
-
-## 背景与问题
-最终整合阶段超时，系统没有继续等待接口返回。以下内容只依据已经完成的分段笔记和抽取证据生成，避免补写无证据结论。
-
-## 创新点
-请优先查看后续“方法主线”和“关键结果”中的原文证据摘录。若某个分段使用了规则兜底笔记，本报告会保守呈现，不把兜底摘录扩写成强结论。
-
-## 一句话总结
-本文围绕论文标题和分段证据所指向的研究问题展开；由于最终整合接口超时，本句不额外引入新结论。
-
-## 数据与任务定义
-{excerpt[:2600]}
-
-## 方法主线
-### 机制流程
-{excerpt[2600:5600] or excerpt[:2200]}
-
-### 关键公式
-{_clean_xml_text(formula_text)[:1800]}
-
-## 关键结果
-{excerpt[5600:8600] or excerpt[:2200]}
-
-{chr(10).join(asset_lines)}
-
-## 深度分析
-本节保留分段笔记中的证据性内容，不扩写未经 Verifier 充分确认的贡献、能力或应用范围。
-
-{excerpt[8600:11200] or excerpt[:2200]}
-
-## 局限
-最终整合调用超时：{error}
-
-因此，本报告可能缺少跨章节的高级综合，但不会因为接口超时而中断 Word 生成。
-
-## 总结
-这是在接口超时情况下生成的保守版论文精读笔记。建议后续在接口稳定后重新运行，以获得更完整的综合分析。
-"""
+    compact_notes = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=14000)
+    asset_context = _asset_context(assets[:8], text_preview_chars=0, latex_preview_chars=300)
+    formula_context = _formula_context(formulas[:6])
+    prompt = (
+        "你是科研论文精读笔记编辑。前一次完整整合请求超时，现在请用更短输出快速生成一份可读中文 Markdown 报告。\n"
+        "硬性要求：\n"
+        "1. 必须输出中文自然段，不要复制英文原文段落，不要保留 PDF 断行或断词。\n"
+        "2. 只基于给定分段笔记和证据写；没有证据就省略，不要编造。\n"
+        "3. 必须包含这些二级标题：核心信息、摘要、背景与问题、创新点、方法主线、关键结果、局限、总结。\n"
+        "4. 图表占位符只能使用给定的 [[ASSET:n]]，并放在相关段落旁边。\n"
+        "5. 如果某段笔记是规则兜底笔记，只提炼其可读证据，不要把“规则兜底笔记/错误摘要/原文证据摘录”这些字样写入报告。\n\n"
+        f"标题证据：{paper_title or '未可靠抽取'}\n\n"
+        f"摘要证据：{_clean_xml_text(abstract)[:1200] if abstract else '未可靠抽取'}\n\n"
+        f"公式候选：\n{formula_context}\n\n"
+        f"TexTeller 识别：\n{recognized_formulas[:1200] if recognized_formulas else '无'}\n\n"
+        f"可用图表：\n{asset_context}\n\n"
+        f"分段笔记：\n{compact_notes}"
     )
+    try:
+        return _chat(
+            client,
+            model,
+            prompt,
+            system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+            max_tokens=3600,
+            max_attempts=1,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "总结质量自检未通过：完整整合和快速整合都超时，已停止生成 Word，避免输出不可读的原文摘录版报告。"
+            f"完整整合错误：{_clean_xml_text(str(original_error))[:220]}；"
+            f"快速整合错误：{_clean_xml_text(str(exc))[:220]}。"
+            "请降低 CODEX_SUMMARY_CONCURRENCY，或提高/修复 CODEX_TIMEOUT_SECONDS 后重试。"
+        ) from exc
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
@@ -3141,6 +3121,7 @@ def _verify_summary_claims(
     summary = _normalize_final_sections(summary)
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
+    _assert_summary_quality(summary)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
     guard_results = _run_harness_guards(
@@ -3189,6 +3170,50 @@ def _verify_summary_claims(
 
 def _summary_is_degraded_fallback(summary: str) -> bool:
     return "LLM 最终整合超时" in summary or "保守版论文精读笔记" in summary
+
+
+def _assert_summary_quality(summary: str) -> None:
+    issues = _summary_quality_issues(summary)
+    if issues:
+        raise RuntimeError(
+            "总结质量自检未通过，已停止生成 Word，避免输出不可读报告："
+            + "；".join(issues)
+            + "。请降低 CODEX_SUMMARY_CONCURRENCY，或修复/提高 CODEX_TIMEOUT_SECONDS 后重试。"
+        )
+
+
+def _summary_quality_issues(summary: str) -> list[str]:
+    issues: list[str] = []
+    forbidden_markers = [
+        "规则兜底笔记",
+        "错误摘要：",
+        "原文证据摘录",
+        "LLM 最终整合超时",
+        "保守版论文精读笔记",
+    ]
+    found_markers = [marker for marker in forbidden_markers if marker in summary]
+    if found_markers:
+        issues.append(f"报告包含内部降级文本 {', '.join(found_markers[:3])}")
+
+    body = re.sub(r"\[\[ASSET:\d+\]\]", "", summary)
+    body = re.sub(r"(?m)^#.*$", "", body)
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", body))
+    latin_letters = len(re.findall(r"[A-Za-z]", body))
+    if latin_letters > 700 and cjk_chars < 450:
+        issues.append("中文总结主体疑似直接复制英文原文，中文内容不足")
+
+    bad_sections = []
+    for title in ("摘要", "背景与问题", "方法主线", "关键结果"):
+        section = _section_body(summary, title)
+        if not section:
+            continue
+        section_cjk = len(re.findall(r"[\u4e00-\u9fff]", section))
+        section_latin = len(re.findall(r"[A-Za-z]", section))
+        if section_latin > 220 and section_cjk < 80:
+            bad_sections.append(title)
+    if bad_sections:
+        issues.append(f"这些章节疑似英文原文未整理：{', '.join(bad_sections)}")
+    return issues
 
 
 def _run_harness_guards(

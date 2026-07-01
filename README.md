@@ -337,6 +337,8 @@ copy config.json config.local.json
 
 如果分段、最终整合或 Verifier 阶段仍然超时，PaperAgent 会降级使用已完成的分段笔记和原文证据继续生成 Word，并在报告附录/trace 中记录 warning，不再直接中断为错误。
 
+为避免生成不可读报告，Word 写入前会做质量自检：如果报告主体疑似直接复制英文原文、包含内部兜底文本，或快速整合也超时，程序会停止生成 Word 并返回明确错误，避免输出不可交付的文档。
+
 `config.local.json` 已加入 `.gitignore`，不会提交到 GitHub。你当前机器上的真实配置保存在该文件中，本地启动时直接指定它即可。
 
 ## 启动命令
