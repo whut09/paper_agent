@@ -335,6 +335,8 @@ copy config.json config.local.json
 
 `CODEX_SUMMARY_CONCURRENCY` 控制分段笔记阶段的并发请求数，默认 `3`。如果接口限流或超时明显，可以降到 `1` 或 `2`；如果本地模型或网关吞吐足够，可以提高到 `4` 到 `6`。
 
+如果分段、最终整合或 Verifier 阶段仍然超时，PaperAgent 会降级使用已完成的分段笔记和原文证据继续生成 Word，并在报告附录/trace 中记录 warning，不再直接中断为错误。
+
 `config.local.json` 已加入 `.gitignore`，不会提交到 GitHub。你当前机器上的真实配置保存在该文件中，本地启动时直接指定它即可。
 
 ## 启动命令

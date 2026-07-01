@@ -2985,26 +2985,39 @@ def _integrate_summary_with_codex(
     memory_context = _correction_memory_context(memories)
     summarization_patch = _prompt_patch_context(patches, "summarization")
     final_input = _compact_chunk_notes_for_final(chunk_notes)
-    return _chat(
-        client,
-        model,
-        (
-            f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
-            f"历史用户修正规则：\n{memory_context}\n\n"
-            f"自优化总结提示词：\n{summarization_patch}\n\n"
-            "完整性硬性要求：最终输出必须包含这些二级章节："
-            "## 核心信息、## 摘要、## 背景与问题、## 创新点、## 一句话总结、"
-            "## 方法主线、## 关键结果、## 深度分析、## 局限、## 总结。"
-            "如果证据较少，也要用已有证据写成短段落；不要输出计划、过程说明或“我先/接着我会”这类话。\n\n"
-            f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
-            f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
-            f"关键公式候选：\n{formula_context}\n\n"
-            f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
-            f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
-        ),
-        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
-        max_tokens=5200,
+    prompt = (
+        f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+        f"历史用户修正规则：\n{memory_context}\n\n"
+        f"自优化总结提示词：\n{summarization_patch}\n\n"
+        "完整性硬性要求：最终输出必须包含这些二级章节："
+        "## 核心信息、## 摘要、## 背景与问题、## 创新点、## 一句话总结、"
+        "## 方法主线、## 关键结果、## 深度分析、## 局限、## 总结。"
+        "如果证据较少，也要用已有证据写成短段落；不要输出计划、过程说明或“我先/接着我会”这类话。\n\n"
+        f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
+        f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
+        f"关键公式候选：\n{formula_context}\n\n"
+        f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
+        f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
     )
+    try:
+        return _chat(
+            client,
+            model,
+            prompt,
+            system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+            max_tokens=5200,
+        )
+    except RuntimeError as exc:
+        return _fallback_integrated_summary(
+            chunk_notes,
+            assets,
+            summary_language,
+            abstract,
+            formulas,
+            recognized_formulas,
+            paper_title,
+            exc,
+        )
 
 
 def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int = 36000) -> str:
@@ -3024,6 +3037,76 @@ def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int 
         compacted.append(f"[Chunk {idx}]\n{chunk_text}")
         total += len(chunk_text)
     return "\n\n".join(compacted)
+
+
+def _fallback_integrated_summary(
+    chunk_notes: list[str],
+    assets: list[PaperAsset],
+    summary_language: str,
+    abstract: str,
+    formulas: list[str],
+    recognized_formulas: str,
+    paper_title: str,
+    exc: Exception,
+) -> str:
+    evidence = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=22000)
+    excerpt = _truncate_middle(evidence, 12000)
+    error = _clean_xml_text(str(exc))[:260]
+    title = paper_title or "论文精读笔记"
+    asset_lines = []
+    for idx, asset in enumerate(assets[:8], 1):
+        label = asset.caption or f"第 {asset.page_number} 页 {asset.kind}"
+        asset_lines.append(f"[[ASSET:{idx}]]\n{_clean_xml_text(label)[:180]}")
+    formula_text = "\n".join(formulas[:6]) or recognized_formulas or "未抽取到可靠公式候选。"
+    return _postprocess_summary(
+        f"""# {title}
+
+## 核心信息
+- 标题: {title}
+- 生成方式: LLM 最终整合超时，已使用分段笔记和原文证据自动生成保守版报告
+- 总结语言: {summary_language}
+
+## 摘要
+{_clean_xml_text(abstract)[:1800] if abstract else "摘要证据未可靠抽取；本节依据分段笔记保守生成。"}
+
+## 背景与问题
+最终整合阶段超时，系统没有继续等待接口返回。以下内容只依据已经完成的分段笔记和抽取证据生成，避免补写无证据结论。
+
+## 创新点
+请优先查看后续“方法主线”和“关键结果”中的原文证据摘录。若某个分段使用了规则兜底笔记，本报告会保守呈现，不把兜底摘录扩写成强结论。
+
+## 一句话总结
+本文围绕论文标题和分段证据所指向的研究问题展开；由于最终整合接口超时，本句不额外引入新结论。
+
+## 数据与任务定义
+{excerpt[:2600]}
+
+## 方法主线
+### 机制流程
+{excerpt[2600:5600] or excerpt[:2200]}
+
+### 关键公式
+{_clean_xml_text(formula_text)[:1800]}
+
+## 关键结果
+{excerpt[5600:8600] or excerpt[:2200]}
+
+{chr(10).join(asset_lines)}
+
+## 深度分析
+本节保留分段笔记中的证据性内容，不扩写未经 Verifier 充分确认的贡献、能力或应用范围。
+
+{excerpt[8600:11200] or excerpt[:2200]}
+
+## 局限
+最终整合调用超时：{error}
+
+因此，本报告可能缺少跨章节的高级综合，但不会因为接口超时而中断 Word 生成。
+
+## 总结
+这是在接口超时情况下生成的保守版论文精读笔记。建议后续在接口稳定后重新运行，以获得更完整的综合分析。
+"""
+    )
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
@@ -3067,6 +3150,28 @@ def _verify_summary_claims(
         paper_title,
         correction_memories or [],
     )
+    if _summary_is_degraded_fallback(summary):
+        guard_warnings = _blocking_guard_errors(guard_results)
+        verification = VerificationResult(
+            True,
+            [],
+            soft_warnings=[
+                {
+                    "type": "degraded_report_warning",
+                    "claim": "",
+                    "reason": "LLM 最终整合或校验阶段超时，已生成保守降级版 Word；阻断型 Guard 已转为 warning。",
+                },
+                *[
+                    {
+                        "type": "degraded_guard_warning",
+                        "claim": "",
+                        "reason": warning,
+                    }
+                    for warning in guard_warnings
+                ],
+            ],
+        )
+        return summary, verification, guard_results
     verification = _run_verification_agent(
         client,
         model,
@@ -3080,6 +3185,10 @@ def _verify_summary_claims(
         _add_guard_failures_to_verification(verification, guard_errors)
         verification.passed = False
     return summary, verification, guard_results
+
+
+def _summary_is_degraded_fallback(summary: str) -> bool:
+    return "LLM 最终整合超时" in summary or "保守版论文精读笔记" in summary
 
 
 def _run_harness_guards(
@@ -3629,13 +3738,27 @@ def _run_verification_agent(
         f"Self-improving evaluation rubric:\n{evaluation_patch}\n\n"
         f"Claim/Evidence payload:\n{json.dumps(evidence_payload, ensure_ascii=False, indent=2)}"
     )
-    output = _chat(
-        client,
-        model,
-        prompt,
-        system_prompt=CRITIC_SYSTEM_PROMPT,
-        max_tokens=1600,
-    )
+    try:
+        output = _chat(
+            client,
+            model,
+            prompt,
+            system_prompt=CRITIC_SYSTEM_PROMPT,
+            max_tokens=1600,
+            max_attempts=1,
+        )
+    except RuntimeError as exc:
+        return VerificationResult(
+            True,
+            [],
+            soft_warnings=[
+                {
+                    "type": "verifier_timeout_warning",
+                    "claim": "",
+                    "reason": f"Verifier Agent 超时，已降级为本地 Guard 校验并允许生成 Word：{_clean_xml_text(str(exc))[:260]}",
+                }
+            ],
+        )
     verification = _parse_verification_result(output)
     if _verification_failed_due_to_format(verification):
         repair_prompt = (
@@ -3652,12 +3775,17 @@ def _run_verification_agent(
             "{\"passed\": true/false, \"hard_failures\": [], \"soft_warnings\": [], \"patch_suggestions\": []}\n\n"
             f"Raw output:\n{output}"
         )
-        repaired_output = _chat(
-            client,
-            model,
-            repair_prompt,
-            system_prompt=CRITIC_SYSTEM_PROMPT,
-        )
+        try:
+            repaired_output = _chat(
+                client,
+                model,
+                repair_prompt,
+                system_prompt=CRITIC_SYSTEM_PROMPT,
+                max_tokens=1200,
+                max_attempts=1,
+            )
+        except RuntimeError:
+            return _verification_format_warning(verification)
         repaired = _parse_verification_result(repaired_output)
         if not _verification_failed_due_to_format(repaired):
             return repaired
@@ -4325,15 +4453,20 @@ def _replace_missing_abstract(
 ) -> str:
     if not abstract or not any(marker in summary for marker in ("原文摘要未完整抽取", "摘要未完整抽取")):
         return summary
-    abstract_cn = _chat(
-        client,
-        model,
-        (
-            "请把下面论文英文摘要忠实写成中文摘要。只输出中文内容，"
-            "不要总结、不要评价、不要添加标题。\n\n"
-            f"{abstract}"
-        ),
-    )
+    try:
+        abstract_cn = _chat(
+            client,
+            model,
+            (
+                "请把下面论文英文摘要忠实写成中文摘要。只输出中文内容，"
+                "不要总结、不要评价、不要添加标题。\n\n"
+                f"{abstract}"
+            ),
+            max_tokens=1200,
+            max_attempts=1,
+        )
+    except RuntimeError:
+        return summary
     if not abstract_cn:
         return summary
     pattern = r"(##\s*(?:原文摘要翻译|摘要翻译|摘要)\s*)(.*?)(?=\n## |\Z)"
