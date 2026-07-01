@@ -48,6 +48,9 @@ def _skillbridge_command() -> tuple[list[str], Path] | None:
 
 
 def _load_reference_via_skillbridge(reference_name: str) -> str | None:
+    if not _truthy(os.environ.get("PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS", "")):
+        return None
+
     skillbridge = _skillbridge_command()
     if skillbridge is None:
         return None
@@ -93,13 +96,24 @@ def _load_reference_via_skillbridge(reference_name: str) -> str | None:
 
 
 def load_paper_skill_reference(reference_name: str, default: str = "") -> str:
+    prompt_engine = os.environ.get("PAPER_AGENT_PROMPT_ENGINE", "code").strip().lower()
+    if prompt_engine in {"code", "direct", "builtin", "built-in"}:
+        return default
+    if prompt_engine == "skillbridge" and not _truthy(os.environ.get("PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS", "")):
+        return default
+
     if reference_name in _REFERENCE_CACHE:
         return _REFERENCE_CACHE[reference_name] or default
 
-    bridge_text = _load_reference_via_skillbridge(reference_name)
-    if bridge_text:
-        _REFERENCE_CACHE[reference_name] = bridge_text
-        return bridge_text
+    if prompt_engine == "skillbridge":
+        bridge_text = _load_reference_via_skillbridge(reference_name)
+        if bridge_text:
+            _REFERENCE_CACHE[reference_name] = bridge_text
+            return bridge_text
+        return default
+
+    if prompt_engine not in {"local", "skill", "skills"}:
+        return default
 
     reference_path = paper_agent_skill_root() / "references" / reference_name
     try:
@@ -109,6 +123,10 @@ def load_paper_skill_reference(reference_name: str, default: str = "") -> str:
     result = text or default
     _REFERENCE_CACHE[reference_name] = result
     return result
+
+
+def _truthy(value: str) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 __all__ = [

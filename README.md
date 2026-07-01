@@ -335,7 +335,7 @@ copy config.json config.local.json
 
 `CODEX_SUMMARY_CONCURRENCY` 控制分段笔记阶段的并发请求数，默认 `3`。如果接口限流或超时明显，可以降到 `1` 或 `2`；如果本地模型或网关吞吐足够，可以提高到 `4` 到 `6`。
 
-如果分段、最终整合或 Verifier 阶段仍然超时，PaperAgent 会降级使用已完成的分段笔记和原文证据继续生成 Word，并在报告附录/trace 中记录 warning，不再直接中断为错误。
+如果分段阶段部分 chunk 超时，PaperAgent 会跳过超时 chunk 并继续使用已完成的中文分段笔记。最终整合超时后会尝试一次轻量快速整合；如果快速整合也超时，程序会停止生成 Word，避免输出不可读文档。
 
 为避免生成不可读报告，Word 写入前会做质量自检：如果报告主体疑似直接复制英文原文、包含内部兜底文本，或快速整合也超时，程序会停止生成 Word 并返回明确错误，避免输出不可交付的文档。
 
@@ -408,10 +408,19 @@ paper_agent/skills/paper-agent-paper-reading/
     paper-agent.mjs
 ```
 
-论文总结和论文翻译的核心 prompt 已经放入 skill 的 `references/` 中。运行时会优先通过 SkillBridge 读取这些 skill reference；如果 SkillBridge 不可用或读取失败，才回退到代码内置默认 prompt。也可以通过环境变量指定外部 skill 目录：
+论文总结和论文翻译的核心 prompt 已经放入 skill 的 `references/` 中，但 PaperAgent 默认使用代码内置 direct prompt，避免额外 SkillBridge 启动和复杂 prompt 带来的耗时。需要切换 prompt 来源时可以设置：
 
 ```powershell
+# 默认值：使用代码内置 direct prompt
+$env:PAPER_AGENT_PROMPT_ENGINE="code"
+
+# 可选：直接读取本地 skill references，不经过 SkillBridge
+$env:PAPER_AGENT_PROMPT_ENGINE="local"
 $env:PAPER_AGENT_SKILL_DIR="F:\codex\code\paper_agent\paper_agent\skills\paper-agent-paper-reading"
+
+# 可选：通过 SkillBridge 读取 skill references
+$env:PAPER_AGENT_PROMPT_ENGINE="skillbridge"
+$env:PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS="true"
 $env:PAPER_AGENT_SKILLBRIDGE_ROOT="F:\codex\code\agent-skill-bridge"
 ```
 

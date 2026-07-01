@@ -2,6 +2,7 @@ import json
 import subprocess
 import shutil
 from paper_agent.paper_agent import parse_args
+import paper_agent.skill_prompts as skill_prompts
 from paper_agent.skill_prompts import (
     PAPER_AGENT_SKILL_ID,
     load_paper_skill_reference,
@@ -19,12 +20,28 @@ class DummyTranslator(BaseTranslator):
 
 
 def test_packaged_paper_skill_references_are_available():
+    skill_prompts._REFERENCE_CACHE.clear()
     root = paper_agent_skill_root()
 
     assert root.name == PAPER_AGENT_SKILL_ID
     assert (root / "SKILL.md").exists()
+    assert load_paper_skill_reference("summary-system-prompt.md", "direct default") == "direct default"
+
+
+def test_local_skill_references_are_available(monkeypatch):
+    skill_prompts._REFERENCE_CACHE.clear()
+    monkeypatch.setenv("PAPER_AGENT_PROMPT_ENGINE", "local")
+
     assert "DeepPaperNote" in load_paper_skill_reference("summary-system-prompt.md")
     assert "$text" in load_paper_skill_reference("translation-prompt.md")
+
+
+def test_skillbridge_engine_requires_explicit_opt_in(monkeypatch):
+    skill_prompts._REFERENCE_CACHE.clear()
+    monkeypatch.setenv("PAPER_AGENT_PROMPT_ENGINE", "skillbridge")
+    monkeypatch.delenv("PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS", raising=False)
+
+    assert load_paper_skill_reference("summary-system-prompt.md", "direct default") == "direct default"
 
 
 def test_skillbridge_root_defaults_to_sibling_repo_or_env(monkeypatch):
@@ -36,10 +53,11 @@ def test_skillbridge_root_defaults_to_sibling_repo_or_env(monkeypatch):
 
 
 def test_load_paper_skill_reference_prefers_skillbridge(monkeypatch):
+    skill_prompts._REFERENCE_CACHE.clear()
     calls = []
 
-    def fake_run(command, cwd, capture_output, text, timeout, check):
-        calls.append((command, cwd, timeout, check))
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
 
         class Result:
             returncode = 0
@@ -47,13 +65,18 @@ def test_load_paper_skill_reference_prefers_skillbridge(monkeypatch):
 
         return Result()
 
+    monkeypatch.setenv("PAPER_AGENT_PROMPT_ENGINE", "skillbridge")
+    monkeypatch.setenv("PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS", "true")
     monkeypatch.setenv("PAPER_AGENT_SKILLBRIDGE_ROOT", r"F:\codex\code\agent-skill-bridge")
-    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/pnpm" if name == "pnpm" else None)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
     monkeypatch.setattr(subprocess, "run", fake_run)
 
     assert load_paper_skill_reference("summary-system-prompt.md") == "from skillbridge"
     assert calls
-    assert calls[0][0][2:5] == ["read", str(paper_agent_skill_root()), "references/summary-system-prompt.md"]
+    command = calls[0][0]
+    assert "read" in command
+    assert str(paper_agent_skill_root()) in command
+    assert "references/summary-system-prompt.md" in command
 
 
 def test_translator_uses_packaged_skill_prompt_by_default():

@@ -142,6 +142,18 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 """
 
 
+LEAN_FINAL_NOTE_PROMPT = """请把分段笔记整合成一份可读的中文 Markdown 论文精读笔记。
+
+要求：
+1. 不要复制英文原文段落，不要保留 PDF 断行或断词。
+2. 只基于给定证据写，不能编造数据集、公式、图表编号、机构、年份或结论。
+3. 必须包含这些二级章节：核心信息、摘要、背景与问题、创新点、方法主线、关键结果、局限、总结。
+4. 用自然段写清楚论文背景、解决什么问题、方法怎么做、关键结果是什么。
+5. 图表占位符只能使用给定的 [[ASSET:n]]，并放在相关解释附近。
+6. 不要输出思考过程、代码块、HTML、JSON、引用章节或“我的笔记”章节。
+"""
+
+
 SYNTHESIZER_SYSTEM_PROMPT = load_paper_skill_reference(
     "summary-system-prompt.md",
     DEEP_PAPER_NOTE_SYSTEM_PROMPT,
@@ -2952,16 +2964,12 @@ def _summarize_chunks_with_codex(
 def _fallback_chunk_note(idx: int, total: int, chunk: str, exc: Exception) -> str:
     cleaned = _clean_xml_text(chunk)
     headings = re.findall(r"(?m)^(?:#{1,4}\s*)?(?:[0-9IVX]+\.?\s+)?[A-Z][A-Za-z0-9 ,:;()/&\\-]{6,90}$", cleaned)
-    sentences = re.split(r"(?<=[。.!?])\s+", cleaned)
-    selected_sentences = [sentence.strip() for sentence in sentences if len(sentence.strip()) > 60][:10]
-    excerpt = "\n".join(selected_sentences) or cleaned[:2200]
     error = _clean_xml_text(str(exc))[:220]
     return (
-        f"## Chunk {idx}/{total} 规则兜底笔记\n"
-        f"本段模型分段总结超时或失败，已使用原文摘录兜底，后续整合只能基于这些证据写保守结论。\n"
+        f"## Chunk {idx}/{total} 超时记录\n"
+        f"本段模型分段总结超时或失败，已跳过原文摘录，避免把英文 raw text 写入最终报告。\n"
         f"错误摘要：{error}\n\n"
-        f"可能章节标题：{'; '.join(headings[:8]) if headings else '未可靠识别'}\n\n"
-        f"原文证据摘录：\n{excerpt[:2600]}"
+        f"可能章节标题：{'; '.join(headings[:8]) if headings else '未可靠识别'}"
     )
 
 
@@ -2986,7 +2994,7 @@ def _integrate_summary_with_codex(
     summarization_patch = _prompt_patch_context(patches, "summarization")
     final_input = _compact_chunk_notes_for_final(chunk_notes)
     prompt = (
-        f"{FINAL_NOTE_PROMPT}\n\n总结语言：{summary_language}\n\n"
+        f"{_final_note_prompt_for_runtime()}\n\n总结语言：{summary_language}\n\n"
         f"历史用户修正规则：\n{memory_context}\n\n"
         f"自优化总结提示词：\n{summarization_patch}\n\n"
         "完整性硬性要求：最终输出必须包含这些二级章节："
@@ -3041,6 +3049,13 @@ def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int 
     return "\n\n".join(compacted)
 
 
+def _final_note_prompt_for_runtime() -> str:
+    style = _first_value({}, "PAPER_AGENT_SUMMARY_PROMPT_STYLE").strip().lower()
+    if style in {"deep", "full", "skill"}:
+        return FINAL_NOTE_PROMPT
+    return LEAN_FINAL_NOTE_PROMPT
+
+
 def _fast_integrate_summary_with_codex(
     client: openai.OpenAI,
     model: str,
@@ -3063,7 +3078,7 @@ def _fast_integrate_summary_with_codex(
         "2. 只基于给定分段笔记和证据写；没有证据就省略，不要编造。\n"
         "3. 必须包含这些二级标题：核心信息、摘要、背景与问题、创新点、方法主线、关键结果、局限、总结。\n"
         "4. 图表占位符只能使用给定的 [[ASSET:n]]，并放在相关段落旁边。\n"
-        "5. 如果某段笔记是规则兜底笔记，只提炼其可读证据，不要把“规则兜底笔记/错误摘要/原文证据摘录”这些字样写入报告。\n\n"
+        "5. 如果某段笔记是超时记录，直接忽略该段，不要把“超时记录/错误摘要/原文证据摘录/英文 raw text”这些字样写入报告。\n\n"
         f"标题证据：{paper_title or '未可靠抽取'}\n\n"
         f"摘要证据：{_clean_xml_text(abstract)[:1200] if abstract else '未可靠抽取'}\n\n"
         f"公式候选：\n{formula_context}\n\n"
@@ -3186,8 +3201,10 @@ def _summary_quality_issues(summary: str) -> list[str]:
     issues: list[str] = []
     forbidden_markers = [
         "规则兜底笔记",
+        "超时记录",
         "错误摘要：",
         "原文证据摘录",
+        "英文 raw text",
         "LLM 最终整合超时",
         "保守版论文精读笔记",
     ]
