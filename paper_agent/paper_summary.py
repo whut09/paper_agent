@@ -3084,7 +3084,7 @@ def _fast_integrate_summary_with_codex(
         "硬性要求：\n"
         "1. 必须输出中文自然段，不要复制英文原文段落，不要保留 PDF 断行或断词。\n"
         "2. 只基于给定分段笔记和证据写；没有证据就省略，不要编造。\n"
-        "3. 必须包含这些二级标题：核心信息、摘要、背景与问题、创新点、方法主线、关键结果、局限、总结。\n"
+        "3. 必须包含这些二级标题：核心信息、摘要、背景与问题、创新点、一句话总结、方法主线、关键结果、深度分析、局限、总结。\n"
         "4. 图表占位符只能使用给定的 [[ASSET:n]]，并放在相关段落旁边。\n"
         "5. 如果某段笔记是超时记录，直接忽略该段，不要把“超时记录/错误摘要/原文证据摘录/英文 raw text”这些字样写入报告。\n\n"
         f"标题证据：{paper_title or '未可靠抽取'}\n\n"
@@ -3154,8 +3154,8 @@ def _verify_summary_claims(
         paper_title,
         correction_memories or [],
     )
+    guard_errors = _blocking_guard_errors(guard_results)
     if _summary_is_degraded_fallback(summary):
-        guard_warnings = _blocking_guard_errors(guard_results)
         verification = VerificationResult(
             True,
             [],
@@ -3171,8 +3171,21 @@ def _verify_summary_claims(
                         "claim": "",
                         "reason": warning,
                     }
-                    for warning in guard_warnings
+                    for warning in guard_errors
                 ],
+            ],
+        )
+        return summary, verification, guard_results
+    if not claims and not guard_errors:
+        verification = VerificationResult(
+            True,
+            [],
+            soft_warnings=[
+                {
+                    "type": "no_verifiable_claims_warning",
+                    "claim": "",
+                    "reason": "本地 Guard 已通过，但未从报告中抽取到结构化 claim，已跳过 LLM claim verifier。",
+                }
             ],
         )
         return summary, verification, guard_results
@@ -3184,7 +3197,6 @@ def _verify_summary_claims(
         correction_memories or [],
         prompt_patches,
     )
-    guard_errors = _blocking_guard_errors(guard_results)
     if guard_errors:
         _add_guard_failures_to_verification(verification, guard_errors)
         verification.passed = False
@@ -4568,6 +4580,7 @@ def _strip_preface_before_markdown_report(text: str) -> str:
 
 def _normalize_final_sections(text: str) -> str:
     text = text.replace("标题翻译", "中文标题")
+    text = _normalize_required_heading_levels(text)
     text = re.sub(r"(?m)^##\s*(?:原文摘要翻译|摘要翻译)\s*$", "## 摘要", text)
     text = re.sub(r"(?m)^##\s*(?:研究背景|背景介绍|背景|研究问题|问题定义|问题与背景)\s*$", "## 背景与问题", text)
     text = _merge_background_problem_sections(text)
@@ -4581,6 +4594,53 @@ def _normalize_final_sections(text: str) -> str:
     text = text.replace("翻译", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+
+def _normalize_required_heading_levels(text: str) -> str:
+    aliases = {
+        "核心信息": "核心信息",
+        "论文信息": "核心信息",
+        "基本信息": "核心信息",
+        "摘要": "摘要",
+        "原文摘要": "摘要",
+        "中文摘要": "摘要",
+        "背景与问题": "背景与问题",
+        "研究背景": "背景与问题",
+        "背景介绍": "背景与问题",
+        "背景": "背景与问题",
+        "研究问题": "背景与问题",
+        "问题定义": "背景与问题",
+        "问题与背景": "背景与问题",
+        "创新点": "创新点",
+        "核心贡献": "创新点",
+        "贡献": "创新点",
+        "主要贡献": "创新点",
+        "一句话总结": "一句话总结",
+        "一句话概括": "一句话总结",
+        "方法主线": "方法主线",
+        "方法": "方法主线",
+        "方法概览": "方法主线",
+        "关键结果": "关键结果",
+        "实验结果": "关键结果",
+        "结果": "关键结果",
+        "深度分析": "深度分析",
+        "分析": "深度分析",
+        "讨论": "深度分析",
+        "局限": "局限",
+        "局限性": "局限",
+        "限制": "局限",
+        "总结": "总结",
+        "结论": "总结",
+    }
+
+    def normalize(match: re.Match) -> str:
+        title = re.sub(r"[：:]\s*$", "", match.group(2).strip())
+        canonical = aliases.get(title)
+        if canonical:
+            return f"## {canonical}"
+        return match.group(0)
+
+    return re.sub(r"(?m)^(#{2,6})\s+(.+?)\s*$", normalize, text)
 
 
 def _merge_background_problem_sections(text: str) -> str:
