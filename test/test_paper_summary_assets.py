@@ -33,6 +33,8 @@ from paper_agent.paper_summary import (
     _format_guard,
     _load_correction_memories,
     _expand_table_rect_to_borders,
+    _figure_caption_continuation_is_body_text,
+    _graphic_region_is_page_artifact,
     _memory_guard,
     _postprocess_summary,
     _missing_asset_references,
@@ -47,6 +49,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _sync_inline_asset_references,
     _visual_rect_for_caption,
+    _visual_rect_for_caption_direction,
     _verification_should_block_report,
     _with_asset_references,
     _run_harness_guards,
@@ -920,3 +923,42 @@ def test_formula_marker_is_inserted_before_fallback_figures():
 
     assert result.index("[[ASSET:3]]") < result.index("[[ASSET:1]]")
     assert "[[ASSET:3]]" in result
+
+
+def test_figure_caption_period_stops_before_following_body_text():
+    assert _figure_caption_continuation_is_body_text(
+        "Fig. 4. Degradation-aware accuracy of MLLMs on Q-Bench.",
+        "restoration operations in the subsequent iteration lead to an improvement.",
+    )
+
+
+def test_page_sized_graphic_region_is_ignored_as_artifact():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    assert _graphic_region_is_page_artifact(FakePage(), fitz.Rect(-120, -70, 696, 443))
+    assert not _graphic_region_is_page_artifact(FakePage(), fitz.Rect(48, 44, 562, 372))
+
+
+def test_tight_above_figure_wins_over_larger_below_body_region():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, *_args, **_kwargs):
+            return {"blocks": []}
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(318, 410, 575, 545)},
+                {"rect": fitz.Rect(318, 560, 575, 750)},
+            ]
+
+    caption = fitz.Rect(312, 547, 564, 555)
+    lines = [TextLine("Fig. 5. The superiority of Q-Agent.", caption)]
+
+    above = _visual_rect_for_caption_direction(FakePage(), caption, lines, "above")
+    below = _visual_rect_for_caption_direction(FakePage(), caption, lines, "below")
+    selected = _visual_rect_for_caption(FakePage(), caption, lines)
+
+    assert above is not None and below is not None
+    assert selected == above

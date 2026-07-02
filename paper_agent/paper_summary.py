@@ -997,6 +997,8 @@ def _capture_tables(
         table_rect = _expand_table_rect_to_borders(page, table_rect)
         caption, caption_rect = _nearby_caption_with_rect(page, table_rect, ("table", "表"))
         table_text = _table_to_text(table)
+        if not caption and _table_detection_looks_like_page_region(page, table_rect):
+            continue
         if not caption and not _table_detection_looks_reliable(table, table_text):
             continue
         clip_rect = _merge_rects([table_rect, caption_rect]) if caption_rect else table_rect
@@ -1691,6 +1693,28 @@ def _next_caption_or_heading_y(
     return min(candidates) if candidates else None
 
 
+def _previous_caption_or_heading_y(
+    lines: list[TextLine],
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+) -> float | None:
+    candidates: list[float] = []
+    for line in lines:
+        if line.rect.y1 >= caption_rect.y0 - 3:
+            continue
+        if caption_rect.y0 - line.rect.y1 > 430:
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0:
+            continue
+        if _caption_is_table(line.text) or _caption_is_figure(line.text):
+            candidates.append(line.rect.y1 + 2)
+            continue
+        if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z ]{2,}$", line.text.strip()):
+            candidates.append(line.rect.y1 + 2)
+    return max(candidates) if candidates else None
+
+
 def _group_lines_by_row(lines: list[TextLine]) -> list[list[TextLine]]:
     rows: list[list[TextLine]] = []
     for line in sorted(lines, key=lambda item: (item.rect.y0, item.rect.x0)):
@@ -1853,6 +1877,8 @@ def _figure_caption_continuation_is_body_text(previous_text: str, next_text: str
         return False
     if re.match(r"^(?:Figure|Fig\.?|Table|Tab\.?)\s*\d+", following, flags=re.IGNORECASE):
         return True
+    if following[:1].islower() and len(re.findall(r"[A-Za-z]{2,}", following)) >= 3:
+        return True
     if following[:1].isupper() and len(re.findall(r"[A-Za-z]{2,}", following)) >= 3:
         return True
     return bool(re.match(r"^(?:To|We|The|This|These|Our|In)\b", following))
@@ -1871,31 +1897,66 @@ def _visual_rect_for_caption(
     caption_rect: fitz.Rect,
     lines: list[TextLine],
 ) -> fitz.Rect | None:
+    above = _visual_rect_for_caption_direction(page, caption_rect, lines, "above")
+    below = _visual_rect_for_caption_direction(page, caption_rect, lines, "below")
+    if above is None:
+        return below
+    if below is None:
+        return above
+
+    above_gap = max(0.0, caption_rect.y0 - above.y1)
+    below_gap = max(0.0, below.y0 - caption_rect.y1)
+    if above_gap <= 25:
+        return above
+    if below_gap <= 70 and (above_gap > 70 or below.height > above.height * 0.75):
+        return below
+    return above
+
+
+def _visual_rect_for_caption_direction(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine],
+    direction: str,
+) -> fitz.Rect | None:
     left, right = _caption_column_bounds(page, caption_rect)
-    search_top = max(0, caption_rect.y0 - min(520, page.rect.height * 0.7))
-    candidates = []
-    column_rect = fitz.Rect(left, search_top, right, caption_rect.y0 + 6)
+    if direction == "above":
+        previous_boundary = _previous_caption_or_heading_y(lines, caption_rect, left, right)
+        search_top = max(previous_boundary or 0, caption_rect.y0 - min(520, page.rect.height * 0.7))
+        search_bottom = caption_rect.y0 - 1
+    else:
+        next_boundary = _next_caption_or_heading_y(lines, caption_rect, left, right)
+        search_top = caption_rect.y1 + 1
+        search_bottom = next_boundary or min(page.rect.height - 24, caption_rect.y1 + min(420, page.rect.height * 0.55))
+
+    if search_bottom <= search_top + 20:
+        return None
+
+    column_rect = fitz.Rect(left, search_top, right, search_bottom)
+    candidates: list[fitz.Rect] = []
     for region in _page_graphic_regions(page):
-        if region.y0 > caption_rect.y0 + 4 or region.y1 < search_top:
+        if region.y1 < search_top or region.y0 > search_bottom:
             continue
         if _rect_overlap_fraction(region, column_rect) <= 0:
             continue
         horizontal = _horizontal_overlap_fraction(region, left, right)
-        if horizontal < 0.15:
+        if horizontal < 0.12:
             continue
         if region.width < 18 or region.height < 12:
             continue
-        candidates.append(region)
+        candidates.append(region & column_rect)
     if not candidates:
         return None
 
-    near = [r for r in candidates if -8 <= caption_rect.y0 - r.y1 <= 150]
-    seed_pool = near or candidates
-    seed = max(seed_pool, key=lambda r: r.width * r.height)
-    barrier_y = _figure_upper_barrier_y(lines, seed, caption_rect, left, right, search_top)
-    if barrier_y is not None:
-        search_top = max(search_top, barrier_y + 2)
-        candidates = [region for region in candidates if region.y0 >= search_top - 1]
+    if direction == "above":
+        near = [r for r in candidates if 0 <= caption_rect.y0 - r.y1 <= 180]
+        seed_pool = near or candidates
+        seed = max(seed_pool, key=lambda r: (r.y1, r.width * r.height))
+    else:
+        near = [r for r in candidates if 0 <= r.y0 - caption_rect.y1 <= 180]
+        seed_pool = near or candidates
+        seed = min(seed_pool, key=lambda r: (r.y0, -r.width * r.height))
+
     group = fitz.Rect(seed)
     changed = True
     while changed:
@@ -1903,12 +1964,13 @@ def _visual_rect_for_caption(
         for region in candidates:
             if not _figure_region_belongs_to_group(region, seed, group):
                 continue
-            if _rect_overlap_fraction(region, group) > 0.05 or _rect_gap(region, group) <= 45:
+            if _rect_overlap_fraction(region, group) > 0.03 or _rect_gap(region, group) <= 52:
                 before = tuple(group)
                 group |= region
                 if tuple(group) != before:
                     changed = True
-    group &= fitz.Rect(left, search_top, right, caption_rect.y0 - 1)
+
+    group &= column_rect
     if group.is_empty or group.width < 40 or group.height < 30:
         return None
     return group
@@ -2017,7 +2079,7 @@ def _page_graphic_regions(page: fitz.Page) -> list[fitz.Rect]:
         for block in blocks:
             if block.get("type") == 1:
                 rect = fitz.Rect(block.get("bbox"))
-                if rect.width >= 12 and rect.height >= 12:
+                if rect.width >= 12 and rect.height >= 12 and not _graphic_region_is_page_artifact(page, rect):
                     regions.append(rect)
     except Exception:
         pass
@@ -2027,11 +2089,26 @@ def _page_graphic_regions(page: fitz.Page) -> list[fitz.Rect]:
             if not rect:
                 continue
             rect = fitz.Rect(rect)
-            if rect.width >= 12 and rect.height >= 12:
+            if rect.width >= 12 and rect.height >= 12 and not _graphic_region_is_page_artifact(page, rect):
                 regions.append(rect)
     except Exception:
         pass
     return regions
+
+
+def _graphic_region_is_page_artifact(page: fitz.Page, rect: fitz.Rect) -> bool:
+    extends_outside = (
+        rect.x0 < page.rect.x0 - 20
+        or rect.y0 < page.rect.y0 - 20
+        or rect.x1 > page.rect.x1 + 20
+        or rect.y1 > page.rect.y1 + 20
+    )
+    if extends_outside and rect.width > page.rect.width * 0.9 and rect.height > page.rect.height * 0.35:
+        return True
+    page_area = max(page.rect.width * page.rect.height, 1.0)
+    if rect.width > page.rect.width * 0.98 and rect.height > page.rect.height * 0.55 and rect.width * rect.height > page_area * 0.45:
+        return True
+    return False
 
 
 def _rect_gap(first: fitz.Rect, second: fitz.Rect) -> float:
@@ -2098,6 +2175,16 @@ def _table_detection_looks_reliable(table, table_text: str) -> bool:
     if len(non_empty_rows) <= 2 and len(words) > non_empty_cells:
         return False
     return True
+
+
+def _table_detection_looks_like_page_region(page: fitz.Page, rect: fitz.Rect) -> bool:
+    page_area = max(page.rect.width * page.rect.height, 1.0)
+    rect_area = max(rect.width * rect.height, 0.0)
+    if rect.width > page.rect.width * 0.72 and rect.height > page.rect.height * 0.30:
+        return True
+    if rect_area > page_area * 0.25 and rect.width > page.rect.width * 0.65:
+        return True
+    return False
 
 
 def _nearby_caption(page: fitz.Page, rect: fitz.Rect, prefixes: Iterable[str]) -> str:
