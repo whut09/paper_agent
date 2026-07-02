@@ -443,13 +443,12 @@ class ExtractMethods(_PaperWorkflowNode):
     produces = ["draft_report"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
-        if context.client is None or context.config is None:
-            raise ValueError("ExtractMethods requires an initialized Codex client.")
+        client, config = _ensure_workflow_codex_client(context)
         context.check_cancelled()
         context.report(0.68, "整合方法、结果和分析...")
         context.summary = _integrate_summary_with_codex(
-            context.client,
-            context.config.model,
+            client,
+            config.model,
             context.chunk_notes,
             context.assets,
             context.summary_language,
@@ -471,16 +470,15 @@ class VerifyClaims(_PaperWorkflowNode):
     produces = ["verification_report", "verified_report", "knowledge_graph"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
-        if context.client is None or context.config is None:
-            raise ValueError("VerifyClaims requires an initialized Codex client.")
+        client, config = _ensure_workflow_codex_client(context)
         context.report(0.78, "校验标题、摘要和图表引用...")
         context.summary, context.verification, context.guard_results = _verify_summary_claims(
             context.summary,
             context.text,
             context.grounding_map,
             context.abstract,
-            context.client,
-            context.config.model,
+            client,
+            config.model,
             context.paper_title,
             context.assets,
             context.correction_memories,
@@ -561,6 +559,14 @@ class GenerateReport(_PaperWorkflowNode):
         )
         _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
+
+
+def _ensure_workflow_codex_client(context: _PaperWorkflowContext) -> tuple[openai.OpenAI, CodexConfig]:
+    if context.config is None:
+        context.config = _resolve_codex_config(context.codex_envs)
+    if context.client is None:
+        context.client = _create_codex_client(context.config)
+    return context.client, context.config
 
 
 def _normalize_node_result(
@@ -3329,10 +3335,11 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
         raise ValueError("Revision requires a verification report.")
     context.verification.revision_attempted = True
     context.revision_attempts += 1
-    if _verification_needs_full_report_rewrite(context.verification) and context.client is not None and context.config is not None:
+    if _verification_needs_full_report_rewrite(context.verification):
+        client, config = _ensure_workflow_codex_client(context)
         revised_summary = _repair_report_format_with_codex(
-            context.client,
-            context.config.model,
+            client,
+            config.model,
             context.summary,
             context.assets,
             context.abstract,
