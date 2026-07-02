@@ -90,6 +90,9 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
     """
     session = requests.Session()
     session.trust_env = not get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY")
+    download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
+    if download_proxy:
+        session.proxies.update({"http": download_proxy, "https": download_proxy})
     target: Path | None = None
     temp_target: Path | None = None
     last_error: requests.exceptions.RequestException | None = None
@@ -138,7 +141,9 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
         raise
     except requests.exceptions.RequestException as exc:
         proxy_hint = ""
-        if session.trust_env and (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
+        if download_proxy:
+            proxy_hint = "当前论文下载请求已配置 PAPER_AGENT_DOWNLOAD_PROXY；如果代理不可用，请检查代理地址或改用文件上传。"
+        elif session.trust_env and (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
             proxy_hint = (
                 "当前检测到 HTTP_PROXY/HTTPS_PROXY，下载请求会经过代理；"
                 "如果代理不稳定，可以在 config.local.json 中设置 "
@@ -569,6 +574,8 @@ def setup_gui(
         demo.launch(server_name="0.0.0.0", max_file_size="5mb", inbrowser=True)
         return
 
+    _ensure_local_proxy_bypass()
+
     # Try binding addresses in order: "0.0.0.0" for IPv4, fallback to loopback
     bind_addresses = ["0.0.0.0", "127.0.0.1"]
 
@@ -589,7 +596,14 @@ def setup_gui(
                 "This may be caused by global mode of proxy software."
             )
 
-    # Last resort: let Gradio create a share link
+    if not share:
+        raise RuntimeError(
+            "Unable to launch local Gradio GUI. If proxy software is running in "
+            "global mode, add 127.0.0.1, localhost, and 0.0.0.0 to the proxy "
+            "bypass list, or run with a different --serverport."
+        )
+
+    # Last resort for explicit share mode only.
     demo.launch(
         debug=True,
         inbrowser=True,
@@ -597,6 +611,25 @@ def setup_gui(
         server_port=server_port,
         **auth_kwargs,
     )
+
+
+def _ensure_local_proxy_bypass() -> None:
+    local_hosts = [
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "::1",
+    ]
+    existing = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
+    parts = [part.strip() for part in existing.split(",") if part.strip()]
+    seen = {part.lower() for part in parts}
+    for host in local_hosts:
+        if host.lower() not in seen:
+            parts.append(host)
+            seen.add(host.lower())
+    value = ",".join(parts)
+    os.environ["NO_PROXY"] = value
+    os.environ["no_proxy"] = value
 
 
 # For auto-reloading while developing
