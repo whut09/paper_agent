@@ -187,6 +187,7 @@ class CodexConfig:
     api_key: str
     model: str
     use_proxy: bool = False
+    proxy: str = ""
 
 
 @dataclass
@@ -2334,6 +2335,7 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
     api_key = _first_value(envs, "CODEX_API_KEY", "OPENAI_API_KEY")
     model = _first_value(envs, "CODEX_MODEL", "OPENAI_MODEL")
     use_proxy = _truthy(_first_value(envs, "CODEX_USE_PROXY", "OPENAI_USE_PROXY"))
+    proxy = _first_value(envs, "CODEX_PROXY", "OPENAI_PROXY")
 
     if not base_url:
         raise ValueError("缺少 CODEX_BASE_URL，请在前端或 config.json 中配置 Codex 本地接口 URL。")
@@ -2341,7 +2343,13 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
         raise ValueError("缺少 CODEX_MODEL，请在前端或 config.json 中配置模型名称。")
     if not api_key:
         api_key = "codex-local"
-    return CodexConfig(base_url=base_url, api_key=api_key, model=model, use_proxy=use_proxy)
+    return CodexConfig(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        use_proxy=use_proxy,
+        proxy=proxy,
+    )
 
 
 def _truthy(value: str) -> bool:
@@ -4370,9 +4378,13 @@ def _extract_json_object(text: str) -> str:
 
 def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
     timeout_seconds = _codex_timeout_seconds()
+    client_kwargs = {}
+    if config.use_proxy and config.proxy:
+        client_kwargs["proxy"] = config.proxy
     http_client = httpx.Client(
         trust_env=config.use_proxy,
         timeout=httpx.Timeout(timeout_seconds, connect=min(20.0, timeout_seconds)),
+        **client_kwargs,
     )
     return openai.OpenAI(
         base_url=config.base_url,

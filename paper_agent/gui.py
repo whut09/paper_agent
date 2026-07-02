@@ -264,6 +264,7 @@ def summarize_file(
                 "CODEX_API_KEY": get_config_or_env("CODEX_API_KEY"),
                 "CODEX_MODEL": get_config_or_env("CODEX_MODEL"),
                 "CODEX_USE_PROXY": get_config_or_env("CODEX_USE_PROXY"),
+                "CODEX_PROXY": get_config_or_env("CODEX_PROXY"),
             },
             max_assets=max_assets_value,
             progress=progress_bar,
