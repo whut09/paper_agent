@@ -13,7 +13,7 @@ def test_table_asset_is_not_duplicated_by_fallback_section():
         "[[ASSET:1]]\n"
     )
 
-    xml = _document_xml("paper.pdf", summary, assets, [(Path("table7.png"), "image1.png", "rId4")], [])
+    xml = _document_xml("paper.pdf", summary, assets, [(Path("table7.png"), "image1.png", "rId4")])
 
     assert xml.count("image1.png") == 1
     assert xml.count("关键图表") == 0

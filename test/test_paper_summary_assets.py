@@ -21,6 +21,7 @@ from paper_agent.paper_summary import (
     _caption_is_table,
     _caption_text_and_rect,
     _asset_guard,
+    _assert_report_ready_for_docx,
     _correction_memory_context,
     _document_xml,
     _evidence_guard,
@@ -578,17 +579,28 @@ def test_verifier_soft_warnings_do_not_block_report():
     assert not _verification_should_block_report(warning_only)
 
 
-def test_docx_document_xml_appends_verifier_warnings():
+def test_docx_document_xml_omits_verifier_warnings_appendix():
     xml = _document_xml(
         "paper.pdf",
         "# 测试论文\n## 方法主线\n方法描述。",
         [],
         [],
-        ["weak_evidence: 原文只有单数据集实验"],
     )
 
-    assert "附录：Verifier Warnings" in xml
-    assert "weak_evidence: 原文只有单数据集实验" in xml
+    assert "Verifier Warnings" not in xml
+    assert "weak_evidence" not in xml
+
+
+def test_docx_quality_gate_blocks_incomplete_report():
+    incomplete = "## 总结\n这篇论文讨论了图像恢复中的两个问题。"
+
+    try:
+        _assert_report_ready_for_docx(incomplete)
+    except RuntimeError as exc:
+        assert "总结完整性自检未通过" in str(exc)
+        assert "缺少必要章节" in str(exc)
+        return
+    raise AssertionError("incomplete report was not blocked")
 
 
 def test_verifier_format_error_does_not_block_report():

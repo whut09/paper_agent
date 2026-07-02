@@ -550,12 +550,12 @@ class GenerateReport(_PaperWorkflowNode):
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+        _assert_report_ready_for_docx(context.summary)
         _write_docx(
             context.docx_path,
             context.source_path.name,
             context.summary,
             context.assets,
-            _verification_warning_messages(context.verification) if context.verification else [],
         )
         _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
@@ -3262,6 +3262,44 @@ def _summary_quality_issues(summary: str) -> list[str]:
     return issues
 
 
+def _assert_report_ready_for_docx(summary: str) -> None:
+    normalized = _normalize_final_sections(_postprocess_summary(summary))
+    errors = _docx_report_quality_errors(normalized)
+    if errors:
+        raise RuntimeError(
+            "总结完整性自检未通过，已停止生成 Word，避免输出残缺报告："
+            + "；".join(errors)
+            + "。请重试生成，或检查 Codex 接口是否返回了完整结构化总结。"
+        )
+
+
+def _docx_report_quality_errors(summary: str) -> list[str]:
+    errors: list[str] = []
+    missing_sections = _missing_required_report_sections(summary)
+    if missing_sections:
+        errors.append(f"缺少必要章节：{', '.join(missing_sections)}")
+
+    too_short_sections = _too_short_required_sections(summary)
+    if too_short_sections:
+        errors.append(f"章节内容过短：{', '.join(too_short_sections)}")
+
+    body = re.sub(r"\[\[ASSET:\d+\]\]", "", summary)
+    body = re.sub(r"(?m)^#{1,6}\s+.*$", "", body)
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", body))
+    if cjk_chars < 700:
+        errors.append(f"中文正文内容过少：{cjk_chars} 字")
+
+    present_required = [
+        section
+        for section in _required_report_sections()
+        if re.search(rf"(?m)^##\s+{re.escape(section)}\s*$", summary)
+    ]
+    if len(present_required) < 8:
+        errors.append(f"必要章节覆盖不足：{len(present_required)}/10")
+
+    return errors
+
+
 def _run_harness_guards(
     summary: str,
     grounded_map: dict[str, list[dict[str, str]]],
@@ -5184,13 +5222,12 @@ def _write_docx(
     paper_filename: str,
     summary: str,
     assets: list[PaperAsset],
-    verification_warnings: list[str] | None = None,
 ) -> None:
     media_files = [
         (asset.path, f"image{i + 1}.png", f"rId{i + 4}")
         for i, asset in enumerate(assets)
     ]
-    document_xml = _document_xml(paper_filename, summary, assets, media_files, verification_warnings or [])
+    document_xml = _document_xml(paper_filename, summary, assets, media_files)
     rels_xml = _document_rels(media_files)
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as docx:
@@ -5213,7 +5250,6 @@ def _document_xml(
     summary: str,
     assets: list[PaperAsset],
     media_files: list[tuple[Path, str, str]],
-    verification_warnings: list[str] | None = None,
 ) -> str:
     summary = _normalize_final_sections(_postprocess_summary(summary))
     body = [
@@ -5297,11 +5333,6 @@ def _document_xml(
             body.append(_paragraph(_asset_reference_sentence(label), "AssetLead"))
             body.append(_image_paragraph(source, asset_id, rel_id))
             used_assets.add(asset_id)
-
-    if verification_warnings:
-        body.append(_paragraph("附录：Verifier Warnings", "Heading1"))
-        for warning in verification_warnings:
-            body.append(_paragraph(_normalize_markdown_line(warning), None))
 
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
