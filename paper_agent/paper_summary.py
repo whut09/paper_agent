@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import html
@@ -2988,7 +2988,7 @@ def _fallback_chunk_note(idx: int, total: int, chunk: str, exc: Exception) -> st
 
 
 def _integrate_summary_with_codex(
-    client: openai.OpenAI,
+    client: openai.OpenAI | None,
     model: str,
     chunk_notes: list[str],
     assets: list[PaperAsset],
@@ -3000,6 +3000,7 @@ def _integrate_summary_with_codex(
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
 ) -> str:
+    client = _coerce_codex_client(client)
     asset_context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=800)
     formula_context = _formula_context(formulas)
     memories = correction_memories or []
@@ -3071,7 +3072,7 @@ def _final_note_prompt_for_runtime() -> str:
 
 
 def _fast_integrate_summary_with_codex(
-    client: openai.OpenAI,
+    client: openai.OpenAI | None,
     model: str,
     chunk_notes: list[str],
     assets: list[PaperAsset],
@@ -3082,6 +3083,7 @@ def _fast_integrate_summary_with_codex(
     paper_title: str,
     original_error: Exception,
 ) -> str:
+    client = _coerce_codex_client(client)
     compact_notes = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=14000)
     asset_context = _asset_context(assets[:8], text_preview_chars=0, latex_preview_chars=300)
     formula_context = _formula_context(formulas[:6])
@@ -3138,13 +3140,14 @@ def _verify_summary_claims(
     paper_text: str,
     grounding_map: dict[str, list[dict[str, str]]],
     abstract: str,
-    client: openai.OpenAI,
+    client: openai.OpenAI | None,
     model: str,
     paper_title: str,
     assets: list[PaperAsset],
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
 ) -> tuple[str, VerificationResult, list[GuardResult]]:
+    client = _coerce_codex_client(client)
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
@@ -4404,7 +4407,7 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
 
 
 def _repair_report_format_with_codex(
-    client: openai.OpenAI,
+    client: openai.OpenAI | None,
     model: str,
     summary: str,
     assets: list[PaperAsset],
@@ -4412,6 +4415,7 @@ def _repair_report_format_with_codex(
     paper_title: str,
     verification: VerificationResult,
 ) -> str:
+    client = _coerce_codex_client(client)
     missing_or_short = "\n".join(_verification_failure_details(verification).splitlines()[:12])
     prompt = (
         "你是论文精读报告格式修复器。请只基于已有报告内容做 Markdown 结构修复，"
@@ -4444,6 +4448,15 @@ def _repair_report_format_with_codex(
         http_client=http_client,
         max_retries=0,
     )
+
+
+def _coerce_codex_client(client: openai.OpenAI | None) -> openai.OpenAI | None:
+    if client is not None:
+        return client
+    try:
+        return _create_codex_client(_resolve_codex_config({}))
+    except ValueError:
+        return client
 
 
 def _codex_timeout_seconds() -> float:
@@ -5932,3 +5945,4 @@ def _clean_xml_text(value: str) -> str:
 def _safe_stem(stem: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9._-]+", "_", stem).strip("._-")
     return safe or "paper"
+
