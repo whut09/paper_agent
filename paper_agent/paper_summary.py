@@ -4404,6 +4404,12 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
         timeout=httpx.Timeout(timeout_seconds, connect=min(20.0, timeout_seconds)),
         **client_kwargs,
     )
+    return openai.OpenAI(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        http_client=http_client,
+        max_retries=0,
+    )
 
 
 def _repair_report_format_with_codex(
@@ -4441,12 +4447,6 @@ def _repair_report_format_with_codex(
         system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
         max_tokens=3600,
         max_attempts=1,
-    )
-    return openai.OpenAI(
-        base_url=config.base_url,
-        api_key=config.api_key,
-        http_client=http_client,
-        max_retries=0,
     )
 
 
@@ -4487,13 +4487,15 @@ def _codex_summary_concurrency() -> int:
 
 
 def _chat(
-    client: openai.OpenAI,
+    client: openai.OpenAI | None,
     model: str,
     user_prompt: str,
     system_prompt: str = DEEP_PAPER_NOTE_SYSTEM_PROMPT,
     max_tokens: int | None = None,
     max_attempts: int | None = None,
 ) -> str:
+    if client is None:
+        raise RuntimeError("Codex 客户端未初始化，请检查 CODEX_BASE_URL、CODEX_API_KEY、CODEX_MODEL 配置。")
     max_attempts = max_attempts or _codex_chat_attempts()
     last_error: Exception | None = None
     for attempt in range(max_attempts):

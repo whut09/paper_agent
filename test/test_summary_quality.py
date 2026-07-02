@@ -46,3 +46,24 @@ def test_final_integration_stops_instead_of_raw_fallback_when_llm_times_out():
         )
     finally:
         ps._chat = original_chat
+
+
+def test_codex_client_factory_returns_chat_client():
+    config = ps.CodexConfig(
+        base_url="https://api.example.test/v1",
+        api_key="test-key",
+        model="test-model",
+        use_proxy=False,
+        proxy="",
+    )
+    client = ps._create_codex_client(config)
+
+    assert client is not None
+    assert hasattr(client, "chat")
+
+
+def test_chat_rejects_missing_client_with_clear_error():
+    _assert_raises_runtime_error(
+        lambda: ps._chat(None, "test-model", "hello"),
+        "Codex",
+    )
