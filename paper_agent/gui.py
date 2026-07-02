@@ -7,6 +7,7 @@ import time
 import uuid
 from asyncio import CancelledError
 from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote, urlparse
 
 import gradio as gr
@@ -74,9 +75,19 @@ def verify_recaptcha(response):
 
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 DOWNLOAD_RETRIES = 3
+DOWNLOAD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 PaperAgent/0.1 (+https://github.com/whut09/paper_agent)",
+    "Accept": "application/pdf,application/octet-stream,*/*",
+}
+DownloadProgressCallback = Callable[[int, int | None], None]
 
 
-def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> str:
+def download_with_limit(
+    url: str,
+    save_path: Path,
+    size_limit: int | None,
+    progress_callback: DownloadProgressCallback | None = None,
+) -> str:
     """
     This function downloads a file from a URL and saves it to a specified path.
 
@@ -88,6 +99,7 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
     Returns:
         - The path of the downloaded file
     """
+    url = _normalize_paper_url(url)
     session = requests.Session()
     session.trust_env = not get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY")
     download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
@@ -99,7 +111,9 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
     try:
         for attempt in range(DOWNLOAD_RETRIES):
             resume_from = temp_target.stat().st_size if temp_target and temp_target.exists() else 0
-            headers = {"Range": f"bytes={resume_from}-"} if resume_from else None
+            headers = dict(DOWNLOAD_HEADERS)
+            if resume_from:
+                headers["Range"] = f"bytes={resume_from}-"
             try:
                 with session.get(url, stream=True, timeout=(8, 45), headers=headers) as response:
                     response.raise_for_status()
@@ -115,6 +129,8 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
                         temp_target.unlink(missing_ok=True)
                         raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
                     total_size = resume_from
+                    if progress_callback:
+                        progress_callback(total_size, expected_size)
                     mode = "ab" if resume_from else "wb"
                     with open(temp_target, mode) as file:
                         for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
@@ -125,6 +141,8 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
                                 temp_target.unlink(missing_ok=True)
                                 raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
                             file.write(chunk)
+                            if progress_callback:
+                                progress_callback(total_size, expected_size)
                     if expected_size and total_size < expected_size:
                         raise requests.exceptions.ChunkedEncodingError(
                             f"incomplete download: {total_size} bytes read, {expected_size} expected"
@@ -151,6 +169,16 @@ def download_with_limit(url: str, save_path: Path, size_limit: int | None) -> st
             )
         retry_hint = "已自动重试下载但仍失败；可以再次点击生成，或先在浏览器下载 PDF 后使用文件上传。"
         raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
+
+
+def _normalize_paper_url(url: str) -> str:
+    normalized = url.strip()
+    parsed = urlparse(normalized)
+    if parsed.netloc.lower().endswith("arxiv.org") and parsed.path.startswith("/abs/"):
+        paper_id = parsed.path.removeprefix("/abs/").strip("/")
+        if paper_id:
+            return f"https://arxiv.org/pdf/{paper_id}"
+    return normalized
 
 
 def _download_filename(url: str, response: requests.Response) -> str:
@@ -221,15 +249,30 @@ def summarize_file(
     if file_type == "File":
         if not file_input:
             raise gr.Error("No input")
+        progress(0.03, desc="Preparing uploaded paper...")
         file_path = shutil.copy(file_input, output)
     else:
         if not link_input:
             raise gr.Error("No input")
+        progress(0.01, desc="Downloading paper...")
+
+        def download_progress(downloaded: int, total: int | None) -> None:
+            if total:
+                ratio = min(downloaded / max(total, 1), 1.0)
+                downloaded_mb = downloaded / 1024 / 1024
+                total_mb = total / 1024 / 1024
+                progress(0.01 + ratio * 0.09, desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB")
+            else:
+                downloaded_mb = downloaded / 1024 / 1024
+                progress(0.03, desc=f"Downloading paper... {downloaded_mb:.1f} MB")
+
         file_path = download_with_limit(
             link_input,
             output,
             5 * 1024 * 1024 if flag_demo else None,
+            progress_callback=download_progress,
         )
+        progress(0.1, desc="Download complete. Parsing paper...")
 
     if page_range != "Others":
         selected_page = page_map[page_range]
