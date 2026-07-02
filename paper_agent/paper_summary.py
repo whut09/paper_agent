@@ -3330,18 +3330,14 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     context.verification.revision_attempted = True
     context.revision_attempts += 1
     if _verification_needs_full_report_rewrite(context.verification) and context.client is not None and context.config is not None:
-        revised_summary = _integrate_summary_with_codex(
+        revised_summary = _repair_report_format_with_codex(
             context.client,
             context.config.model,
-            context.chunk_notes,
+            context.summary,
             context.assets,
-            context.summary_language,
             context.abstract,
-            context.formulas,
-            _recognized_formula_context(context.assets),
             context.paper_title,
-            context.correction_memories,
-            context.prompt_patches,
+            context.verification,
         )
     else:
         revised_summary = _apply_verifier_patch_suggestions(
@@ -4397,6 +4393,43 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
         trust_env=config.use_proxy,
         timeout=httpx.Timeout(timeout_seconds, connect=min(20.0, timeout_seconds)),
         **client_kwargs,
+    )
+
+
+def _repair_report_format_with_codex(
+    client: openai.OpenAI,
+    model: str,
+    summary: str,
+    assets: list[PaperAsset],
+    abstract: str,
+    paper_title: str,
+    verification: VerificationResult,
+) -> str:
+    missing_or_short = "\n".join(_verification_failure_details(verification).splitlines()[:12])
+    prompt = (
+        "你是论文精读报告格式修复器。请只基于已有报告内容做 Markdown 结构修复，"
+        "不要重新总结整篇论文，不要加入没有证据的新结论。\n\n"
+        "必须输出一份完整 Markdown 报告，并包含这些二级标题：\n"
+        "## 核心信息\n## 摘要\n## 背景与问题\n## 创新点\n## 一句话总结\n"
+        "## 方法主线\n## 关键结果\n## 深度分析\n## 局限\n## 总结\n\n"
+        "修复规则：\n"
+        "1. 保留已有中文内容和 [[ASSET:n]] 占位符。\n"
+        "2. 如果某个必需章节缺失，从已有报告、标题证据和摘要证据中抽取可支持内容补成短段落。\n"
+        "3. 如果没有足够证据，写一到两句保守表述，但不要写“未知”“未提及”“N/A”。\n"
+        "4. 不要输出解释、JSON、代码块或修复过程。\n\n"
+        f"标题证据：{paper_title or '未可靠抽取'}\n\n"
+        f"摘要证据：{_clean_xml_text(abstract)[:1000] if abstract else '未可靠抽取'}\n\n"
+        f"可用图表占位符：{', '.join(f'[[ASSET:{idx}]]' for idx in range(1, min(len(assets), 8) + 1)) or '无'}\n\n"
+        f"需要修复的问题：\n{missing_or_short}\n\n"
+        f"已有报告：\n{_truncate_middle(summary, 12000)}"
+    )
+    return _chat(
+        client,
+        model,
+        prompt,
+        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+        max_tokens=3600,
+        max_attempts=1,
     )
     return openai.OpenAI(
         base_url=config.base_url,
