@@ -3,9 +3,12 @@ import cgi
 import os
 import shutil
 import socket
+import subprocess
+import threading
 import time
 import uuid
 from asyncio import CancelledError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlparse
@@ -75,6 +78,8 @@ def verify_recaptcha(response):
 
 DOWNLOAD_CHUNK_SIZE = 64 * 1024
 DOWNLOAD_RETRIES = 3
+PARALLEL_DOWNLOAD_CHUNK_SIZE = 256 * 1024
+PARALLEL_DOWNLOAD_WORKERS = 4
 DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 PaperAgent/0.1 (+https://github.com/whut09/paper_agent)",
     "Accept": "application/pdf,application/octet-stream,*/*",
@@ -100,8 +105,25 @@ def download_with_limit(
         - The path of the downloaded file
     """
     url = _normalize_paper_url(url)
+    download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
+    curl_result = _try_curl_download(url, save_path, size_limit, download_proxy, progress_callback)
+    if curl_result:
+        return curl_result
+
+    trust_env = _download_should_trust_env(url)
+    parallel_result = _try_parallel_range_download(
+        url,
+        save_path,
+        size_limit,
+        trust_env,
+        download_proxy,
+        progress_callback,
+    )
+    if parallel_result:
+        return parallel_result
+
     session = requests.Session()
-    session.trust_env = not get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY")
+    session.trust_env = trust_env
     download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
     if download_proxy:
         session.proxies.update({"http": download_proxy, "https": download_proxy})
@@ -171,6 +193,207 @@ def download_with_limit(
         raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
 
 
+def _try_curl_download(
+    url: str,
+    save_path: Path,
+    size_limit: int | None,
+    download_proxy: str,
+    progress_callback: DownloadProgressCallback | None,
+) -> str | None:
+    if get_config_bool_or_env("PAPER_AGENT_DISABLE_CURL_DOWNLOAD"):
+        return None
+    curl = shutil.which("curl.exe") or shutil.which("curl")
+    if not curl:
+        return None
+
+    filename = _download_filename_from_url(url)
+    target = save_path / filename
+    temp_target = target.with_name(f"{target.name}.part")
+    temp_target.unlink(missing_ok=True)
+
+    command = [
+        curl,
+        "-L",
+        "--fail",
+        "--silent",
+        "--show-error",
+        "--connect-timeout",
+        get_config_or_env("PAPER_AGENT_CURL_CONNECT_TIMEOUT", "20"),
+        "--max-time",
+        get_config_or_env("PAPER_AGENT_CURL_MAX_TIME", "180"),
+        "-A",
+        DOWNLOAD_HEADERS["User-Agent"],
+        "-o",
+        str(temp_target),
+        url,
+    ]
+    if download_proxy:
+        command[1:1] = ["--proxy", download_proxy]
+    elif get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY"):
+        command[1:1] = ["--noproxy", "*"]
+
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        while process.poll() is None:
+            if progress_callback and temp_target.exists():
+                progress_callback(temp_target.stat().st_size, None)
+            time.sleep(0.2)
+        stderr = process.stderr.read() if process.stderr else ""
+    except OSError as exc:
+        logger.debug("curl download failed to start, falling back: %s", exc)
+        temp_target.unlink(missing_ok=True)
+        return None
+
+    if process.returncode != 0:
+        logger.debug("curl download failed with code %s: %s", process.returncode, stderr.strip())
+        temp_target.unlink(missing_ok=True)
+        return None
+
+    if not temp_target.exists() or temp_target.stat().st_size <= 0:
+        temp_target.unlink(missing_ok=True)
+        return None
+    if size_limit and temp_target.stat().st_size > size_limit:
+        temp_target.unlink(missing_ok=True)
+        raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+
+    if progress_callback:
+        progress_callback(temp_target.stat().st_size, temp_target.stat().st_size)
+    temp_target.replace(target)
+    return str(target)
+
+
+def _try_parallel_range_download(
+    url: str,
+    save_path: Path,
+    size_limit: int | None,
+    trust_env: bool,
+    download_proxy: str,
+    progress_callback: DownloadProgressCallback | None,
+) -> str | None:
+    if get_config_bool_or_env("PAPER_AGENT_DISABLE_PARALLEL_DOWNLOAD"):
+        return None
+
+    head_session = requests.Session()
+    head_session.trust_env = trust_env
+    if download_proxy:
+        head_session.proxies.update({"http": download_proxy, "https": download_proxy})
+
+    try:
+        head = head_session.head(
+            url,
+            allow_redirects=True,
+            timeout=(6, 20),
+            headers=DOWNLOAD_HEADERS,
+        )
+        head.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.debug("Parallel download HEAD failed, falling back: %s", exc)
+        return None
+
+    accept_ranges = (head.headers.get("Accept-Ranges") or "").lower()
+    content_length = head.headers.get("Content-Length")
+    if "bytes" not in accept_ranges or not content_length or not content_length.isdigit():
+        return None
+
+    total_size = int(content_length)
+    if total_size <= PARALLEL_DOWNLOAD_CHUNK_SIZE:
+        return None
+    if size_limit and total_size > size_limit:
+        raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+
+    target = save_path / _download_filename(url, head)
+    temp_target = target.with_name(f"{target.name}.part")
+    part_dir = target.with_name(f"{target.name}.parts")
+    part_dir.mkdir(parents=True, exist_ok=True)
+
+    ranges: list[tuple[int, int, Path]] = []
+    part_size = (total_size + PARALLEL_DOWNLOAD_WORKERS - 1) // PARALLEL_DOWNLOAD_WORKERS
+    for index, start in enumerate(range(0, total_size, part_size)):
+        end = min(start + part_size - 1, total_size - 1)
+        ranges.append((start, end, part_dir / f"part-{index:02d}"))
+
+    downloaded = 0
+    lock = threading.Lock()
+
+    def report(delta: int) -> None:
+        nonlocal downloaded
+        with lock:
+            downloaded += delta
+            current = downloaded
+        if progress_callback:
+            progress_callback(current, total_size)
+
+    def download_range(start: int, end: int, part_path: Path) -> None:
+        session = requests.Session()
+        session.trust_env = trust_env
+        if download_proxy:
+            session.proxies.update({"http": download_proxy, "https": download_proxy})
+        headers = dict(DOWNLOAD_HEADERS)
+        headers["Range"] = f"bytes={start}-{end}"
+        with session.get(url, stream=True, timeout=(8, 60), headers=headers) as response:
+            response.raise_for_status()
+            if response.status_code != 206:
+                raise requests.exceptions.RequestException(f"range request returned {response.status_code}")
+            written = 0
+            with open(part_path, "wb") as file:
+                for chunk in response.iter_content(chunk_size=PARALLEL_DOWNLOAD_CHUNK_SIZE):
+                    if not chunk:
+                        continue
+                    file.write(chunk)
+                    written += len(chunk)
+                    report(len(chunk))
+            expected = end - start + 1
+            if written != expected:
+                raise requests.exceptions.ChunkedEncodingError(
+                    f"incomplete range {start}-{end}: {written} bytes read, {expected} expected"
+                )
+
+    try:
+        if progress_callback:
+            progress_callback(0, total_size)
+        with ThreadPoolExecutor(max_workers=min(PARALLEL_DOWNLOAD_WORKERS, len(ranges))) as executor:
+            futures = [executor.submit(download_range, start, end, part_path) for start, end, part_path in ranges]
+            for future in as_completed(futures):
+                future.result()
+
+        with open(temp_target, "wb") as output:
+            for _, _, part_path in ranges:
+                with open(part_path, "rb") as part:
+                    shutil.copyfileobj(part, output)
+        if temp_target.stat().st_size != total_size:
+            raise requests.exceptions.ChunkedEncodingError(
+                f"incomplete merged download: {temp_target.stat().st_size} bytes read, {total_size} expected"
+            )
+        temp_target.replace(target)
+        shutil.rmtree(part_dir, ignore_errors=True)
+        return str(target)
+    except (OSError, requests.exceptions.RequestException) as exc:
+        logger.debug("Parallel download failed, falling back: %s", exc)
+        temp_target.unlink(missing_ok=True)
+        shutil.rmtree(part_dir, ignore_errors=True)
+        return None
+
+
+def _download_should_trust_env(url: str) -> bool:
+    if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY"):
+        return False
+    if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_USE_ENV_PROXY"):
+        return True
+    if get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY"):
+        return False
+    host = urlparse(url).netloc.lower()
+    if host.endswith("arxiv.org"):
+        return False
+    return True
+
+
 def _normalize_paper_url(url: str) -> str:
     normalized = url.strip()
     parsed = urlparse(normalized)
@@ -179,6 +402,13 @@ def _normalize_paper_url(url: str) -> str:
         if paper_id:
             return f"https://arxiv.org/pdf/{paper_id}"
     return normalized
+
+
+def _download_filename_from_url(url: str) -> str:
+    filename = os.path.basename(unquote(urlparse(url).path)).strip() or "paper"
+    if not filename.lower().endswith(".pdf"):
+        filename = f"{filename}.pdf"
+    return filename
 
 
 def _download_filename(url: str, response: requests.Response) -> str:
