@@ -217,6 +217,11 @@ def _try_curl_download(
         "--fail",
         "--silent",
         "--show-error",
+        "--http1.1",
+        "--speed-limit",
+        get_config_or_env("PAPER_AGENT_CURL_SPEED_LIMIT", "32768"),
+        "--speed-time",
+        get_config_or_env("PAPER_AGENT_CURL_SPEED_TIME", "15"),
         "--connect-timeout",
         get_config_or_env("PAPER_AGENT_CURL_CONNECT_TIMEOUT", "20"),
         "--max-time",
@@ -227,32 +232,39 @@ def _try_curl_download(
         str(temp_target),
         url,
     ]
-    if download_proxy:
-        command[1:1] = ["--proxy", download_proxy]
-    elif get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY"):
-        command[1:1] = ["--noproxy", "*"]
 
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
-        while process.poll() is None:
-            if progress_callback and temp_target.exists():
-                progress_callback(temp_target.stat().st_size, None)
-            time.sleep(0.2)
-        stderr = process.stderr.read() if process.stderr else ""
-    except OSError as exc:
-        logger.debug("curl download failed to start, falling back: %s", exc)
+    for mode, proxy in _curl_proxy_candidates(download_proxy):
         temp_target.unlink(missing_ok=True)
-        return None
+        attempt_command = list(command)
+        if proxy:
+            attempt_command[1:1] = ["--proxy", proxy]
+        elif mode == "noproxy":
+            attempt_command[1:1] = ["--noproxy", "*"]
 
-    if process.returncode != 0:
-        logger.debug("curl download failed with code %s: %s", process.returncode, stderr.strip())
+        try:
+            logger.info("Downloading paper with curl (%s).", mode)
+            process = subprocess.Popen(
+                attempt_command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            while process.poll() is None:
+                if progress_callback and temp_target.exists():
+                    progress_callback(temp_target.stat().st_size, None)
+                time.sleep(0.2)
+            stderr = process.stderr.read() if process.stderr else ""
+        except OSError as exc:
+            logger.debug("curl download failed to start, falling back: %s", exc)
+            temp_target.unlink(missing_ok=True)
+            return None
+
+        if process.returncode == 0:
+            break
+        logger.debug("curl download failed with code %s in %s mode: %s", process.returncode, mode, stderr.strip())
+    else:
         temp_target.unlink(missing_ok=True)
         return None
 
@@ -267,6 +279,72 @@ def _try_curl_download(
         progress_callback(temp_target.stat().st_size, temp_target.stat().st_size)
     temp_target.replace(target)
     return str(target)
+
+
+def _curl_proxy_candidates(configured_proxy: str) -> list[tuple[str, str | None]]:
+    if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY"):
+        return [("noproxy", None)]
+
+    candidates: list[tuple[str, str | None]] = []
+    seen_modes: set[str] = set()
+    seen_proxies: set[str] = set()
+
+    def add(mode: str, proxy: str | None) -> None:
+        normalized_proxy = (proxy or "").strip().lower()
+        if normalized_proxy:
+            if normalized_proxy in seen_proxies:
+                return
+            seen_proxies.add(normalized_proxy)
+        elif mode in seen_modes:
+            return
+        candidates.append((mode, proxy))
+        seen_modes.add(mode)
+
+    if configured_proxy:
+        add("configured-proxy", configured_proxy)
+    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        value = os.environ.get(name)
+        if value:
+            add(f"env-{name}", value)
+    system_proxy = _windows_system_proxy()
+    if system_proxy:
+        add("windows-system-proxy", system_proxy)
+
+    add("curl-default", None)
+    return candidates
+
+
+def _windows_system_proxy() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        ) as key:
+            proxy_enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+            if not proxy_enabled:
+                return ""
+            proxy_server, _ = winreg.QueryValueEx(key, "ProxyServer")
+    except OSError:
+        return ""
+
+    proxy = str(proxy_server or "").strip()
+    if not proxy:
+        return ""
+    if ";" in proxy:
+        entries = {}
+        for item in proxy.split(";"):
+            if "=" not in item:
+                continue
+            scheme, value = item.split("=", 1)
+            entries[scheme.strip().lower()] = value.strip()
+        proxy = entries.get("https") or entries.get("http") or next(iter(entries.values()), "")
+    if proxy and "://" not in proxy:
+        proxy = f"http://{proxy}"
+    return proxy
 
 
 def _try_parallel_range_download(
