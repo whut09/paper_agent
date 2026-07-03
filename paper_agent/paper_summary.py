@@ -538,7 +538,7 @@ class GenerateReport(_PaperWorkflowNode):
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
     requires = ["verified_report", "asset_manifest"]
-    produces = ["docx", "trace.json", "grounding_map.json", "verification.json", "knowledge_graph.json"]
+    produces = ["docx", "summary.md", "trace.json", "grounding_map.json", "verification.json", "knowledge_graph.json"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         if context.output is None or context.source_path is None:
@@ -546,6 +546,7 @@ class GenerateReport(_PaperWorkflowNode):
         context.check_cancelled()
         context.report(0.85, "写入 Word 文档...")
         context.docx_path = context.output / f"{context.paper_name}-summary.docx"
+        context.summary_markdown_path = context.output / f"{context.paper_name}-summary.md"
         context.trace_path = context.output / f"{context.paper_name}-trace.json"
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
@@ -557,6 +558,7 @@ class GenerateReport(_PaperWorkflowNode):
             context.summary,
             context.assets,
         )
+        context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
         _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
 
@@ -633,6 +635,7 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
     if context.output is None or not context.paper_name:
         return
     context.trace_path = context.trace_path or context.output / f"{context.paper_name}-trace.json"
+    context.summary_markdown_path = context.summary_markdown_path or context.output / f"{context.paper_name}-summary.md"
     context.grounding_map_path = context.grounding_map_path or context.output / f"{context.paper_name}-grounding-map.json"
     context.verification_path = context.verification_path or context.output / f"{context.paper_name}-verification.json"
     context.knowledge_graph_path = context.knowledge_graph_path or context.output / f"{context.paper_name}-knowledge-graph.json"
@@ -686,6 +689,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         json.dumps(graph_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    if context.summary and not context.summary_markdown_path.exists():
+        context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
 
 
 def _verification_payload(verification: VerificationResult | None) -> dict:
@@ -751,6 +756,7 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "gate_decision": context.gate_decision,
         "gate_history": context.gate_history,
         "docx": context.docx_path,
+        "summary.md": context.summary_markdown_path,
         "verification-failed.md": context.verification_failed_path,
         "grounding_map.json": context.grounding_map_path,
         "verification.json": context.verification_path,
@@ -790,6 +796,8 @@ def _node_artifacts_snapshot(node: _PaperWorkflowNode, context: _PaperWorkflowCo
         artifacts.extend(str(asset.path) for asset in context.assets if asset.path)
     if "docx" in node.produces and context.docx_path:
         artifacts.append(str(context.docx_path))
+    if "summary.md" in node.produces and context.summary_markdown_path:
+        artifacts.append(str(context.summary_markdown_path))
     if "verification-failed.md" in node.produces and context.verification_failed_path:
         artifacts.append(str(context.verification_failed_path))
     if "trace.json" in node.produces and context.trace_path:
@@ -3153,9 +3161,9 @@ def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int 
 
 def _final_note_prompt_for_runtime() -> str:
     style = _first_value({}, "PAPER_AGENT_SUMMARY_PROMPT_STYLE").strip().lower()
-    if style in {"deep", "full", "skill"}:
-        return FINAL_NOTE_PROMPT
-    return LEAN_FINAL_NOTE_PROMPT
+    if style in {"lean", "fast", "short"}:
+        return LEAN_FINAL_NOTE_PROMPT
+    return FINAL_NOTE_PROMPT
 
 
 def _fast_integrate_summary_with_codex(
@@ -3238,8 +3246,16 @@ def _verify_summary_claims(
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
-    summary = _ensure_required_report_sections(summary, abstract, paper_title)
-    summary = _rewrite_english_heavy_sections(summary, client, model, abstract, paper_title)
+    summary = _repair_report_substance_if_needed(
+        summary,
+        paper_text,
+        grounding_map,
+        abstract,
+        client,
+        model,
+        paper_title,
+        assets,
+    )
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
     _assert_summary_quality(summary)
@@ -3325,6 +3341,12 @@ def _summary_quality_issues(summary: str) -> list[str]:
         "英文 raw text",
         "LLM 最终整合超时",
         "保守版论文精读笔记",
+        "报告生成时只保留",
+        "当前章节采用",
+        "当前版本采用保守中文概括",
+        "后续可结合原文",
+        "后续应结合原文",
+        "已被整理为中文保守表述",
     ]
     found_markers = [marker for marker in forbidden_markers if marker in summary]
     if found_markers:
@@ -3351,20 +3373,56 @@ def _summary_quality_issues(summary: str) -> list[str]:
     return issues
 
 
-def _rewrite_english_heavy_sections(
+def _repair_report_substance_if_needed(
     summary: str,
+    paper_text: str,
+    grounding_map: dict[str, list[dict[str, str]]],
+    abstract: str,
     client: openai.OpenAI | None,
     model: str,
-    abstract: str,
     paper_title: str,
+    assets: list[PaperAsset],
 ) -> str:
-    for title in ("摘要", "背景与问题", "方法主线", "关键结果"):
+    issues = _report_substance_issues(summary)
+    if not issues:
+        return summary
+    repaired = _synthesize_report_by_sections_with_codex(
+        client,
+        model,
+        paper_text,
+        grounding_map,
+        abstract,
+        paper_title,
+        assets,
+        issues,
+    )
+    return _normalize_final_sections(repaired)
+
+
+def _report_substance_issues(summary: str) -> list[str]:
+    issues = []
+    issues.extend(_summary_quality_issues(summary))
+    issues.extend(_docx_report_quality_errors(summary))
+    for title in ("摘要", "背景与问题", "方法主线", "关键结果", "深度分析", "总结"):
         body = _section_body(summary, title)
-        if not body or not _section_is_english_heavy(body):
-            continue
-        rewritten = _rewrite_section_to_chinese(client, model, title, body, abstract, paper_title)
-        summary = _replace_section_body(summary, title, rewritten)
-    return _normalize_final_sections(summary)
+        if body and _section_is_generic_filler(body):
+            issues.append(f"{title} 疑似模板兜底，不是实质论文内容")
+    return list(dict.fromkeys(issues))
+
+
+def _section_is_generic_filler(section: str) -> bool:
+    markers = (
+        "报告生成时只保留",
+        "当前章节",
+        "当前版本",
+        "后续可结合原文",
+        "后续应结合原文",
+        "回到原文",
+        "保守中文",
+        "中文保守",
+        "已抽取证据",
+    )
+    return any(marker in section for marker in markers)
 
 
 def _section_is_english_heavy(section: str) -> bool:
@@ -3374,69 +3432,139 @@ def _section_is_english_heavy(section: str) -> bool:
     return latin_letters > 220 and cjk_chars < 80
 
 
-def _rewrite_section_to_chinese(
+def _synthesize_report_by_sections_with_codex(
     client: openai.OpenAI | None,
     model: str,
-    title: str,
-    body: str,
+    paper_text: str,
+    grounding_map: dict[str, list[dict[str, str]]],
     abstract: str,
     paper_title: str,
+    assets: list[PaperAsset],
+    issues: list[str],
 ) -> str:
-    if client is not None:
-        try:
-            rewritten = _chat(
-                client,
-                model,
-                (
-                    f"请把下面论文报告的“{title}”章节忠实整理成中文。"
-                    "只输出该章节正文，不要输出标题、解释、代码块或英文原文。"
-                    "可以保留 [[ASSET:n]] 占位符；不要添加原文没有支持的新结论。\n\n"
-                    f"论文标题：{paper_title or '当前论文'}\n\n"
-                    f"英文摘要证据：{_clean_xml_text(abstract)[:1200] if abstract else ''}\n\n"
-                    f"需要整理的章节正文：\n{_truncate_middle(body, 5000)}"
-                ),
-                system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
-                max_tokens=1400,
-                max_attempts=1,
-            ).strip()
-            if rewritten and not _section_is_english_heavy(rewritten):
-                return rewritten
-        except RuntimeError:
-            pass
-    return _fallback_chinese_section_rewrite(title, paper_title)
-
-
-def _replace_section_body(summary: str, title: str, body: str) -> str:
-    pattern = re.compile(rf"(?ms)(^##\s*{re.escape(title)}\s*\n)(.*?)(?=^## |\Z)")
-    if pattern.search(summary):
-        return pattern.sub(lambda match: match.group(1) + body.strip() + "\n\n", summary, count=1)
-    return f"{summary.rstrip()}\n\n## {title}\n{body.strip()}\n"
-
-
-def _fallback_chinese_section_rewrite(title: str, paper_title: str) -> str:
-    subject = paper_title or "当前论文"
-    templates = {
-        "摘要": (
-            f"本节根据已抽取的论文证据对 {subject} 做中文整理。报告会优先保留研究问题、方法设计、实验验证和结论边界，"
-            "避免直接复制英文摘要。由于原始模型输出中该章节英文占比过高，当前版本采用保守中文概括，后续可结合原文摘要继续细化具体术语、任务设定和指标结果。"
-        ),
-        "背景与问题": (
-            f"{subject} 的背景与问题应从研究动机、已有方法不足和任务约束三方面阅读。当前章节先给出中文化整理，"
-            "重点提示读者回到原文引言核对问题定义、应用场景和作者声称要解决的关键困难。"
-        ),
-        "方法主线": (
-            f"{subject} 的方法主线应按输入信息、核心模块、训练或推理流程、输出结果的顺序梳理。"
-            "当前章节避免保留未整理英文原文，并提醒复现时继续核对原文中的模块定义、公式、图表说明和实验设置。"
-        ),
-        "关键结果": (
-            f"{subject} 的关键结果应围绕实验设置、对比对象、评价指标和主要现象展开。"
-            "当前章节采用中文保守整理，避免把英文结果段落直接写入报告；后续精读时应继续对照表格、图示和消融实验确认结论强度。"
-        ),
+    client = _coerce_codex_client(client)
+    section_bodies: dict[str, str] = {
+        "核心信息": _complete_core_info_body("", paper_title),
     }
-    return templates.get(
-        title,
-        f"{subject} 的这一部分已被整理为中文保守表述，后续应结合原文证据继续核对细节。",
+    asset_context = _asset_context(assets[:8], text_preview_chars=160, latex_preview_chars=300)
+    for section in (
+        "摘要",
+        "背景与问题",
+        "创新点",
+        "一句话总结",
+        "方法主线",
+        "关键结果",
+        "深度分析",
+        "局限",
+        "总结",
+    ):
+        evidence = _section_evidence_for_report(section, paper_text, grounding_map, abstract)
+        body = _synthesize_report_section_with_codex(
+            client,
+            model,
+            section,
+            evidence,
+            abstract,
+            paper_title,
+            asset_context,
+            issues,
+        )
+        section_bodies[section] = body
+
+    result = [f"# {paper_title or '论文精读笔记'}"]
+    for section in _required_report_section_order():
+        result.extend(["", f"## {section}", section_bodies.get(section, "").strip()])
+    report = _normalize_final_sections("\n".join(result))
+    remaining_issues = _report_substance_issues(report)
+    if remaining_issues:
+        raise RuntimeError(
+            "总结质量自检未通过：逐章节重写后仍未达到可交付质量，已停止生成 Word："
+            + "；".join(remaining_issues[:8])
+        )
+    return report
+
+
+def _synthesize_report_section_with_codex(
+    client: openai.OpenAI | None,
+    model: str,
+    section: str,
+    evidence: str,
+    abstract: str,
+    paper_title: str,
+    asset_context: str,
+    issues: list[str],
+) -> str:
+    prompt = (
+        f"请为论文精读报告撰写“{section}”章节正文。只输出正文，不要输出章节标题。\n\n"
+        "写作要求：\n"
+        "- 必须是中文实质内容，不能写模板句、流程说明、免责声明或“回到原文核对”。\n"
+        "- 可以保留模型名、数据集名、指标名、论文术语等英文专有名词，但不要复制整句英文原文。\n"
+        "- 只能根据给定证据写，不要编造原文没有的数字、数据集、结论或局限。\n"
+        "- 如果是方法章节，需要写清楚输入、核心模块、处理流程和输出；如果是结果章节，需要写清楚主要实验现象和对比含义。\n"
+        "- 可以在方法或结果章节使用相关 [[ASSET:n]]，占位符必须独占一行；其他章节通常不要插图。\n\n"
+        f"论文标题：{paper_title or '未可靠抽取'}\n\n"
+        f"英文摘要证据：\n{_clean_xml_text(abstract)[:1600] if abstract else '未可靠抽取'}\n\n"
+        f"本章节可用正文证据：\n{evidence}\n\n"
+        f"可用图表截图摘要：\n{asset_context}\n\n"
+        f"需要避免的问题：\n" + "\n".join(f"- {issue}" for issue in issues[:8])
     )
+    body = _chat(
+        client,
+        model,
+        prompt,
+        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+        max_tokens=1200 if section != "方法主线" else 1700,
+    )
+    body = _strip_section_heading(_postprocess_summary(body), section).strip()
+    if not body or _section_is_english_heavy(body) or _section_is_generic_filler(body):
+        raise RuntimeError(f"总结质量自检未通过：{section} 章节重写后仍不可用。")
+    return body
+
+
+def _section_evidence_for_report(
+    section: str,
+    paper_text: str,
+    grounding_map: dict[str, list[dict[str, str]]],
+    abstract: str,
+    max_chars: int = 9000,
+) -> str:
+    buckets_by_section = {
+        "摘要": ("intro",),
+        "背景与问题": ("intro",),
+        "创新点": ("intro", "method"),
+        "一句话总结": ("intro", "method", "experiments"),
+        "方法主线": ("method",),
+        "关键结果": ("experiments",),
+        "深度分析": ("method", "experiments"),
+        "局限": ("experiments",),
+        "总结": ("intro", "method", "experiments"),
+    }
+    pieces = []
+    if abstract:
+        pieces.append("## 摘要证据\n" + _clean_xml_text(abstract)[:1800])
+    for bucket in buckets_by_section.get(section, ("intro", "method", "experiments")):
+        for item in grounding_map.get(bucket, [])[:2]:
+            title = item.get("title", bucket)
+            text = _truncate_middle(_clean_xml_text(item.get("text", "")), 3000)
+            if text:
+                pieces.append(f"## {bucket}: {item.get('section_id', '')} {title}\n{text}")
+    if section == "局限":
+        limitation_window = _section_window_for_verifier(
+            paper_text,
+            ("limitation", "limitation", "discussion", "conclusion", "future", "failure"),
+            window=5000,
+        )
+        if limitation_window:
+            pieces.append("## 局限/讨论窗口\n" + limitation_window)
+    if not pieces and paper_text:
+        pieces.append(_truncate_middle(_clean_xml_text(paper_text), max_chars))
+    return _truncate_middle("\n\n".join(pieces), max_chars)
+
+
+def _strip_section_heading(text: str, section: str) -> str:
+    text = re.sub(rf"(?m)^#{1,6}\s*{re.escape(section)}\s*$", "", text)
+    text = re.sub(r"(?m)^#{1,6}\s+.+$", "", text, count=1) if text.lstrip().startswith("#") else text
+    return text.strip()
 
 
 def _assert_report_ready_for_docx(summary: str) -> None:
@@ -3572,7 +3700,6 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     if revised_summary != context.summary:
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
-        context.summary = _ensure_required_report_sections(context.summary, context.abstract, context.paper_title)
         context.summary = _enforce_core_original_title(context.summary, context.paper_title)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.verification.revision_applied = True
@@ -4746,7 +4873,13 @@ def _chat(
                 request.pop("max_tokens", None)
                 response = client.chat.completions.create(**request)
             content = response.choices[0].message.content or ""
-            return _postprocess_summary(content)
+            content = _postprocess_summary(content)
+            if content.strip():
+                return content
+            last_error = RuntimeError("Codex 接口返回空内容。")
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(_chat_retry_delay(attempt))
         except openai.APIStatusError as exc:
             last_error = exc
             if not _is_retryable_openai_status(exc) or attempt + 1 >= max_attempts:
@@ -4774,6 +4907,8 @@ def _chat(
             f"Codex 接口连接失败，已重试 {max_attempts} 次仍未成功：服务端断开或网络链路不稳定。"
             "程序已默认不继承系统代理；如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
         ) from last_error
+    if last_error is not None:
+        raise RuntimeError(f"Codex 接口调用失败，已重试 {max_attempts} 次仍未返回有效内容：{last_error}") from last_error
     raise RuntimeError("Codex 接口调用失败：未返回有效响应。")
 
 
@@ -4963,17 +5098,19 @@ def _ensure_required_report_sections(summary: str, abstract: str = "", paper_tit
     summary = _normalize_final_sections(summary)
     title = _extract_note_title(summary) or "论文精读笔记"
     sections = _collect_markdown_sections(summary)
-    source_pool = _unsectioned_report_body(summary)
-    evidence_sentences = _report_evidence_sentences(source_pool, abstract)
 
     result = [f"# {title}"]
+    core_body = _complete_core_info_body(sections.pop("核心信息", ""), paper_title)
+    result.extend(["", "## 核心信息", core_body])
     for section in _required_report_section_order():
-        body = sections.get(section, "").strip()
-        body = _complete_required_section_body(section, body, evidence_sentences, abstract, paper_title)
-        result.extend(["", f"## {section}", body.strip()])
+        if section == "核心信息":
+            continue
+        body = sections.pop(section, "").strip()
+        if body:
+            result.extend(["", f"## {section}", body])
 
     for section, body in sections.items():
-        if section not in _required_report_sections() and body.strip():
+        if body.strip():
             result.extend(["", f"## {section}", body.strip()])
 
     return _normalize_final_sections("\n".join(part for part in result if part is not None))
@@ -5013,66 +5150,6 @@ def _normalize_report_section_name(title: str) -> str:
     return title
 
 
-def _unsectioned_report_body(summary: str) -> str:
-    lines = []
-    for line in summary.splitlines():
-        if re.match(r"^#{1,6}\s+", line.strip()):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
-
-
-def _report_evidence_sentences(source_pool: str, abstract: str) -> list[str]:
-    text = "\n".join(part for part in (source_pool, abstract) if part)
-    text = re.sub(r"\[\[ASSET:\d+\]\]", "", text)
-    text = re.sub(r"(?m)^[-*]\s*", "", text)
-    text = re.sub(r"\s+", " ", _clean_xml_text(text)).strip()
-    candidates = re.split(r"(?<=[。！？!?；;])\s+|\n+", text)
-    result: list[str] = []
-    for candidate in candidates:
-        candidate = candidate.strip(" -:：;；")
-        if len(candidate) < 18 or _core_info_line_is_unspecified(candidate):
-            continue
-        if re.fullmatch(r"[A-Za-z0-9 ,.;:()/%+\-]+", candidate) and len(candidate) > 220:
-            continue
-        result.append(candidate)
-        if len(result) >= 12:
-            break
-    return result
-
-
-def _complete_required_section_body(
-    section: str,
-    body: str,
-    evidence_sentences: list[str],
-    abstract: str,
-    paper_title: str,
-) -> str:
-    body = body.strip()
-    if section == "核心信息":
-        return _complete_core_info_body(body, paper_title)
-    if section == "一句话总结":
-        return body if _compact_text_len(body) >= 25 else _one_sentence_summary(evidence_sentences, paper_title)
-
-    minimum = {
-        "摘要": 100,
-        "背景与问题": 130,
-        "创新点": 90,
-        "方法主线": 150,
-        "关键结果": 110,
-        "深度分析": 100,
-        "局限": 50,
-        "总结": 70,
-    }.get(section, 70)
-    if _compact_text_len(body) >= minimum:
-        return body
-
-    supplement = _fallback_section_text(section, evidence_sentences, abstract, paper_title)
-    if body:
-        return f"{body.rstrip()}\n\n{supplement}"
-    return supplement
-
-
 def _complete_core_info_body(body: str, paper_title: str) -> str:
     lines = [line for line in body.splitlines() if line.strip()]
     if paper_title and not any(re.match(r"^\s*[-*]\s*标题\s*[:：]", line) for line in lines):
@@ -5080,39 +5157,6 @@ def _complete_core_info_body(body: str, paper_title: str) -> str:
     if not lines:
         lines.append(f"- 标题: {paper_title or '论文精读对象'}")
     return "\n".join(lines)
-
-
-def _one_sentence_summary(evidence_sentences: list[str], paper_title: str) -> str:
-    if evidence_sentences:
-        sentence = evidence_sentences[0]
-        return f"这篇论文围绕{paper_title or '目标任务'}展开，核心线索是：{sentence}"
-    return f"这篇论文围绕{paper_title or '目标任务'}展开，重点需要从研究问题、方法设计、实验结果和适用边界四个角度阅读。"
-
-
-def _fallback_section_text(
-    section: str,
-    evidence_sentences: list[str],
-    abstract: str,
-    paper_title: str,
-) -> str:
-    joined = " ".join(evidence_sentences[:4]).strip()
-    if not joined:
-        joined = _clean_xml_text(abstract).strip()
-    if not joined:
-        joined = f"论文主题为 {paper_title or '当前论文'}，正文证据需要围绕问题、方法、结果与边界逐项核对。"
-    joined = _truncate_middle(joined, 900).replace("\n", " ")
-    evidence_note = "报告生成时只保留已抽取证据能够支撑的表述，后续可通过原文段落、图表和公式继续细化。"
-    templates = {
-        "摘要": f"本文的核心内容可概括为：{joined} 这部分信息用于承接后续的方法、实验和分析章节。{evidence_note}",
-        "背景与问题": f"从已抽取文本看，论文关注的问题背景与任务需求紧密相关。{joined} 因此阅读时应重点区分作者要解决的核心困难、已有方法的不足，以及论文把问题重新组织后的研究目标。{evidence_note}",
-        "创新点": f"报告中可确认的创新线索主要来自论文对问题设定、方法流程和实验验证的组织方式。{joined} 这些内容应作为创新判断的依据，避免脱离原文扩展。{evidence_note}",
-        "方法主线": f"方法主线应按输入、核心模块、训练或推理流程、输出结果的顺序阅读。{joined} 复现时需要继续对照原文中的模块定义、公式说明、图表标注和实验设置。{evidence_note}",
-        "关键结果": f"关键结果应围绕论文报告的实验现象、对比对象和图表证据理解。{joined} 这些结果适合与方法章节交叉阅读，以判断改进来自哪些设计环节。{evidence_note}",
-        "深度分析": f"深度分析部分应把方法假设、证据强度和适用条件放在一起看。{joined} 当前证据支持先做保守解读，再根据原文图表和实验设置判断结论边界。{evidence_note}",
-        "局限": f"局限部分需要结合实验覆盖范围、任务设定和实现复杂度来判断。{joined} 因此报告应保留对泛化范围、数据条件和复现成本的谨慎观察。{evidence_note}",
-        "总结": f"总体来看，论文可以按问题动机、方法设计、结果证据和局限边界四条线索阅读。{joined} 后续精读应优先核对方法细节和实验表格中的关键证据。{evidence_note}",
-    }
-    return templates.get(section, joined)
 
 
 def _compact_text_len(text: str) -> int:

@@ -48,9 +48,8 @@ from paper_agent.paper_summary import (
     _row_is_prose_after_table,
     _row_looks_table_section_label,
     _row_looks_table_like,
-    _rewrite_english_heavy_sections,
+    _report_substance_issues,
     _sync_inline_asset_references,
-    _summary_quality_issues,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _verification_should_block_report,
@@ -65,6 +64,48 @@ from paper_agent.paper_summary import (
 
 def line(text: str, x0: float, y0: float, x1: float, y1: float) -> TextLine:
     return TextLine(text=text, rect=fitz.Rect(x0, y0, x1, y1))
+
+
+def _valid_test_summary() -> str:
+    return """# Test
+
+## 核心信息
+- 标题: Test Paper
+- 中文标题: 测试论文
+- 领域: 图像恢复
+
+## 摘要
+这是一份用于测试 Word 生成链路的完整中文论文报告。报告用足够长的中文自然段描述论文的问题、方法和实验结论，避免被质量门误判为英文原文或残缺报告。该测试文本不追求真实论文结论，只用于验证文档、sidecar 和结构化产物能够稳定写出。
+
+## 背景与问题
+图像恢复任务通常需要在低分辨率、噪声、压缩伪影和模糊等退化条件下恢复清晰图像。已有方法如果只针对单一退化训练，遇到真实场景中的混合退化时容易泛化不足。论文类报告需要先说明任务为什么重要，再解释方法针对哪些具体问题给出设计。
+对于工程使用者来说，背景章节还要解释输入数据的退化来源、输出质量的评价方式，以及为什么单纯提高模型规模不能自动解决泛化问题。这个测试段落刻意写得更完整，用来覆盖真实报告中背景说明的最低信息量。
+
+## 创新点
+测试报告模拟一种面向复杂输入的多阶段方法：先识别输入条件，再选择合适模块处理，最后通过实验比较验证效果。创新点不写成空泛口号，而是说明每个设计环节解决什么问题、为什么影响最终输出质量。
+
+## 一句话总结
+这篇测试报告验证 PaperAgent 能生成结构完整、中文内容充足、可写入 Word 的论文精读文档。
+
+## 方法主线
+### 机制流程
+方法流程可以概括为三步：第一步分析输入样本和任务边界，第二步选择合适的处理模块并组织执行顺序，第三步根据输出质量和实验指标判断改进是否有效。这个过程强调从输入到输出的可解释链路，而不是只给出一个黑盒结论。
+
+### 关键公式
+测试文本不插入真实公式，但保留对关键机制的中文解释位置。真实报告中这里应解释论文最重要的公式、变量含义和工程作用，避免只堆公式截图而不说明含义。
+
+## 关键结果
+关键结果章节需要概括主要实验现象、对比对象和评价指标。测试报告说明，完整 Word 输出应包含足够中文正文、必要标题、图表引用位置和 sidecar 文件，避免因为缺少章节、正文过短或英文未整理而被质量门拦截。
+
+## 深度分析
+深度分析部分关注证据强度、方法假设和边界条件。对于真实论文，应说明哪些结论由实验直接支持，哪些现象仍需要更多数据或消融验证。测试报告在这里提供足够长的中文段落，用来验证生成器不会把空泛模板当作高质量内容。
+
+## 局限
+测试报告的局限在于它不是一篇真实论文的科学结论，只能用于覆盖文档生成逻辑。真实报告还需要结合论文原文、图表、公式和实验表格判断方法适用范围、复杂度、数据边界和泛化能力。
+
+## 总结
+总体来看，这份测试报告用于验证从 Markdown 到 Word 的完整链路，包括结构检查、正文长度检查、知识图谱 sidecar、verification sidecar 和 trace 文件写入。它强调报告必须包含可读中文内容，不能用模板句或英文原文填充关键章节。
+"""
 
 
 class DummyWorkflowNode(PaperWorkflowNode):
@@ -197,11 +238,7 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         context.output = Path(tmp)
         context.source_path = Path("paper.pdf")
         context.paper_name = "paper"
-        context.summary = _ensure_required_report_sections(
-            "# Test\n\n## 总结\n测试报告覆盖方法、实验、分析和局限，适合作为 Word 生成用例。",
-            "The paper evaluates a method with experiments and discusses limitations.",
-            "Test Paper",
-        )
+        context.summary = _valid_test_summary()
         context.knowledge_graph = {
             "nodes": [{"id": "paper:paper", "label": "Paper", "type": "paper", "source_section": ""}],
             "edges": [],
@@ -510,7 +547,7 @@ def test_knowledge_graph_extracts_research_nodes_and_edges():
     assert "reports_evaluation" in edge_relations
 
 
-def test_required_report_sections_are_rebuilt_from_sparse_draft():
+def test_required_report_sections_do_not_fabricate_sparse_draft_content():
     sparse = """# 论文精读笔记
 
 ### 1. 方法
@@ -527,26 +564,13 @@ def test_required_report_sections_are_rebuilt_from_sparse_draft():
     )
     guard = _format_guard(result)
 
-    assert all(
-        f"## {section}" in result
-        for section in (
-            "核心信息",
-            "摘要",
-            "背景与问题",
-            "创新点",
-            "一句话总结",
-            "方法主线",
-            "关键结果",
-            "深度分析",
-            "局限",
-            "总结",
-        )
-    )
-    assert not any("missing required section" in error for error in guard.errors)
-    assert not any("required section is too short" in error for error in guard.errors)
+    assert "## 核心信息" in result
+    assert "## 方法主线" in result
+    assert "报告生成时只保留" not in result
+    assert any("missing required section" in error for error in guard.errors)
 
 
-def test_english_heavy_required_section_is_rewritten_before_quality_gate():
+def test_english_heavy_and_generic_sections_are_flagged_before_docx():
     english_abstract = (
         "This paper presents a model that decomposes visual inputs into multiple stages, "
         "uses expert modules for reasoning, and evaluates the approach on several task settings. "
@@ -559,15 +583,14 @@ def test_english_heavy_required_section_is_rewritten_before_quality_gate():
         "A Test Paper About Expert Modules",
     )
 
-    result = _rewrite_english_heavy_sections(
-        summary,
-        None,
-        "test-model",
-        english_abstract,
-        "A Test Paper About Expert Modules",
+    issues = _report_substance_issues(
+        summary
+        + "\n\n## 方法主线\n当前章节采用保守中文概括，后续可结合原文继续细化。"
     )
 
-    assert "疑似英文原文未整理" not in "；".join(_summary_quality_issues(result))
+    joined = "；".join(issues)
+    assert "疑似英文原文未整理" in joined
+    assert "疑似模板兜底" in joined
 
 
 def test_knowledge_graph_links_claims_to_source_sections():

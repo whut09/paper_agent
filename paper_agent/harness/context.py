@@ -57,6 +57,7 @@ class PaperWorkflowContext:
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
+    summary_markdown_path: Path | None = None
     verification_failed_path: Path | None = None
     trace_path: Path | None = None
     grounding_map_path: Path | None = None

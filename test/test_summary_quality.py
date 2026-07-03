@@ -67,3 +67,38 @@ def test_chat_rejects_missing_client_with_clear_error():
         lambda: ps._chat(None, "test-model", "hello"),
         "Codex",
     )
+
+
+def test_chat_retries_empty_content_response():
+    class Message:
+        def __init__(self, content):
+            self.content = content
+
+    class Choice:
+        def __init__(self, content):
+            self.message = Message(content)
+
+    class Response:
+        def __init__(self, content):
+            self.choices = [Choice(content)]
+
+    class Completions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **_request):
+            self.calls += 1
+            return Response("" if self.calls == 1 else "有效内容")
+
+    class Chat:
+        def __init__(self):
+            self.completions = Completions()
+
+    class Client:
+        def __init__(self):
+            self.chat = Chat()
+
+    client = Client()
+
+    assert ps._chat(client, "test-model", "hello", max_attempts=2) == "有效内容"
+    assert client.chat.completions.calls == 2
