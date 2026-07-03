@@ -40,7 +40,11 @@ from paper_agent.paper_summary import (
     _postprocess_summary,
     _missing_asset_references,
     _normalize_final_sections,
+    _normalize_inline_text,
+    _original_asset_label,
     _paragraph,
+    _reflow_markdown_lines,
+    _stream_request_allows_partial_content,
     _prompt_patch_context,
     _parse_verification_result,
     _verification_format_warning,
@@ -844,13 +848,101 @@ def test_background_sections_normalize_to_background_and_problem():
     assert "## 研究问题" not in result
 
 
-def test_heading3_background_only_wraps_text():
+def test_heading3_uses_plain_blue_subheading_style():
     xml = _paragraph("机制流程", "Heading3")
     paragraph_properties = xml.split("</w:pPr>", 1)[0]
     run_properties = xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
 
     assert "<w:shd" not in paragraph_properties
-    assert '<w:shd w:fill="DDEDEA"/>' in run_properties
+    assert "<w:shd" not in run_properties
+    assert '<w:color w:val="2563EB"/>' in run_properties
+
+
+def test_latex_text_is_rendered_as_readable_inline_text():
+    text = _normalize_inline_text(r"$max(H_I, W_I) \times s \geq 4000$ and $\{2, 4, 8, 16\}$ geq eta")
+
+    assert "\\" not in text
+    assert "$" not in text
+    assert "≥" in text
+    assert "geq" not in text
+    assert "η" in text
+    assert "×" in text
+
+
+def test_latex_set_notation_is_rendered_without_escape_garbage():
+    text = _normalize_inline_text(r"从候选集 $\{2, 4, 8, 16\}$ 中选择 $s$，使 $Q_I \geq \eta$。")
+
+    assert "$" not in text
+    assert "\\" not in text
+    assert "geq" not in text
+    assert "{2, 4, 8, 16}" not in text
+    assert "2, 4, 8, 16" in text
+    assert "Q_I ≥ η" in text
+
+
+def test_section_lists_reflow_to_plain_paragraphs_not_note_cards():
+    lines = _reflow_markdown_lines(
+        """# Title
+
+## 创新点
+- 第一点说明。
+- 第二点说明。
+"""
+    )
+
+    assert not any("[NOTE_CARD]" in line for line in lines)
+    assert any("第一点说明。第二点说明。" in line for line in lines)
+
+
+def test_document_xml_does_not_append_unused_assets_to_tail_section():
+    summary = """# Title
+
+## 摘要
+这里解释正文。
+
+[[ASSET:1]]
+"""
+    assets = [
+        PaperAsset("figure", 1, Path("used.png"), "Fig. 1 overview"),
+        PaperAsset("formula", 2, Path("unused.png"), "关键公式：x = y (271)"),
+    ]
+
+    xml = _document_xml(
+        "paper.pdf",
+        summary,
+        assets,
+        [(assets[0].path, "image1.png", "rId4"), (assets[1].path, "image2.png", "rId5")],
+    )
+
+    assert "关键图表" not in xml
+    assert "rId4" in xml
+    assert "rId5" not in xml
+
+
+def test_formula_asset_label_ignores_unreasonable_ocr_numbers():
+    asset = PaperAsset("formula", 2, Path("formula.png"), "关键公式：x = y (271)")
+
+    assert _original_asset_label(asset) == ""
+
+
+def test_partial_stream_content_only_allowed_for_chunk_notes():
+    enough_content = "这是已经生成的中文分段笔记。" * 30
+    chunk_request = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "请阅读论文第 5/14 段内容，生成分段笔记。"},
+        ]
+    }
+    final_request = {
+        "messages": [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "请整合为完整报告。"},
+        ]
+    }
+
+    assert _stream_request_allows_partial_content(chunk_request, enough_content)
+    assert not _stream_request_allows_partial_content(final_request, enough_content)
+    assert not _stream_request_allows_partial_content(chunk_request, "太短")
 
 
 def test_codex_config_disables_proxy_by_default():

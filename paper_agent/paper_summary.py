@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -431,6 +431,9 @@ class SummarizeContribution(_PaperWorkflowNode):
                 f"生成分段笔记 {completed}/{total}...",
             ),
             cancellation_check=context.check_cancelled,
+            cache_path=(context.output / f"{context.paper_name}-chunk-notes.json")
+            if context.output is not None
+            else None,
         )
 
 
@@ -552,12 +555,21 @@ class GenerateReport(_PaperWorkflowNode):
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
         _assert_report_ready_for_docx(context.summary)
-        _write_docx(
-            context.docx_path,
-            context.source_path.name,
-            context.summary,
-            context.assets,
-        )
+        try:
+            _write_docx(
+                context.docx_path,
+                context.source_path.name,
+                context.summary,
+                context.assets,
+            )
+        except PermissionError:
+            context.docx_path = _next_available_report_path(context.docx_path)
+            _write_docx(
+                context.docx_path,
+                context.source_path.name,
+                context.summary,
+                context.assets,
+            )
         context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
         _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
@@ -2993,14 +3005,16 @@ def _summarize_chunks_with_codex(
     prompt_patches: list[PromptPatch] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     cancellation_check: Callable[[], None] | None = None,
+    cache_path: Path | None = None,
 ) -> list[str]:
-    chunks = _chunk_text(paper_text, 14000)
+    chunks = _chunk_text(paper_text, _codex_chunk_chars())
     asset_context = _asset_context(assets, text_preview_chars=0, latex_preview_chars=300)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
     extraction_patch = _prompt_patch_context(patches, "extraction")
     total = len(chunks)
+    cached_notes = _load_chunk_notes_cache(cache_path, total)
 
     def summarize_one(idx: int, chunk: str) -> tuple[int, str]:
         if cancellation_check:
@@ -3031,28 +3045,47 @@ def _summarize_chunks_with_codex(
             user_prompt,
             system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
             max_tokens=1400,
-            max_attempts=1,
         )
 
     max_workers = min(_codex_summary_concurrency(), total)
     if max_workers <= 1:
         chunk_notes = []
         for idx, chunk in enumerate(chunks, 1):
+            if idx <= len(cached_notes) and cached_notes[idx - 1].strip():
+                chunk_notes.append(cached_notes[idx - 1])
+                if progress_callback:
+                    progress_callback(len(chunk_notes), total)
+                continue
             try:
                 _idx, note = summarize_one(idx, chunk)
             except Exception as exc:
-                note = _fallback_chunk_note(idx, total, chunk, exc)
+                raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
             chunk_notes.append(note)
+            _write_chunk_notes_cache(cache_path, chunk_notes, total)
             if progress_callback:
                 progress_callback(len(chunk_notes), total)
         return chunk_notes
 
     results: list[str] = [""] * total
     completed = 0
+    pending_chunks: list[tuple[int, str]] = []
+    for idx, chunk in enumerate(chunks, 1):
+        if idx <= len(cached_notes) and cached_notes[idx - 1].strip():
+            results[idx - 1] = cached_notes[idx - 1]
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, total)
+        else:
+            pending_chunks.append((idx, chunk))
+    if completed:
+        _write_chunk_notes_cache(cache_path, results, total)
+    if not pending_chunks:
+        return results
+
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-summary") as executor:
         future_to_index = {
             executor.submit(summarize_one, idx, chunk): idx
-            for idx, chunk in enumerate(chunks, 1)
+            for idx, chunk in pending_chunks
         }
         for future in as_completed(future_to_index):
             if cancellation_check:
@@ -3062,12 +3095,48 @@ def _summarize_chunks_with_codex(
                 _idx, note = future.result()
                 idx = _idx
             except Exception as exc:
-                note = _fallback_chunk_note(idx, total, chunks[idx - 1], exc)
+                raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
             results[idx - 1] = note
             completed += 1
+            _write_chunk_notes_cache(cache_path, results, total)
             if progress_callback:
                 progress_callback(completed, total)
     return results
+
+
+def _load_chunk_notes_cache(cache_path: Path | None, total: int) -> list[str]:
+    if cache_path is None or not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if int(data.get("total") or 0) != total:
+        return []
+    notes = data.get("notes")
+    if not isinstance(notes, list):
+        return []
+    return [_clean_xml_text(str(note)) for note in notes]
+
+
+def _write_chunk_notes_cache(cache_path: Path | None, notes: list[str], total: int) -> None:
+    if cache_path is None:
+        return
+    try:
+        cache_path.write_text(
+            json.dumps({"total": total, "notes": notes}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _chunk_summary_error_message(idx: int, total: int, exc: Exception) -> str:
+    error = _clean_xml_text(str(exc))[:260]
+    return (
+        f"分段笔记生成失败（第 {idx}/{total} 段），已停止生成 Word，避免输出不完整或不可读报告。"
+        f"错误摘要：{error}"
+    )
 
 
 def _fallback_chunk_note(idx: int, total: int, chunk: str, exc: Exception) -> str:
@@ -4841,6 +4910,26 @@ def _codex_summary_concurrency() -> int:
     return max(1, min(value, 8))
 
 
+def _codex_chunk_chars() -> int:
+    raw_value = _first_value({}, "CODEX_CHUNK_CHARS")
+    try:
+        value = int(raw_value) if raw_value else 10000
+    except ValueError:
+        value = 10000
+    return max(4000, min(value, 14000))
+
+
+def _codex_stream_timeout_seconds() -> float:
+    raw_value = _first_value({}, "CODEX_STREAM_TIMEOUT_SECONDS")
+    if not raw_value:
+        return _codex_timeout_seconds()
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = _codex_timeout_seconds()
+    return max(30.0, min(value, 600.0))
+
+
 def _chat(
     client: openai.OpenAI | None,
     model: str,
@@ -4876,7 +4965,14 @@ def _chat(
             content = _postprocess_summary(content)
             if content.strip():
                 return content
-            last_error = RuntimeError("Codex 接口返回空内容。")
+            stream_error: Exception | None = None
+            try:
+                stream_content = _chat_stream_content(client, request)
+                if stream_content.strip():
+                    return stream_content
+            except Exception as exc:
+                stream_error = exc
+            last_error = stream_error or RuntimeError("Codex 接口返回空内容。")
             if attempt + 1 >= max_attempts:
                 break
             time.sleep(_chat_retry_delay(attempt))
@@ -4907,9 +5003,75 @@ def _chat(
             f"Codex 接口连接失败，已重试 {max_attempts} 次仍未成功：服务端断开或网络链路不稳定。"
             "程序已默认不继承系统代理；如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
         ) from last_error
+    if isinstance(last_error, TimeoutError):
+        raise RuntimeError(
+            f"Codex 流式接口响应超时，已重试 {max_attempts} 次仍未成功。"
+            f"当前流式单次超时为 {_codex_stream_timeout_seconds():.0f} 秒；"
+            "如果接口确实很慢，可以在 config.local.json 中设置 CODEX_STREAM_TIMEOUT_SECONDS。"
+        ) from last_error
     if last_error is not None:
         raise RuntimeError(f"Codex 接口调用失败，已重试 {max_attempts} 次仍未返回有效内容：{last_error}") from last_error
     raise RuntimeError("Codex 接口调用失败：未返回有效响应。")
+
+
+def _chat_stream_content(client: openai.OpenAI, request: dict) -> str:
+    stream_request = dict(request)
+    stream_request["stream"] = True
+    stream_request.setdefault("timeout", _codex_stream_timeout_seconds())
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paper-chat-stream")
+    future = executor.submit(_read_chat_stream_content, client, stream_request)
+    try:
+        return future.result(timeout=_codex_stream_timeout_seconds() + 5.0)
+    except FuturesTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(
+            f"Codex 流式接口超过 {_codex_stream_timeout_seconds():.0f} 秒仍未结束。"
+        ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _read_chat_stream_content(client: openai.OpenAI, stream_request: dict) -> str:
+    try:
+        stream = client.chat.completions.create(**stream_request)
+    except openai.BadRequestError:
+        if "max_tokens" not in stream_request:
+            raise
+        stream_request.pop("max_tokens", None)
+        stream = client.chat.completions.create(**stream_request)
+    if hasattr(stream, "choices"):
+        choices = getattr(stream, "choices", None) or []
+        if not choices:
+            return ""
+        message = getattr(choices[0], "message", None)
+        return _postprocess_summary(getattr(message, "content", "") or "")
+    chunks: list[str] = []
+    try:
+        for event in stream:
+            choices = getattr(event, "choices", None) or []
+            if not choices:
+                continue
+            delta = getattr(choices[0], "delta", None)
+            content = getattr(delta, "content", None)
+            if content:
+                chunks.append(content)
+    except httpx.HTTPError:
+        partial_content = _postprocess_summary("".join(chunks))
+        if _stream_request_allows_partial_content(stream_request, partial_content):
+            return partial_content
+        raise
+    return _postprocess_summary("".join(chunks))
+
+
+def _stream_request_allows_partial_content(stream_request: dict, content: str) -> bool:
+    if len(content.strip()) < 300:
+        return False
+    messages = stream_request.get("messages") or []
+    if not messages:
+        return False
+    user_message = next((item for item in reversed(messages) if item.get("role") == "user"), {})
+    user_prompt = str(user_message.get("content") or "")
+    return user_prompt.lstrip().startswith("请阅读论文第")
 
 
 def _is_retryable_openai_status(exc: openai.APIStatusError) -> bool:
@@ -5359,11 +5521,13 @@ def _textualize_latex(text: str) -> str:
     text = text.replace("\\[", "").replace("\\]", "")
     text = text.replace("\\(", "").replace("\\)", "")
     text = text.replace("$$", "")
+    text = re.sub(r"(?<!\w)\$(.+?)\$(?!\w)", r"\1", text)
     text = re.sub(r"\\tilde\{([^{}]+)\}", r"~\1", text)
     text = re.sub(r"\\mathbb\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"\\mathcal\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"\\mathrm\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"\\text\{([^{}]+)\}", r"\1", text)
+    text = re.sub(r"\\mathbf\{([^{}]+)\}", r"\1", text)
     text = re.sub(r"_\{([^{}]+)\}", r"_\1", text)
     text = re.sub(r"\^\{([^{}]+)\}", r"^\1", text)
 
@@ -5383,18 +5547,41 @@ def _textualize_latex(text: str) -> str:
         "\\cdot": "·",
         "\\rightarrow": "→",
         "\\to": "→",
+        "\\geq": "≥",
+        "\\leq": "≤",
+        "\\neq": "≠",
+        "\\approx": "≈",
+        "\\argmax": "argmax",
+        "\\max": "max",
+        "\\min": "min",
         "\\in": "∈",
         "\\left": "",
         "\\right": "",
         "\\quad": " ",
         "\\ldots": "…",
         "\\ldotp": ".",
+        "\\{": "{",
+        "\\}": "}",
     }
     text = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", frac, text)
     for source, target in replacements.items():
         text = text.replace(source, target)
+    text = text.replace("\\$", "$")
     text = re.sub(r"\\([A-Za-z]+)", r"\1", text)
+    text = text.replace("\\", "")
     text = text.replace("{", "").replace("}", "")
+    text = text.replace("$", "")
+    plain_math_words = {
+        "geq": "≥",
+        "leq": "≤",
+        "neq": "≠",
+        "approx": "≈",
+        "eta": "η",
+        "theta": "θ",
+        "lambda": "λ",
+    }
+    for source, target in plain_math_words.items():
+        text = re.sub(rf"\b{source}\b", target, text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text
 
@@ -5674,6 +5861,20 @@ def _write_docx(
                 docx.write(source, f"word/media/{media_name}")
 
 
+def _next_available_report_path(path: Path) -> Path:
+    for index in range(1, 100):
+        candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+        try:
+            with candidate.open("ab"):
+                return candidate
+        except PermissionError:
+            continue
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return path.with_name(f"{path.stem}-{timestamp}{path.suffix}")
+
+
 def _document_xml(
     paper_filename: str,
     summary: str,
@@ -5746,23 +5947,6 @@ def _document_xml(
             body.append(_image_paragraph(source, asset_id, rel_id))
             used_assets.add(asset_id)
 
-    remaining_assets = [
-        (asset_id, asset)
-        for asset_id, asset in asset_by_id.items()
-        if asset_id not in used_assets
-    ]
-    if remaining_assets:
-        body.append(_paragraph("关键图表", "Heading1"))
-        for asset_id, asset in remaining_assets:
-            media = media_by_id.get(asset_id)
-            if not media:
-                continue
-            source, _media_name, rel_id = media
-            label = _asset_display_label(asset_id, asset, asset_counters, asset_labels)
-            body.append(_paragraph(_asset_reference_sentence(label), "AssetLead"))
-            body.append(_image_paragraph(source, asset_id, rel_id))
-            used_assets.add(asset_id)
-
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:wpc="http://schemas.microsoft.com/office/word/2010/wordprocessingCanvas"
  xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
@@ -5807,9 +5991,6 @@ def _reflow_markdown_lines(markdown: str) -> list[str]:
             return
         if current_section in {"核心信息"}:
             result.extend(list_buffer)
-        elif current_section in {"创新点", "关键结果", "局限", "总结", "我的笔记"}:
-            for item in list_buffer:
-                result.append("[NOTE_CARD] " + _normalize_list_to_sentence(item))
         else:
             result.append(_join_paragraph_buffer([_normalize_list_to_sentence(item) for item in list_buffer]))
         list_buffer.clear()
@@ -5918,7 +6099,7 @@ def _paragraph(text: str, style: str | None = None) -> str:
 def _run_properties(style: str | None = None) -> str:
     base_fonts = _font_run_xml()
     if style == "Heading3":
-        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="134E4A"/><w:sz w:val="26"/><w:shd w:fill="DDEDEA"/></w:rPr>'
+        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="2563EB"/><w:sz w:val="23"/></w:rPr>'
     return f"<w:rPr>{base_fonts}</w:rPr>"
 
 
@@ -5932,24 +6113,22 @@ def _font_run_xml() -> str:
 def _paragraph_properties(style: str | None = None) -> str:
     if style == "Title":
         return (
-            '<w:pPr><w:pStyle w:val="Title"/><w:jc w:val="center"/>'
-            '<w:spacing w:before="240" w:after="180"/></w:pPr>'
+            '<w:pPr><w:pStyle w:val="Title"/><w:jc w:val="left"/>'
+            '<w:spacing w:before="160" w:after="140"/></w:pPr>'
         )
     if style == "Heading1":
         return (
             '<w:pPr><w:pStyle w:val="Heading1"/>'
-            '<w:spacing w:before="420" w:after="180"/>'
-            '<w:shd w:fill="EAF4F1"/><w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="2F7D6D"/></w:pBdr>'
+            '<w:spacing w:before="360" w:after="140"/>'
+            '<w:pBdr><w:bottom w:val="single" w:sz="8" w:space="6" w:color="BFDBFE"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "Heading2":
-        return '<w:pPr><w:pStyle w:val="Heading2"/><w:spacing w:before="260" w:after="120"/></w:pPr>'
+        return '<w:pPr><w:pStyle w:val="Heading2"/><w:spacing w:before="220" w:after="90"/></w:pPr>'
     if style == "Heading3":
         return (
             '<w:pPr><w:pStyle w:val="Heading3"/>'
-            '<w:spacing w:before="260" w:after="100" w:line="320" w:lineRule="auto"/>'
-            '<w:ind w:left="80" w:right="120"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="12" w:space="8" w:color="2F7D6D"/></w:pBdr>'
+            '<w:spacing w:before="180" w:after="70" w:line="300" w:lineRule="auto"/>'
             '</w:pPr>'
         )
     if style == "Caption":
@@ -5963,18 +6142,16 @@ def _paragraph_properties(style: str | None = None) -> str:
     if style == "Metadata":
         return (
             '<w:pPr><w:pStyle w:val="Metadata"/>'
-            '<w:spacing w:before="40" w:after="40" w:line="300" w:lineRule="auto"/>'
-            '<w:ind w:left="260"/>'
-            '<w:shd w:fill="F7FBFA"/>'
+            '<w:spacing w:before="35" w:after="35" w:line="300" w:lineRule="auto"/>'
+            '<w:ind w:left="240"/>'
             '</w:pPr>'
         )
     if style == "Callout":
         return (
             '<w:pPr><w:pStyle w:val="Callout"/>'
-            '<w:spacing w:before="120" w:after="120" w:line="360" w:lineRule="auto"/>'
-            '<w:ind w:left="240" w:right="240"/>'
-            '<w:shd w:fill="F7FBFA"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="10" w:space="8" w:color="7CB7A8"/></w:pBdr>'
+            '<w:spacing w:before="80" w:after="100" w:line="340" w:lineRule="auto"/>'
+            '<w:ind w:left="180" w:right="120"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="BFDBFE"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "FigureCallout":
@@ -5982,17 +6159,15 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:pPr><w:pStyle w:val="FigureCallout"/>'
             '<w:spacing w:before="80" w:after="40" w:line="300" w:lineRule="auto"/>'
             '<w:ind w:left="260" w:right="260"/>'
-            '<w:shd w:fill="F1F5F9"/>'
             '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="64748B"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "NoteCard":
         return (
             '<w:pPr><w:pStyle w:val="NoteCard"/>'
-            '<w:spacing w:before="90" w:after="90" w:line="340" w:lineRule="auto"/>'
-            '<w:ind w:left="220" w:right="220"/>'
-            '<w:shd w:fill="FFFDF7"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="D7A84A"/></w:pBdr>'
+            '<w:spacing w:before="80" w:after="100" w:line="340" w:lineRule="auto"/>'
+            '<w:ind w:left="180" w:right="120"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="BFDBFE"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "ListParagraph":
@@ -6110,17 +6285,34 @@ def _original_asset_label(asset: PaperAsset) -> str:
                 source_text,
             )
             if match:
-                return f"公式 {match.group(1)}"
+                label = _reasonable_equation_number(match.group(1))
+                if label:
+                    return f"公式 {label}"
             match = re.search(r"(?:公式|方程)\s*[\(:：]?\s*([0-9一二三四五六七八九十]+)\)?", source_text)
             if match:
                 return f"公式 {match.group(1)}"
             match = re.search(r"[\(\[（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)\]）]", source_text)
             if match:
-                return f"公式 {match.group(1)}"
+                label = _reasonable_equation_number(match.group(1))
+                if label:
+                    return f"公式 {label}"
             match = _trailing_equation_number(source_text)
             if match:
-                return f"公式 {match}"
+                label = _reasonable_equation_number(match)
+                if label:
+                    return f"公式 {label}"
     return ""
+
+
+def _reasonable_equation_number(value: str) -> str:
+    value = str(value).strip()
+    numeric = re.match(r"^(\d+)([A-Za-z]?)$", value)
+    if not numeric:
+        return value
+    number = int(numeric.group(1))
+    if number <= 0 or number > 80:
+        return ""
+    return value
 
 
 def _trailing_equation_number(text: str) -> str:
@@ -6363,17 +6555,17 @@ def _styles_xml() -> str:
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
-<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="2B2B2B"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="40"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="30"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2F7D6D"/><w:sz w:val="26"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="FFFFFF"/><w:sz w:val="30"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="1F4F46"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="294D45"/><w:sz w:val="21"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="294D45"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F172A"/><w:sz w:val="36"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2563EB"/><w:sz w:val="28"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1D4ED8"/><w:sz w:val="24"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2563EB"/><w:sz w:val="23"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1D4ED8"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="1D4ED8"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="FigureCallout"><w:name w:val="figure callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="475569"/><w:sz w:val="20"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="4A3B18"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="list paragraph"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="333333"/><w:sz w:val="22"/></w:rPr></w:style>
 </w:styles>"""
 

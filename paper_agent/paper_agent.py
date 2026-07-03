@@ -337,6 +337,9 @@ def main(args: Optional[List[str]] = None) -> int:
         from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
         from paper_agent.harness.workflow import summarize_paper
 
+        def print_progress(value: float, desc: str) -> None:
+            print(f"[{value * 100:5.1f}%] {desc}", flush=True)
+
         output_path = summarize_paper(
             parsed_args.file,
             parsed_args.output,
@@ -349,6 +352,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 "CODEX_USE_PROXY": str(ConfigManager.get("CODEX_USE_PROXY", "")),
             },
             max_assets=parsed_args.max_assets or DEFAULT_MAX_ASSETS,
+            progress=print_progress,
         )
         print(output_path)
         return 0
