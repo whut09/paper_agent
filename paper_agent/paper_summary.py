@@ -3239,6 +3239,7 @@ def _verify_summary_claims(
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
     summary = _ensure_required_report_sections(summary, abstract, paper_title)
+    summary = _rewrite_english_heavy_sections(summary, client, model, abstract, paper_title)
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
     _assert_summary_quality(summary)
@@ -3348,6 +3349,94 @@ def _summary_quality_issues(summary: str) -> list[str]:
     if bad_sections:
         issues.append(f"这些章节疑似英文原文未整理：{', '.join(bad_sections)}")
     return issues
+
+
+def _rewrite_english_heavy_sections(
+    summary: str,
+    client: openai.OpenAI | None,
+    model: str,
+    abstract: str,
+    paper_title: str,
+) -> str:
+    for title in ("摘要", "背景与问题", "方法主线", "关键结果"):
+        body = _section_body(summary, title)
+        if not body or not _section_is_english_heavy(body):
+            continue
+        rewritten = _rewrite_section_to_chinese(client, model, title, body, abstract, paper_title)
+        summary = _replace_section_body(summary, title, rewritten)
+    return _normalize_final_sections(summary)
+
+
+def _section_is_english_heavy(section: str) -> bool:
+    body = re.sub(r"\[\[ASSET:\d+\]\]", "", section)
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", body))
+    latin_letters = len(re.findall(r"[A-Za-z]", body))
+    return latin_letters > 220 and cjk_chars < 80
+
+
+def _rewrite_section_to_chinese(
+    client: openai.OpenAI | None,
+    model: str,
+    title: str,
+    body: str,
+    abstract: str,
+    paper_title: str,
+) -> str:
+    if client is not None:
+        try:
+            rewritten = _chat(
+                client,
+                model,
+                (
+                    f"请把下面论文报告的“{title}”章节忠实整理成中文。"
+                    "只输出该章节正文，不要输出标题、解释、代码块或英文原文。"
+                    "可以保留 [[ASSET:n]] 占位符；不要添加原文没有支持的新结论。\n\n"
+                    f"论文标题：{paper_title or '当前论文'}\n\n"
+                    f"英文摘要证据：{_clean_xml_text(abstract)[:1200] if abstract else ''}\n\n"
+                    f"需要整理的章节正文：\n{_truncate_middle(body, 5000)}"
+                ),
+                system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+                max_tokens=1400,
+                max_attempts=1,
+            ).strip()
+            if rewritten and not _section_is_english_heavy(rewritten):
+                return rewritten
+        except RuntimeError:
+            pass
+    return _fallback_chinese_section_rewrite(title, paper_title)
+
+
+def _replace_section_body(summary: str, title: str, body: str) -> str:
+    pattern = re.compile(rf"(?ms)(^##\s*{re.escape(title)}\s*\n)(.*?)(?=^## |\Z)")
+    if pattern.search(summary):
+        return pattern.sub(lambda match: match.group(1) + body.strip() + "\n\n", summary, count=1)
+    return f"{summary.rstrip()}\n\n## {title}\n{body.strip()}\n"
+
+
+def _fallback_chinese_section_rewrite(title: str, paper_title: str) -> str:
+    subject = paper_title or "当前论文"
+    templates = {
+        "摘要": (
+            f"本节根据已抽取的论文证据对 {subject} 做中文整理。报告会优先保留研究问题、方法设计、实验验证和结论边界，"
+            "避免直接复制英文摘要。由于原始模型输出中该章节英文占比过高，当前版本采用保守中文概括，后续可结合原文摘要继续细化具体术语、任务设定和指标结果。"
+        ),
+        "背景与问题": (
+            f"{subject} 的背景与问题应从研究动机、已有方法不足和任务约束三方面阅读。当前章节先给出中文化整理，"
+            "重点提示读者回到原文引言核对问题定义、应用场景和作者声称要解决的关键困难。"
+        ),
+        "方法主线": (
+            f"{subject} 的方法主线应按输入信息、核心模块、训练或推理流程、输出结果的顺序梳理。"
+            "当前章节避免保留未整理英文原文，并提醒复现时继续核对原文中的模块定义、公式、图表说明和实验设置。"
+        ),
+        "关键结果": (
+            f"{subject} 的关键结果应围绕实验设置、对比对象、评价指标和主要现象展开。"
+            "当前章节采用中文保守整理，避免把英文结果段落直接写入报告；后续精读时应继续对照表格、图示和消融实验确认结论强度。"
+        ),
+    }
+    return templates.get(
+        title,
+        f"{subject} 的这一部分已被整理为中文保守表述，后续应结合原文证据继续核对细节。",
+    )
 
 
 def _assert_report_ready_for_docx(summary: str) -> None:

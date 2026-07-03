@@ -48,7 +48,9 @@ from paper_agent.paper_summary import (
     _row_is_prose_after_table,
     _row_looks_table_section_label,
     _row_looks_table_like,
+    _rewrite_english_heavy_sections,
     _sync_inline_asset_references,
+    _summary_quality_issues,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _verification_should_block_report,
@@ -542,6 +544,30 @@ def test_required_report_sections_are_rebuilt_from_sparse_draft():
     )
     assert not any("missing required section" in error for error in guard.errors)
     assert not any("required section is too short" in error for error in guard.errors)
+
+
+def test_english_heavy_required_section_is_rewritten_before_quality_gate():
+    english_abstract = (
+        "This paper presents a model that decomposes visual inputs into multiple stages, "
+        "uses expert modules for reasoning, and evaluates the approach on several task settings. "
+        "The experiments compare the method with baseline systems and discuss limitations in deployment. "
+        "The paper also studies ablation settings, robustness behavior, and metric changes across datasets."
+    )
+    summary = _ensure_required_report_sections(
+        f"# Test\n\n## 摘要\n{english_abstract}",
+        english_abstract,
+        "A Test Paper About Expert Modules",
+    )
+
+    result = _rewrite_english_heavy_sections(
+        summary,
+        None,
+        "test-model",
+        english_abstract,
+        "A Test Paper About Expert Modules",
+    )
+
+    assert "疑似英文原文未整理" not in "；".join(_summary_quality_issues(result))
 
 
 def test_knowledge_graph_links_claims_to_source_sections():
