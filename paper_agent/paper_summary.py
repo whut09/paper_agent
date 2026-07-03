@@ -6637,7 +6637,7 @@ def _paragraph(text: str, style: str | None = None) -> str:
 def _run_properties(style: str | None = None) -> str:
     base_fonts = _font_run_xml()
     if style == "Heading3":
-        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="2563EB"/><w:sz w:val="23"/></w:rPr>'
+        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="0F766E"/><w:sz w:val="23"/></w:rPr>'
     return f"<w:rPr>{base_fonts}</w:rPr>"
 
 
@@ -6657,16 +6657,28 @@ def _paragraph_properties(style: str | None = None) -> str:
     if style == "Heading1":
         return (
             '<w:pPr><w:pStyle w:val="Heading1"/>'
-            '<w:spacing w:before="360" w:after="140"/>'
-            '<w:pBdr><w:bottom w:val="single" w:sz="8" w:space="6" w:color="BFDBFE"/></w:pBdr>'
+            '<w:spacing w:before="360" w:after="150" w:line="300" w:lineRule="auto"/>'
+            '<w:ind w:left="80" w:right="80"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="18" w:space="6" w:color="0F766E"/></w:pBdr>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>'
             '</w:pPr>'
         )
     if style == "Heading2":
-        return '<w:pPr><w:pStyle w:val="Heading2"/><w:spacing w:before="220" w:after="90"/></w:pPr>'
+        return (
+            '<w:pPr><w:pStyle w:val="Heading2"/>'
+            '<w:spacing w:before="240" w:after="100" w:line="300" w:lineRule="auto"/>'
+            '<w:ind w:left="80" w:right="80"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="14" w:space="6" w:color="0F766E"/></w:pBdr>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>'
+            '</w:pPr>'
+        )
     if style == "Heading3":
         return (
             '<w:pPr><w:pStyle w:val="Heading3"/>'
-            '<w:spacing w:before="180" w:after="70" w:line="300" w:lineRule="auto"/>'
+            '<w:spacing w:before="180" w:after="80" w:line="300" w:lineRule="auto"/>'
+            '<w:ind w:left="80" w:right="80"/>'
+            '<w:pBdr><w:left w:val="single" w:sz="12" w:space="6" w:color="0F766E"/></w:pBdr>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="EAF4F2"/>'
             '</w:pPr>'
         )
     if style == "Caption":
@@ -6680,8 +6692,9 @@ def _paragraph_properties(style: str | None = None) -> str:
     if style == "Metadata":
         return (
             '<w:pPr><w:pStyle w:val="Metadata"/>'
-            '<w:spacing w:before="35" w:after="35" w:line="300" w:lineRule="auto"/>'
+            '<w:spacing w:before="18" w:after="18" w:line="285" w:lineRule="auto"/>'
             '<w:ind w:left="240"/>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="F2F8F7"/>'
             '</w:pPr>'
         )
     if style == "Callout":
@@ -6689,7 +6702,8 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:pPr><w:pStyle w:val="Callout"/>'
             '<w:spacing w:before="80" w:after="100" w:line="340" w:lineRule="auto"/>'
             '<w:ind w:left="180" w:right="120"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="BFDBFE"/></w:pBdr>'
+            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="0F766E"/></w:pBdr>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="F2F8F7"/>'
             '</w:pPr>'
         )
     if style == "FigureCallout":
@@ -6697,7 +6711,7 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:pPr><w:pStyle w:val="FigureCallout"/>'
             '<w:spacing w:before="80" w:after="40" w:line="300" w:lineRule="auto"/>'
             '<w:ind w:left="260" w:right="260"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="64748B"/></w:pBdr>'
+            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="7BA7A0"/></w:pBdr>'
             '</w:pPr>'
         )
     if style == "NoteCard":
@@ -6705,7 +6719,8 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:pPr><w:pStyle w:val="NoteCard"/>'
             '<w:spacing w:before="80" w:after="100" w:line="340" w:lineRule="auto"/>'
             '<w:ind w:left="180" w:right="120"/>'
-            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="BFDBFE"/></w:pBdr>'
+            '<w:pBdr><w:left w:val="single" w:sz="8" w:space="8" w:color="0F766E"/></w:pBdr>'
+            '<w:shd w:val="clear" w:color="auto" w:fill="F2F8F7"/>'
             '</w:pPr>'
         )
     if style == "ListParagraph":
@@ -7093,17 +7108,17 @@ def _styles_xml() -> str:
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
 <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:sz w:val="22"/></w:rPr></w:rPrDefault></w:docDefaults>
-<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="111827"/><w:sz w:val="22"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F172A"/><w:sz w:val="36"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2563EB"/><w:sz w:val="28"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1D4ED8"/><w:sz w:val="24"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="2563EB"/><w:sz w:val="23"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="1D4ED8"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="1D4ED8"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="21"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="FigureCallout"><w:name w:val="figure callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="475569"/><w:sz w:val="20"/></w:rPr></w:style>
-<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="334155"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F766E"/><w:sz w:val="26"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F766E"/><w:sz w:val="24"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F766E"/><w:sz w:val="23"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Caption"><w:name w:val="caption"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:b/><w:color w:val="0F766E"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="AssetLead"><w:name w:val="asset lead"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="0F766E"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Metadata"><w:name w:val="metadata"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="0F3F3A"/><w:sz w:val="21"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="Callout"><w:name w:val="callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="111827"/><w:sz w:val="22"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="FigureCallout"><w:name w:val="figure callout"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="4B635F"/><w:sz w:val="20"/></w:rPr></w:style>
+<w:style w:type="paragraph" w:styleId="NoteCard"><w:name w:val="note card"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="111827"/><w:sz w:val="22"/></w:rPr></w:style>
 <w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="list paragraph"/><w:basedOn w:val="Normal"/><w:rPr><w:rFonts w:ascii="{DOCX_FONT}" w:hAnsi="{DOCX_FONT}" w:eastAsia="{DOCX_FONT}" w:cs="{DOCX_FONT}"/><w:color w:val="333333"/><w:sz w:val="22"/></w:rPr></w:style>
 </w:styles>"""
 

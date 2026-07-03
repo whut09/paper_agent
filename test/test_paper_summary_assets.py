@@ -56,6 +56,7 @@ from paper_agent.paper_summary import (
     _report_substance_issues,
     _sync_inline_asset_references,
     _suppress_formula_text_when_assets_present,
+    _styles_xml,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _verification_should_block_report,
@@ -850,14 +851,28 @@ def test_background_sections_normalize_to_background_and_problem():
     assert "## 研究问题" not in result
 
 
-def test_heading3_uses_plain_blue_subheading_style():
-    xml = _paragraph("机制流程", "Heading3")
-    paragraph_properties = xml.split("</w:pPr>", 1)[0]
-    run_properties = xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
+def test_docx_headings_use_legacy_teal_bar_style():
+    heading1_xml = _paragraph("摘要", "Heading1")
+    heading3_xml = _paragraph("机制流程", "Heading3")
+    styles_xml = _styles_xml()
+    heading1_properties = heading1_xml.split("</w:pPr>", 1)[0]
+    heading3_properties = heading3_xml.split("</w:pPr>", 1)[0]
+    heading3_run_properties = heading3_xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
 
-    assert "<w:shd" not in paragraph_properties
-    assert "<w:shd" not in run_properties
-    assert '<w:color w:val="2563EB"/>' in run_properties
+    assert '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>' in heading1_properties
+    assert '<w:pBdr><w:left w:val="single"' in heading1_properties
+    assert 'w:color="0F766E"' in heading1_properties
+    assert '<w:shd w:val="clear" w:color="auto" w:fill="EAF4F2"/>' in heading3_properties
+    assert '<w:color w:val="0F766E"/>' in heading3_run_properties
+    assert "2563EB" not in styles_xml
+    assert "1D4ED8" not in styles_xml
+
+
+def test_metadata_uses_legacy_light_teal_fill():
+    xml = _paragraph("- 标题: Test", "Metadata")
+    paragraph_properties = xml.split("</w:pPr>", 1)[0]
+
+    assert '<w:shd w:val="clear" w:color="auto" w:fill="F2F8F7"/>' in paragraph_properties
 
 
 def test_latex_text_is_rendered_as_readable_inline_text():
