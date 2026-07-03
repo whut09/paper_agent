@@ -48,6 +48,7 @@ class PaperWorkflowContext:
     config: Any | None = None
     client: Any | None = None
     chunk_notes: list[str] = field(default_factory=list)
+    partial_summaries: list[dict[str, Any]] = field(default_factory=list)
     summary: str = ""
     verification: Any | None = None
     guard_results: list[Any] = field(default_factory=list)

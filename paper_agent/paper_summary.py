@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -411,7 +411,7 @@ class SummarizeContribution(_PaperWorkflowNode):
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
     requires = ["paper_text", "assets", "prompt_patches"]
-    produces = ["chunk_notes"]
+    produces = ["chunk_notes", "partial_summaries"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         context.check_cancelled()
@@ -434,6 +434,24 @@ class SummarizeContribution(_PaperWorkflowNode):
             cache_path=(context.output / f"{context.paper_name}-chunk-notes.json")
             if context.output is not None
             else None,
+            partial_summaries=context.partial_summaries,
+            partial_cache_path=(context.output / f"{context.paper_name}-partial-integrations.json")
+            if context.output is not None
+            else None,
+            partial_integrator=lambda name, start, end, notes: _integrate_chunk_group_with_codex(
+                context.client,
+                context.config.model,
+                name,
+                start,
+                end,
+                notes,
+                context.assets,
+                context.summary_language,
+                context.abstract,
+                context.paper_title,
+                context.correction_memories,
+                context.prompt_patches,
+            ),
         )
 
 
@@ -461,6 +479,7 @@ class ExtractMethods(_PaperWorkflowNode):
             context.paper_title,
             context.correction_memories,
             context.prompt_patches,
+            context.partial_summaries,
         )
 
 
@@ -763,6 +782,7 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "knowledge_graph": context.knowledge_graph,
         "prompt_patches": context.prompt_patches,
         "chunk_notes": context.chunk_notes,
+        "partial_summaries": context.partial_summaries,
         "draft_report": context.summary,
         "verified_report": context.summary,
         "verification_report": context.verification,
@@ -3007,6 +3027,9 @@ def _summarize_chunks_with_codex(
     progress_callback: Callable[[int, int], None] | None = None,
     cancellation_check: Callable[[], None] | None = None,
     cache_path: Path | None = None,
+    partial_summaries: list[dict[str, object]] | None = None,
+    partial_cache_path: Path | None = None,
+    partial_integrator: Callable[[str, int, int, list[str]], str] | None = None,
 ) -> list[str]:
     chunks = _chunk_text(paper_text, _codex_chunk_chars())
     asset_context = _asset_context(assets, text_preview_chars=0, latex_preview_chars=0)
@@ -3016,6 +3039,9 @@ def _summarize_chunks_with_codex(
     extraction_patch = _prompt_patch_context(patches, "extraction")
     total = len(chunks)
     cached_notes = _load_chunk_notes_cache(cache_path, total)
+    partial_records = partial_summaries if partial_summaries is not None else []
+    partial_records[:] = _load_partial_integration_cache(partial_cache_path, total)
+    group_specs = _chunk_integration_group_specs(total) if partial_integrator else []
 
     def summarize_one(idx: int, chunk: str) -> tuple[int, str]:
         if cancellation_check:
@@ -3069,6 +3095,17 @@ def _summarize_chunks_with_codex(
             _write_chunk_notes_cache(cache_path, chunk_notes, total)
             if progress_callback:
                 progress_callback(len(chunk_notes), total)
+        if group_specs and partial_integrator:
+            _run_missing_partial_integrations(
+                group_specs,
+                chunk_notes,
+                partial_records,
+                partial_cache_path,
+                total,
+                partial_integrator,
+                cancellation_check,
+                max_workers=1,
+            )
         return chunk_notes
 
     results: list[str] = [""] * total
@@ -3084,28 +3121,69 @@ def _summarize_chunks_with_codex(
             pending_chunks.append((idx, chunk))
     if completed:
         _write_chunk_notes_cache(cache_path, results, total)
-    if not pending_chunks:
-        return results
+
+    pending_queue = list(pending_chunks)
+    submitted_partials: set[str] = set(_partial_integration_keys(partial_records))
 
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-summary") as executor:
-        future_to_index = {
-            executor.submit(summarize_one, idx, chunk): idx
-            for idx, chunk in pending_chunks
-        }
-        for future in as_completed(future_to_index):
+        active: dict[object, tuple[str, object]] = {}
+
+        def submit_ready_partials() -> None:
+            if not partial_integrator:
+                return
+            for spec in group_specs:
+                key = _partial_integration_key(spec["name"], spec["start"], spec["end"])
+                if key in submitted_partials:
+                    continue
+                if not _chunk_group_is_ready(results, spec["start"], spec["end"]):
+                    continue
+                if len(active) >= max_workers:
+                    return
+                notes = results[spec["start"] - 1 : spec["end"]]
+                active[executor.submit(partial_integrator, spec["name"], spec["start"], spec["end"], notes)] = (
+                    "partial",
+                    spec,
+                )
+                submitted_partials.add(key)
+
+        def submit_more_chunks() -> None:
+            while pending_queue and len(active) < max_workers:
+                idx, chunk = pending_queue.pop(0)
+                active[executor.submit(summarize_one, idx, chunk)] = ("chunk", idx)
+
+        submit_ready_partials()
+        submit_more_chunks()
+        while active:
             if cancellation_check:
                 cancellation_check()
-            idx = future_to_index[future]
-            try:
-                _idx, note = future.result()
-                idx = _idx
-            except Exception as exc:
-                raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
-            results[idx - 1] = note
-            completed += 1
-            _write_chunk_notes_cache(cache_path, results, total)
-            if progress_callback:
-                progress_callback(completed, total)
+            done, _pending = wait(active, return_when=FIRST_COMPLETED)
+            for future in done:
+                kind, meta = active.pop(future)
+                if kind == "chunk":
+                    idx = int(meta)
+                    try:
+                        _idx, note = future.result()
+                        idx = _idx
+                    except Exception as exc:
+                        raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
+                    results[idx - 1] = note
+                    completed += 1
+                    _write_chunk_notes_cache(cache_path, results, total)
+                    if progress_callback:
+                        progress_callback(completed, total)
+                    continue
+
+                spec = dict(meta)
+                try:
+                    summary = future.result()
+                except Exception:
+                    continue
+                partial_records.append(
+                    _partial_integration_record(spec["name"], spec["start"], spec["end"], total, summary)
+                )
+                _write_partial_integration_cache(partial_cache_path, partial_records, total)
+            submit_ready_partials()
+            submit_more_chunks()
     return results
 
 
@@ -3134,6 +3212,142 @@ def _write_chunk_notes_cache(cache_path: Path | None, notes: list[str], total: i
         )
     except OSError:
         return
+
+
+def _chunk_integration_group_specs(total: int) -> list[dict[str, int | str]]:
+    if total < 4:
+        return []
+    midpoint = (total + 1) // 2
+    return [
+        {"name": "前半篇", "start": 1, "end": midpoint},
+        {"name": "后半篇", "start": midpoint + 1, "end": total},
+    ]
+
+
+def _chunk_group_is_ready(notes: list[str], start: int, end: int) -> bool:
+    if start < 1 or end > len(notes) or start > end:
+        return False
+    return all(note.strip() for note in notes[start - 1 : end])
+
+
+def _partial_integration_key(name: object, start: object, end: object) -> str:
+    return f"{name}:{start}-{end}"
+
+
+def _partial_integration_keys(records: list[dict[str, object]]) -> set[str]:
+    return {
+        _partial_integration_key(record.get("name"), record.get("start"), record.get("end"))
+        for record in records
+        if record.get("summary")
+    }
+
+
+def _partial_integration_record(name: str, start: int, end: int, total: int, summary: str) -> dict[str, object]:
+    return {
+        "name": name,
+        "start": start,
+        "end": end,
+        "total": total,
+        "summary": _postprocess_summary(summary),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _load_partial_integration_cache(cache_path: Path | None, total: int) -> list[dict[str, object]]:
+    if cache_path is None or not cache_path.exists():
+        return []
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if int(data.get("total") or 0) != total:
+        return []
+    records = data.get("partials")
+    if not isinstance(records, list):
+        return []
+    cleaned = []
+    for record in records:
+        if not isinstance(record, dict) or not record.get("summary"):
+            continue
+        try:
+            start = int(record.get("start") or 0)
+            end = int(record.get("end") or 0)
+        except (TypeError, ValueError):
+            continue
+        name = _clean_xml_text(str(record.get("name") or "分段整合"))
+        summary = _postprocess_summary(str(record.get("summary") or ""))
+        if not name or not summary or start <= 0 or end < start:
+            continue
+        cleaned.append(_partial_integration_record(name, start, end, total, summary))
+    return cleaned
+
+
+def _write_partial_integration_cache(
+    cache_path: Path | None,
+    records: list[dict[str, object]],
+    total: int,
+) -> None:
+    if cache_path is None:
+        return
+    deduped: dict[str, dict[str, object]] = {}
+    for record in records:
+        if not record.get("summary"):
+            continue
+        key = _partial_integration_key(record.get("name"), record.get("start"), record.get("end"))
+        deduped[key] = record
+    try:
+        cache_path.write_text(
+            json.dumps({"total": total, "partials": list(deduped.values())}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _run_missing_partial_integrations(
+    group_specs: list[dict[str, int | str]],
+    chunk_notes: list[str],
+    records: list[dict[str, object]],
+    cache_path: Path | None,
+    total: int,
+    partial_integrator: Callable[[str, int, int, list[str]], str],
+    cancellation_check: Callable[[], None] | None = None,
+    max_workers: int = 2,
+) -> None:
+    existing = _partial_integration_keys(records)
+    missing = []
+    for spec in group_specs:
+        key = _partial_integration_key(spec["name"], spec["start"], spec["end"])
+        start = int(spec["start"])
+        end = int(spec["end"])
+        if key not in existing and _chunk_group_is_ready(chunk_notes, start, end):
+            missing.append(spec)
+    if not missing:
+        return
+    workers = max(1, min(max_workers, len(missing)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="paper-partial") as executor:
+        futures = {
+            executor.submit(
+                partial_integrator,
+                str(spec["name"]),
+                int(spec["start"]),
+                int(spec["end"]),
+                chunk_notes[int(spec["start"]) - 1 : int(spec["end"])],
+            ): spec
+            for spec in missing
+        }
+        for future in as_completed(futures):
+            if cancellation_check:
+                cancellation_check()
+            spec = futures[future]
+            try:
+                summary = future.result()
+            except Exception:
+                continue
+            records.append(
+                _partial_integration_record(str(spec["name"]), int(spec["start"]), int(spec["end"]), total, summary)
+            )
+            _write_partial_integration_cache(cache_path, records, total)
 
 
 def _chunk_summary_error_message(idx: int, total: int, exc: Exception) -> str:
@@ -3168,8 +3382,38 @@ def _integrate_summary_with_codex(
     paper_title: str,
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
+    partial_summaries: list[dict[str, object]] | None = None,
 ) -> str:
     client = _coerce_codex_client(client)
+    usable_partials = _usable_partial_summaries(partial_summaries or [], len(chunk_notes))
+    if usable_partials:
+        try:
+            return _integrate_summary_from_partials_with_codex(
+                client,
+                model,
+                chunk_notes,
+                usable_partials,
+                assets,
+                summary_language,
+                abstract,
+                paper_title,
+                correction_memories,
+                prompt_patches,
+            )
+        except RuntimeError as exc:
+            return _fast_integrate_summary_with_codex(
+                client,
+                model,
+                chunk_notes,
+                assets,
+                summary_language,
+                abstract,
+                formulas,
+                recognized_formulas,
+                paper_title,
+                exc,
+            )
+
     asset_context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=0)
     formula_asset_rule = _formula_asset_usage_rule(assets)
     memories = correction_memories or []
@@ -3211,6 +3455,176 @@ def _integrate_summary_with_codex(
             paper_title,
             exc,
         )
+
+
+def _usable_partial_summaries(records: list[dict[str, object]], total_chunks: int) -> list[dict[str, object]]:
+    if total_chunks < 4:
+        return []
+    expected = {
+        _partial_integration_key(spec["name"], spec["start"], spec["end"])
+        for spec in _chunk_integration_group_specs(total_chunks)
+    }
+    by_key: dict[str, dict[str, object]] = {}
+    for record in records:
+        if not record.get("summary"):
+            continue
+        key = _partial_integration_key(record.get("name"), record.get("start"), record.get("end"))
+        if key in expected:
+            by_key[key] = record
+    if expected - set(by_key):
+        return []
+    return sorted(by_key.values(), key=lambda record: int(record.get("start") or 0))
+
+
+def _integrate_chunk_group_with_codex(
+    client: openai.OpenAI | None,
+    model: str,
+    name: str,
+    start: int,
+    end: int,
+    chunk_notes: list[str],
+    assets: list[PaperAsset],
+    summary_language: str,
+    abstract: str,
+    paper_title: str,
+    correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
+) -> str:
+    client = _coerce_codex_client(client)
+    memories = correction_memories or []
+    patches = prompt_patches or _build_prompt_patches(memories)
+    memory_context = _correction_memory_context(memories)
+    summarization_patch = _prompt_patch_context(patches, "summarization")
+    notes = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=16000)
+    formula_asset_rule = _formula_asset_usage_rule(assets)
+    asset_context = _asset_context(assets, text_preview_chars=180, latex_preview_chars=0)
+    prompt = (
+        f"请把论文第 {start}-{end} 段分段笔记整合成“{name}”中间稿。"
+        "这不是最终报告，但要为最终报告提供高密度、可引用的中文材料。\n\n"
+        "要求：\n"
+        "1. 只基于给定分段笔记和证据写，不要编造。\n"
+        "2. 保留本半篇涉及的背景、方法、公式含义、实验结果、局限和图表占位符。\n"
+        "3. 用自然段和小标题组织，不要输出计划、过程说明、代码块、JSON 或英文原文摘录。\n"
+        "4. 公式只解释含义并引用公式截图，不要复写完整公式、LaTeX、等式或长变量表达。\n"
+        "5. 输出长度控制在 1200-2200 中文字左右，优先保留事实密度。\n\n"
+        f"总结语言：{summary_language}\n\n"
+        f"论文标题证据：{paper_title or '未可靠抽取'}\n\n"
+        f"摘要证据：{_clean_xml_text(abstract)[:1400] if abstract else '未可靠抽取'}\n\n"
+        f"历史用户修正规则：\n{memory_context}\n\n"
+        f"自优化总结提示词：\n{summarization_patch}\n\n"
+        f"公式截图使用规则：\n{formula_asset_rule}\n\n"
+        f"可用图表截图：\n{asset_context}\n\n"
+        f"分段笔记：\n{notes}"
+    )
+    return _chat(
+        client,
+        model,
+        prompt,
+        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+        max_tokens=2800,
+        max_attempts=1,
+    )
+
+
+def _integrate_summary_from_partials_with_codex(
+    client: openai.OpenAI | None,
+    model: str,
+    chunk_notes: list[str],
+    partial_summaries: list[dict[str, object]],
+    assets: list[PaperAsset],
+    summary_language: str,
+    abstract: str,
+    paper_title: str,
+    correction_memories: list[CorrectionMemory] | None = None,
+    prompt_patches: list[PromptPatch] | None = None,
+) -> str:
+    client = _coerce_codex_client(client)
+    memories = correction_memories or []
+    patches = prompt_patches or _build_prompt_patches(memories)
+    memory_context = _correction_memory_context(memories)
+    summarization_patch = _prompt_patch_context(patches, "summarization")
+    asset_context = _asset_context(assets, text_preview_chars=400, latex_preview_chars=0)
+    formula_asset_rule = _formula_asset_usage_rule(assets)
+    partial_context = _partial_summary_context(partial_summaries)
+    edge_context = _partial_edge_chunk_context(chunk_notes, partial_summaries)
+    prompt = (
+        f"{_final_note_prompt_for_runtime()}\n\n总结语言：{summary_language}\n\n"
+        "整合策略：你收到的是前半篇和后半篇的并行整合稿，以及每半篇首尾 20% 的原始分段证据。"
+        "请优先以半篇整合稿建立全局结构，再用首尾证据补足引言、方法转折、实验结论和局限，不要重新逐段罗列。\n\n"
+        f"历史用户修正规则：\n{memory_context}\n\n"
+        f"自优化总结提示词：\n{summarization_patch}\n\n"
+        "完整性硬性要求：最终输出必须包含这些二级章节："
+        "## 核心信息、## 摘要、## 背景与问题、## 创新点、## 一句话总结、"
+        "## 方法主线、## 关键结果、## 深度分析、## 局限、## 总结。"
+        "如果证据较少，也要用已有证据写成短段落；不要输出计划、过程说明或“我先/接着我会”这类话。\n\n"
+        f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
+        f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
+        f"公式截图使用规则：\n{formula_asset_rule}\n\n"
+        f"可用图表截图：\n{asset_context}\n\n"
+        f"半篇并行整合稿：\n{partial_context}\n\n"
+        f"首尾 20% 分段证据：\n{edge_context}"
+    )
+    return _chat(
+        client,
+        model,
+        prompt,
+        system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
+        max_tokens=5200,
+    )
+
+
+def _partial_summary_context(partial_summaries: list[dict[str, object]], max_chars_per_partial: int = 7000) -> str:
+    parts = []
+    for record in partial_summaries:
+        name = _clean_xml_text(str(record.get("name") or "分段整合"))
+        start = int(record.get("start") or 0)
+        end = int(record.get("end") or 0)
+        summary = _truncate_middle(_postprocess_summary(str(record.get("summary") or "")), max_chars_per_partial)
+        if summary:
+            parts.append(f"[{name} | Chunk {start}-{end}]\n{summary}")
+    return "\n\n".join(parts) or "未获得半篇整合稿。"
+
+
+def _partial_edge_chunk_context(
+    chunk_notes: list[str],
+    partial_summaries: list[dict[str, object]],
+    max_total_chars: int = 18000,
+) -> str:
+    selected: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    for record in partial_summaries:
+        start = int(record.get("start") or 0)
+        end = int(record.get("end") or 0)
+        for idx in _edge_chunk_indices(start, end):
+            if idx in seen or idx < 1 or idx > len(chunk_notes):
+                continue
+            seen.add(idx)
+            selected.append((idx, chunk_notes[idx - 1]))
+    selected.sort(key=lambda item: item[0])
+    if not selected:
+        return ""
+    per_note_limit = max(900, max_total_chars // max(1, len(selected)))
+    parts = []
+    total = 0
+    for idx, note in selected:
+        cleaned = _truncate_middle(_postprocess_summary(note), per_note_limit)
+        remaining = max_total_chars - total
+        if remaining <= 0:
+            break
+        cleaned = cleaned[:remaining]
+        parts.append(f"[Chunk {idx}]\n{cleaned}")
+        total += len(cleaned)
+    return "\n\n".join(parts)
+
+
+def _edge_chunk_indices(start: int, end: int) -> list[int]:
+    if start <= 0 or end < start:
+        return []
+    count = end - start + 1
+    edge_count = max(1, (count + 4) // 5)
+    indices = list(range(start, min(end, start + edge_count - 1) + 1))
+    indices.extend(range(max(start, end - edge_count + 1), end + 1))
+    return sorted(dict.fromkeys(indices))
 
 
 def _compact_chunk_notes_for_final(chunk_notes: list[str], max_total_chars: int = 36000) -> str:

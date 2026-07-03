@@ -48,6 +48,56 @@ def test_final_integration_stops_instead_of_raw_fallback_when_llm_times_out():
         ps._chat = original_chat
 
 
+def test_final_integration_uses_parallel_partial_summaries():
+    original_chat = ps._chat
+    prompts = []
+    try:
+        def fake_chat(*args, **kwargs):
+            prompts.append(args[2])
+            return "# Test\n\n## 核心信息\n- 标题: Test\n"
+
+        ps._chat = fake_chat
+        chunk_notes = [f"note {idx}" for idx in range(1, 11)]
+        partials = [
+            {"name": "前半篇", "start": 1, "end": 5, "total": 10, "summary": "front-half"},
+            {"name": "后半篇", "start": 6, "end": 10, "total": 10, "summary": "back-half"},
+        ]
+
+        result = ps._integrate_summary_with_codex(
+            None,
+            "fake",
+            chunk_notes,
+            [],
+            "Chinese",
+            "abstract evidence",
+            [],
+            "",
+            "Test Paper",
+            partial_summaries=partials,
+        )
+
+        assert result.startswith("# Test")
+        assert len(prompts) == 1
+        prompt = prompts[0]
+        assert "半篇并行整合稿" in prompt
+        assert "首尾 20% 分段证据" in prompt
+        assert "front-half" in prompt
+        assert "back-half" in prompt
+        assert "[Chunk 1]" in prompt
+        assert "[Chunk 5]" in prompt
+        assert "[Chunk 6]" in prompt
+        assert "[Chunk 10]" in prompt
+        assert "note 3" not in prompt
+        assert "note 8" not in prompt
+    finally:
+        ps._chat = original_chat
+
+
+def test_edge_chunk_indices_use_first_and_last_twenty_percent():
+    assert ps._edge_chunk_indices(1, 10) == [1, 2, 9, 10]
+    assert ps._edge_chunk_indices(1, 5) == [1, 5]
+
+
 def test_codex_client_factory_returns_chat_client():
     config = ps.CodexConfig(
         base_url="https://api.example.test/v1",
