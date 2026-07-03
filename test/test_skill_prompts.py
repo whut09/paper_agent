@@ -52,9 +52,13 @@ def test_skillbridge_root_defaults_to_sibling_repo_or_env(monkeypatch):
     assert root.name == "agent-skill-bridge"
 
 
-def test_load_paper_skill_reference_prefers_skillbridge(monkeypatch):
+def test_load_paper_skill_reference_prefers_skillbridge(monkeypatch, tmp_path):
     skill_prompts._REFERENCE_CACHE.clear()
     calls = []
+    bridge_root = tmp_path / "agent-skill-bridge"
+    cli_entrypoint = bridge_root / "packages" / "cli" / "dist" / "index.js"
+    cli_entrypoint.parent.mkdir(parents=True)
+    cli_entrypoint.write_text("// fake skillbridge cli\n", encoding="utf-8")
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
@@ -67,7 +71,7 @@ def test_load_paper_skill_reference_prefers_skillbridge(monkeypatch):
 
     monkeypatch.setenv("PAPER_AGENT_PROMPT_ENGINE", "skillbridge")
     monkeypatch.setenv("PAPER_AGENT_USE_SKILLBRIDGE_PROMPTS", "true")
-    monkeypatch.setenv("PAPER_AGENT_SKILLBRIDGE_ROOT", r"F:\codex\code\agent-skill-bridge")
+    monkeypatch.setenv("PAPER_AGENT_SKILLBRIDGE_ROOT", str(bridge_root))
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
     monkeypatch.setattr(subprocess, "run", fake_run)
 

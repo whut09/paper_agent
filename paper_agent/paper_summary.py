@@ -58,8 +58,8 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 7. `ASSET` 编号只是程序内部占位符，不是最终 Word 中的图、表、公式编号。正文不要把 `ASSET` 编号写成“公式 2”这类引用；必须使用可用图表截图里给出的“最终引用标签”。
 8. 保留原图表和公式编号：解释图、表、公式时尽量保留 Fig. 1、Table 2、Equation 8、(8) 等原始编号；如果无法确定编号，说明它来自第几页的截图。
 9. 不要输出思考过程，不要输出 `<think>`、`<thinking>`、代码块、HTML、JSON。
-10. 关键公式必须解读。优先使用“TexTeller 公式识别结果”中的 LaTeX；如果没有识别结果，可以重写 1 到 3 个最核心公式的可读文本形式，例如 `Δvision = Ctext / Cvision`；如果公式抽取不可靠，使用可用的公式截图占位符并解释含义。
-11. 不要输出大段 LaTeX 堆砌；每个公式后必须有一句工程含义解释。
+10. 关键公式必须解读，但公式本体只通过 `[[ASSET:编号]]` 截图展示。正文不要复写 LaTeX、等式、arg max/min、求和式、矩阵式或长变量表达；只写公式编号、变量含义、工程作用和对应截图占位符。
+11. 每个公式后必须有一句工程含义解释；如果没有公式截图，只写简短中文描述，不要补写完整公式字符串。
 """
 
 CRITIC_SYSTEM_PROMPT = (
@@ -107,7 +107,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 说明输入、任务、数据集、评价指标和实验边界。原文没有提及的项目直接省略，不要写占位句。
 
 ## 方法主线
-必须包含 `### 机制流程`，用 3-5 步解释 Input -> 关键变换 -> Output。架构图、流程图、方法框架图必须放在本节对应解释段落附近。必须包含 `### 关键公式`，解读论文最重要的 1 到 3 个公式；优先采用 TexTeller 识别到的 LaTeX，并把对应 `[[ASSET:编号]]` 放在公式解释旁边。
+必须包含 `### 机制流程`，用 3-5 步解释 Input -> 关键变换 -> Output。架构图、流程图、方法框架图必须放在本节对应解释段落附近。必须包含 `### 关键公式`，解读论文最重要的 1 到 3 个公式；如果有公式截图，正文只写公式编号、变量含义和工程作用，把对应 `[[ASSET:编号]]` 放在解释旁边，不要复写公式表达式。
 
 ## 关键结果
 提炼最重要的指标、对比、消融和失败/边界证据；不要堆砌所有数字。实验图、结果表、对比表、消融表和 case analysis 图必须放在本节对应解释段落附近。
@@ -132,7 +132,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 
 格式规则：
 - 不要输出 `<think>` 或任何思考过程。
-- 不要输出 LaTeX 块公式；公式只用短文本描述和中文解释。
+- 不要输出 LaTeX 块公式、行内公式、等式、arg max/min、求和式或长变量表达；公式本体由截图展示，正文只写中文解释。
 - 不要输出 markdown 表格，表格内容用自然段概括。
 - 不要输出“翻译”二字；核心信息里写“中文标题”，摘要章节标题只写“摘要”。
 - 不要输出 `## 引用` 章节。
@@ -554,6 +554,7 @@ class GenerateReport(_PaperWorkflowNode):
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+        context.summary = _suppress_formula_text_when_assets_present(context.summary, context.assets)
         _assert_report_ready_for_docx(context.summary)
         try:
             _write_docx(
@@ -1421,22 +1422,22 @@ def _formula_caption(text: str, latex: str = "") -> str:
     if readable:
         return readable
     if latex:
-        return f"关键公式：{latex}"
-    return f"关键公式截图：{_clean_xml_text(text)[:160]}"
+        return "关键公式截图：原文公式本体见截图，正文仅解释变量含义和工程作用"
+    return "关键公式截图：原文公式本体见截图，正文仅解释变量含义和工程作用"
 
 
 def _known_formula_caption(text: str) -> str:
     compact = re.sub(r"\s+", "", _clean_xml_text(text)).lower()
     if "e=[etext;evision]" in compact or "e=[e_text;e_vision]" in compact:
-        return "核心公式：E = [E_text; E_vision]，定义文本与视觉 token 的联合嵌入序列"
+        return "核心公式截图：定义文本与视觉 token 的联合嵌入序列"
     if re.match(r"^c_?m=", compact) or compact.startswith("cm="):
-        return "核心公式：C_m = (I_intra_m)^α · (I_inter_m)^(1-α)，融合模态内部密度与跨模态交互"
+        return "核心公式截图：融合模态内部密度与跨模态交互"
     if compact.startswith(("∆vision=", "δvision=", "Δvision=")):
-        return "核心公式：Δ_vision = C_text / C_vision，确定视觉 token 的自适应位置步长"
+        return "核心公式截图：确定视觉 token 的自适应位置步长"
     if "p′=f(e)" in compact or "p'=f(e)" in compact:
-        return "公式：P' = f(E)，由嵌入序列生成模态感知位置索引"
+        return "公式截图：由嵌入序列生成模态感知位置索引"
     if compact.startswith("rk("):
-        return "公式：RoPE 旋转矩阵随相对位置偏移 Δp 变化"
+        return "公式截图：RoPE 旋转矩阵随相对位置偏移变化"
     return ""
 
 
@@ -3008,7 +3009,7 @@ def _summarize_chunks_with_codex(
     cache_path: Path | None = None,
 ) -> list[str]:
     chunks = _chunk_text(paper_text, _codex_chunk_chars())
-    asset_context = _asset_context(assets, text_preview_chars=0, latex_preview_chars=300)
+    asset_context = _asset_context(assets, text_preview_chars=0, latex_preview_chars=0)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
@@ -3035,6 +3036,10 @@ def _summarize_chunks_with_codex(
 
 可用图表截图：
 {asset_context}
+
+公式记录规则：
+- 如果本段涉及公式，只记录公式解决的问题、变量含义和工程作用。
+- 不要输出完整公式、LaTeX、等式、arg max/min、求和式或长变量表达；最终 Word 会用公式截图展示公式本体。
 
 论文内容：
 {chunk}
@@ -3165,8 +3170,8 @@ def _integrate_summary_with_codex(
     prompt_patches: list[PromptPatch] | None = None,
 ) -> str:
     client = _coerce_codex_client(client)
-    asset_context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=800)
-    formula_context = _formula_context(formulas)
+    asset_context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=0)
+    formula_asset_rule = _formula_asset_usage_rule(assets)
     memories = correction_memories or []
     patches = prompt_patches or _build_prompt_patches(memories)
     memory_context = _correction_memory_context(memories)
@@ -3182,8 +3187,7 @@ def _integrate_summary_with_codex(
         "如果证据较少，也要用已有证据写成短段落；不要输出计划、过程说明或“我先/接着我会”这类话。\n\n"
         f"原始论文标题证据：\n{paper_title or '未抽取到可靠标题。'}\n\n"
         f"原文摘要证据：\n{abstract or '未抽取到可靠摘要。'}\n\n"
-        f"关键公式候选：\n{formula_context}\n\n"
-        f"TexTeller 公式识别结果：\n{recognized_formulas or '未识别到可靠公式。'}\n\n"
+        f"公式截图使用规则：\n{formula_asset_rule}\n\n"
         f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
     )
     try:
@@ -3249,8 +3253,8 @@ def _fast_integrate_summary_with_codex(
 ) -> str:
     client = _coerce_codex_client(client)
     compact_notes = _compact_chunk_notes_for_final(chunk_notes, max_total_chars=14000)
-    asset_context = _asset_context(assets[:8], text_preview_chars=0, latex_preview_chars=300)
-    formula_context = _formula_context(formulas[:6])
+    asset_context = _asset_context(assets[:8], text_preview_chars=0, latex_preview_chars=0)
+    formula_asset_rule = _formula_asset_usage_rule(assets[:8])
     prompt = (
         "你是科研论文精读笔记编辑。前一次完整整合请求超时，现在请用更短输出快速生成一份可读中文 Markdown 报告。\n"
         "硬性要求：\n"
@@ -3258,11 +3262,11 @@ def _fast_integrate_summary_with_codex(
         "2. 只基于给定分段笔记和证据写；没有证据就省略，不要编造。\n"
         "3. 必须包含这些二级标题：核心信息、摘要、背景与问题、创新点、一句话总结、方法主线、关键结果、深度分析、局限、总结。\n"
         "4. 图表占位符只能使用给定的 [[ASSET:n]]，并放在相关段落旁边。\n"
-        "5. 如果某段笔记是超时记录，直接忽略该段，不要把“超时记录/错误摘要/原文证据摘录/英文 raw text”这些字样写入报告。\n\n"
+        "5. 如果某段笔记是超时记录，直接忽略该段，不要把“超时记录/错误摘要/原文证据摘录/英文 raw text”这些字样写入报告。\n"
+        "6. 关键公式只解释含义并插入公式截图；不要复写完整公式、LaTeX、等式、arg max/min 或求和式。\n\n"
         f"标题证据：{paper_title or '未可靠抽取'}\n\n"
         f"摘要证据：{_clean_xml_text(abstract)[:1200] if abstract else '未可靠抽取'}\n\n"
-        f"公式候选：\n{formula_context}\n\n"
-        f"TexTeller 识别：\n{recognized_formulas[:1200] if recognized_formulas else '无'}\n\n"
+        f"公式截图使用规则：\n{formula_asset_rule}\n\n"
         f"可用图表：\n{asset_context}\n\n"
         f"分段笔记：\n{compact_notes}"
     )
@@ -3327,6 +3331,7 @@ def _verify_summary_claims(
     )
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
+    summary = _suppress_formula_text_when_assets_present(summary, assets)
     _assert_summary_quality(summary)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
@@ -5176,6 +5181,107 @@ def _normalize_final_sections(text: str) -> str:
     return text.strip()
 
 
+def _suppress_formula_text_when_assets_present(summary: str, assets: list[PaperAsset]) -> str:
+    if not any(asset.kind == "formula" for asset in assets):
+        return summary
+    cleaned_lines = [_suppress_formula_expressions_in_line(line) for line in summary.splitlines()]
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"[ \t]+([，。；：])", r"\1", cleaned)
+    cleaned = re.sub(r"说明[，,]\s*(其中|即|这|用于|表示|说明)", r"说明，\1", cleaned)
+    cleaned = re.sub(r"([：:])\s*[。；]", r"\1", cleaned)
+    cleaned = re.sub(r"([规则机制关系分数作用])[:：]\s*其中", r"\1，其中", cleaned)
+    cleaned = re.sub(r"((?:公式|方程)\s*[0-9一二三四五六七八九十]+)\s*说明，\s*其中", r"\1说明对应机制，其中", cleaned)
+    cleaned = re.sub(r"((?:公式|方程)\s*[0-9一二三四五六七八九十]+)\s*说明，\s*将", r"\1说明相关指标的组合方式，将", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def _suppress_formula_expressions_in_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
+        return line
+
+    if not _line_mentions_formula(line):
+        return line
+
+    line = re.sub(
+        r"`([^`]+)`",
+        lambda match: "" if _looks_like_formula_expression(match.group(1)) else match.group(1),
+        line,
+    )
+    line = re.sub(
+        r"\$([^$\n]{4,500})\$",
+        lambda match: "" if _looks_like_formula_expression(match.group(1)) else match.group(1),
+        line,
+    )
+
+    math_expr = (
+        r"[^，。；\n]{0,360}?"
+        r"(?:=|≥|≤|∑|Σ|∏|\\|arg\s*max|arg\s*min|\bmin\s*\(|\bmax\s*\(|\bQ[A-Za-z]*\s*\()"
+        r"[^，。；\n]{0,360}?"
+    )
+    tail = r"(?P<tail>，其中|，即|，这|，用于|，表示|，说明|。|；)"
+
+    def clean_prefix(prefix: str) -> str:
+        prefix = prefix.strip()
+        prefix = re.sub(r"\s*(?:可写为|写作|表示为|计算为|定义为|如下|为|是)\s*$", "说明", prefix)
+        return prefix
+
+    def replace_colon(match: re.Match) -> str:
+        prefix = clean_prefix(match.group("prefix"))
+        matched_tail = match.group("tail")
+        if matched_tail in {"。", "；"}:
+            return prefix + matched_tail
+        if matched_tail == "，其中":
+            return prefix + "，其中"
+        return prefix + "说明" + matched_tail
+
+    def replace_assignment(match: re.Match) -> str:
+        prefix = clean_prefix(match.group("prefix"))
+        matched_tail = match.group("tail")
+        if matched_tail in {"。", "；"}:
+            return prefix + "说明其核心计算关系" + matched_tail
+        return prefix + "说明" + matched_tail
+
+    formula_label = r"(?:公式|方程)\s*[0-9一二三四五六七八九十]+"
+    line = re.sub(
+        rf"(?P<prefix>{formula_label}[^。；\n]{{0,160}}?)[：:]\s*{math_expr}{tail}",
+        replace_colon,
+        line,
+        flags=re.IGNORECASE,
+    )
+    line = re.sub(
+        rf"(?P<prefix>{formula_label}[^，。；\n]{{0,120}}?)\s*(?:可写为|写作|表示为|计算为|定义为|为|是)\s*[：:]?\s*{math_expr}{tail}",
+        replace_assignment,
+        line,
+        flags=re.IGNORECASE,
+    )
+    line = re.sub(r"\s{2,}", " ", line)
+    line = re.sub(r"说明说明", "说明", line)
+    line = re.sub(r"((?:公式|方程)\s*[0-9一二三四五六七八九十]+)\s*(?:为|是)\s*，", r"\1说明，", line)
+    line = re.sub(
+        r"((?:公式|方程)\s*[0-9一二三四五六七八九十]+[^，。；\n]{0,80}?)(?:可写为|写作|表示为|计算为|定义为|形式为)\s*[：:]?\s*，",
+        r"\1说明，",
+        line,
+    )
+    line = re.sub(r"公式形式为\s*[。；]", "该公式说明其核心计算关系。", line)
+    line = re.sub(r"(?:可写为|写作|表示为|计算为|定义为|形式为)\s*[：:]\s*，", "说明，", line)
+    return line.strip()
+
+
+def _line_mentions_formula(line: str) -> bool:
+    return bool(re.search(r"(?i)(公式|方程|equation|eq\.?)\s*[0-9一二三四五六七八九十]*", line))
+
+
+def _looks_like_formula_expression(text: str) -> bool:
+    text = _clean_xml_text(text)
+    if re.search(r"\\(?:frac|sum|arg|max|min|mathrm|mathbf|left|right)|[=≥≤∑Σ∏]|arg\s*max|arg\s*min", text):
+        return True
+    latin_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_]*(?:\([^)]*\))?", text)
+    operators = re.findall(r"[+\-*/^=<>]|≥|≤|∈|∪", text)
+    return len(latin_tokens) >= 3 and len(operators) >= 2
+
+
 def _normalize_required_heading_levels(text: str) -> str:
     aliases = {
         "核心信息": "核心信息",
@@ -5605,12 +5711,29 @@ def _asset_context(
             f"建议插入章节：{_target_section_for_asset(asset)}，"
             f"caption/context: {_clean_xml_text(asset.caption)}"
         )
-        if asset.text and text_preview_chars > 0:
+        if asset.text and text_preview_chars > 0 and asset.kind != "formula":
             text += f"\n表格文本预览：\n{_clean_xml_text(asset.text[:text_preview_chars])}"
-        if asset.latex and latex_preview_chars > 0:
+        if asset.latex and latex_preview_chars > 0 and asset.kind != "formula":
             text += f"\nTexTeller LaTeX：{_clean_xml_text(asset.latex[:latex_preview_chars])}"
         parts.append(text)
     return "\n".join(parts)
+
+
+def _formula_asset_usage_rule(assets: list[PaperAsset]) -> str:
+    formula_assets = []
+    labels: dict[int, str] = {}
+    counters = {"figure": 0, "table": 0, "formula": 0}
+    for idx, asset in enumerate(assets, 1):
+        label = _asset_display_label(idx, asset, counters, labels)
+        if asset.kind == "formula":
+            formula_assets.append(f"[[ASSET:{idx}]] 最终引用标签：{_compact_asset_label(label)}")
+    if not formula_assets:
+        return "未抽取到公式截图；如需提到公式，只用中文解释其作用，不要补写完整公式。"
+    return (
+        "已抽取公式截图，最终报告必须用截图展示公式本体。正文只写公式编号、变量含义和工程作用，"
+        "不要复写 LaTeX、等式、arg max/min、求和式、矩阵式或长变量表达。\n"
+        + "\n".join(formula_assets)
+    )
 
 
 def _formula_context(formulas: list[str]) -> str:
@@ -5881,6 +6004,7 @@ def _document_xml(
     assets: list[PaperAsset],
     media_files: list[tuple[Path, str, str]],
 ) -> str:
+    summary = _suppress_formula_text_when_assets_present(summary, assets)
     summary = _normalize_final_sections(_postprocess_summary(summary))
     body = [
         _paragraph(_extract_note_title(summary) or "论文精读笔记", "Title"),

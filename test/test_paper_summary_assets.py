@@ -12,6 +12,7 @@ from paper_agent.paper_summary import (
     PaperAsset,
     TextLine,
     _asset_display_label,
+    _asset_context,
     _apply_verifier_patch_suggestions,
     _attach_claims_to_grounding_map,
     _build_prompt_patches,
@@ -54,6 +55,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _report_substance_issues,
     _sync_inline_asset_references,
+    _suppress_formula_text_when_assets_present,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _verification_should_block_report,
@@ -1105,6 +1107,70 @@ def test_formula_marker_is_inserted_before_fallback_figures():
 
     assert result.index("[[ASSET:3]]") < result.index("[[ASSET:1]]")
     assert "[[ASSET:3]]" in result
+
+
+def test_formula_text_is_suppressed_when_formula_screenshot_exists():
+    assets = [PaperAsset("formula", 3, Path("formula.png"), "关键公式截图：quality score")]
+    summary = (
+        "## 方法主线\n"
+        "### 关键公式\n"
+        "公式 1 定义了 4KAgent 自动选择放大倍率的规则：s = min({s ∈ 2, 4, 8, 16 | max(HI, WI) * s ≥ 4000} ∪ {16})。其中 HI 和 WI 是输入图像的高和宽。\n"
+        "[[ASSET:1]]\n"
+        "公式 2 为 Qs(Ti(Ik−1)) = H(Ti(Ik−1, CI)) + Qnr(Ti(Ik−1))/4，其中 H 表示 HPSv2。\n"
+        "公式 4 的核心选择规则可写为：Ik = arg max(T1(Ik−1), T2(Ik−1), ..., TN(Ik−1))，即从候选输出中选择质量分数最高者。\n"
+    )
+
+    result = _suppress_formula_text_when_assets_present(summary, assets)
+
+    assert "[[ASSET:1]]" in result
+    assert "输入图像的高和宽" in result
+    assert "HPSv2" in result
+    assert "质量分数最高者" in result
+    assert "s = min" not in result
+    assert "Qs(" not in result
+    assert "Qnr(" not in result
+    assert "arg max" not in result
+    assert "≥" not in result
+    assert "为，其中" not in result
+    assert "规则：其中" not in result
+
+
+def test_formula_text_is_kept_without_formula_screenshot():
+    summary = "公式 2 为 Qs(Ti(Ik−1)) = H(Ti(Ik−1, CI)) + Qnr(Ti(Ik−1))/4，其中 H 表示 HPSv2。"
+
+    assert _suppress_formula_text_when_assets_present(summary, []) == summary
+
+
+def test_formula_suppression_does_not_strip_non_formula_code_spans():
+    assets = [PaperAsset("formula", 3, Path("formula.png"), "关键公式截图")]
+    summary = "Profile 使用 `ExpSR-s4-F`、`ExpSR-s4-P` 和 `GenSR-s4-P` 三种设置对比。"
+
+    result = _suppress_formula_text_when_assets_present(summary, assets)
+
+    assert "ExpSR-s4-F" in result
+    assert "ExpSR-s4-P" in result
+    assert "GenSR-s4-P" in result
+
+
+def test_formula_asset_context_does_not_leak_latex_or_ocr_text():
+    assets = [
+        PaperAsset(
+            "formula",
+            2,
+            Path("formula.png"),
+            "关键公式截图：原文公式本体见截图",
+            text="Qs(Ti(Ik−1)) = H(Ti(Ik−1, CI)) + Qnr(Ti(Ik−1))/4",
+            latex=r"Q_s(T_i(I_{k-1})) = H(T_i(I_{k-1}, C_I)) + Q_{nr}(T_i(I_{k-1}))/4",
+        )
+    ]
+
+    context = _asset_context(assets, text_preview_chars=500, latex_preview_chars=800)
+
+    assert "[[ASSET:1]]" in context
+    assert "公式截图" in context
+    assert "Qs(" not in context
+    assert "Q_s" not in context
+    assert "TexTeller" not in context
 
 
 def test_figure_caption_period_stops_before_following_body_text():
