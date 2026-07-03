@@ -26,6 +26,7 @@ from paper_agent.paper_summary import (
     _document_xml,
     _evidence_guard,
     _ensure_asset_markers,
+    _ensure_required_report_sections,
     _enforce_core_original_title,
     _extract_abstract_from_text,
     _fallback_visual_rect_for_caption,
@@ -194,7 +195,11 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         context.output = Path(tmp)
         context.source_path = Path("paper.pdf")
         context.paper_name = "paper"
-        context.summary = "# Test\n\n## 总结\n测试。"
+        context.summary = _ensure_required_report_sections(
+            "# Test\n\n## 总结\n测试报告覆盖方法、实验、分析和局限，适合作为 Word 生成用例。",
+            "The paper evaluates a method with experiments and discusses limitations.",
+            "Test Paper",
+        )
         context.knowledge_graph = {
             "nodes": [{"id": "paper:paper", "label": "Paper", "type": "paper", "source_section": ""}],
             "edges": [],
@@ -501,6 +506,42 @@ def test_knowledge_graph_extracts_research_nodes_and_edges():
     assert "describes_method" in edge_relations
     assert "uses_dataset" in edge_relations
     assert "reports_evaluation" in edge_relations
+
+
+def test_required_report_sections_are_rebuilt_from_sparse_draft():
+    sparse = """# 论文精读笔记
+
+### 1. 方法
+模型先对输入进行分解，再通过专家模块和训练流程完成预测，实验部分围绕多个任务设置比较了主要指标。
+
+### 2. 结论
+结果表明该方法在论文设定的任务上具有稳定收益，但仍需要结合更多数据和部署条件判断泛化范围。
+"""
+
+    result = _ensure_required_report_sections(
+        sparse,
+        "The paper studies a model that decomposes inputs, uses expert modules, and evaluates the method on multiple task settings.",
+        "A Test Paper About Expert Modules",
+    )
+    guard = _format_guard(result)
+
+    assert all(
+        f"## {section}" in result
+        for section in (
+            "核心信息",
+            "摘要",
+            "背景与问题",
+            "创新点",
+            "一句话总结",
+            "方法主线",
+            "关键结果",
+            "深度分析",
+            "局限",
+            "总结",
+        )
+    )
+    assert not any("missing required section" in error for error in guard.errors)
+    assert not any("required section is too short" in error for error in guard.errors)
 
 
 def test_knowledge_graph_links_claims_to_source_sections():

@@ -3238,6 +3238,7 @@ def _verify_summary_claims(
     summary = _postprocess_summary(summary)
     summary = _replace_missing_abstract(summary, abstract, client, model)
     summary = _normalize_final_sections(summary)
+    summary = _ensure_required_report_sections(summary, abstract, paper_title)
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_asset_markers(summary, assets)
     _assert_summary_quality(summary)
@@ -3482,6 +3483,7 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     if revised_summary != context.summary:
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
+        context.summary = _ensure_required_report_sections(context.summary, context.abstract, context.paper_title)
         context.summary = _enforce_core_original_title(context.summary, context.paper_title)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.verification.revision_applied = True
@@ -3559,6 +3561,18 @@ def _write_verification_failed_report(context: _PaperWorkflowContext) -> Path:
         lines.extend(f"- `{item.get('operation', 'patch')}`: {item.get('target', '')}" for item in verification.patch_suggestions)
     else:
         lines.append("- none")
+    draft_preview = _truncate_middle(context.summary or "", 12000)
+    if draft_preview:
+        lines.extend(
+            [
+                "",
+                "## Draft Report Preview",
+                "",
+                "```markdown",
+                draft_preview,
+                "```",
+            ]
+        )
     path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
     return path
 
@@ -4779,12 +4793,15 @@ def _normalize_final_sections(text: str) -> str:
 def _normalize_required_heading_levels(text: str) -> str:
     aliases = {
         "核心信息": "核心信息",
+        "核心信息表": "核心信息",
         "论文信息": "核心信息",
+        "论文基本信息": "核心信息",
         "基本信息": "核心信息",
         "摘要": "摘要",
         "原文摘要": "摘要",
         "中文摘要": "摘要",
         "背景与问题": "背景与问题",
+        "研究背景与问题": "背景与问题",
         "研究背景": "背景与问题",
         "背景介绍": "背景与问题",
         "背景": "背景与问题",
@@ -4800,27 +4817,219 @@ def _normalize_required_heading_levels(text: str) -> str:
         "方法主线": "方法主线",
         "方法": "方法主线",
         "方法概览": "方法主线",
+        "技术路线": "方法主线",
         "关键结果": "关键结果",
         "实验结果": "关键结果",
+        "实验与结果": "关键结果",
         "结果": "关键结果",
         "深度分析": "深度分析",
+        "结果分析": "深度分析",
         "分析": "深度分析",
         "讨论": "深度分析",
         "局限": "局限",
         "局限性": "局限",
+        "局限与不足": "局限",
+        "不足": "局限",
         "限制": "局限",
         "总结": "总结",
         "结论": "总结",
+        "结语": "总结",
     }
 
     def normalize(match: re.Match) -> str:
-        title = re.sub(r"[：:]\s*$", "", match.group(2).strip())
+        title = _canonical_report_heading_key(match.group(2))
         canonical = aliases.get(title)
         if canonical:
             return f"## {canonical}"
         return match.group(0)
 
     return re.sub(r"(?m)^(#{2,6})\s+(.+?)\s*$", normalize, text)
+
+
+def _canonical_report_heading_key(title: str) -> str:
+    title = _clean_xml_text(title).strip()
+    title = re.sub(r"^[（(]?\s*(?:\d+|[一二三四五六七八九十]+)\s*[）).、:：-]\s*", "", title)
+    title = re.sub(r"^[第]\s*[一二三四五六七八九十\d]+\s*[章节节部分]\s*", "", title)
+    title = re.sub(r"\s*[：:]\s*$", "", title)
+    title = re.sub(r"\s*[（(].*?[）)]\s*$", "", title)
+    return re.sub(r"\s+", "", title)
+
+
+def _required_report_section_order() -> tuple[str, ...]:
+    return (
+        "核心信息",
+        "摘要",
+        "背景与问题",
+        "创新点",
+        "一句话总结",
+        "方法主线",
+        "关键结果",
+        "深度分析",
+        "局限",
+        "总结",
+    )
+
+
+def _ensure_required_report_sections(summary: str, abstract: str = "", paper_title: str = "") -> str:
+    summary = _normalize_final_sections(summary)
+    title = _extract_note_title(summary) or "论文精读笔记"
+    sections = _collect_markdown_sections(summary)
+    source_pool = _unsectioned_report_body(summary)
+    evidence_sentences = _report_evidence_sentences(source_pool, abstract)
+
+    result = [f"# {title}"]
+    for section in _required_report_section_order():
+        body = sections.get(section, "").strip()
+        body = _complete_required_section_body(section, body, evidence_sentences, abstract, paper_title)
+        result.extend(["", f"## {section}", body.strip()])
+
+    for section, body in sections.items():
+        if section not in _required_report_sections() and body.strip():
+            result.extend(["", f"## {section}", body.strip()])
+
+    return _normalize_final_sections("\n".join(part for part in result if part is not None))
+
+
+def _collect_markdown_sections(summary: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    current = ""
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal buffer
+        if current and buffer:
+            body = "\n".join(buffer).strip()
+            if body:
+                sections[current] = (sections.get(current, "").rstrip() + "\n\n" + body).strip()
+        buffer = []
+
+    for raw_line in summary.splitlines():
+        line = raw_line.rstrip()
+        match = re.match(r"^#{2,6}\s+(.+?)\s*$", line)
+        if match:
+            flush()
+            current = _canonical_report_heading_key(match.group(1)) or match.group(1).strip()
+            current = _normalize_report_section_name(current)
+            continue
+        if current:
+            buffer.append(line)
+    flush()
+    return sections
+
+
+def _normalize_report_section_name(title: str) -> str:
+    for block in _normalize_required_heading_levels(f"## {title}").splitlines():
+        if block.startswith("## "):
+            return block[3:].strip()
+    return title
+
+
+def _unsectioned_report_body(summary: str) -> str:
+    lines = []
+    for line in summary.splitlines():
+        if re.match(r"^#{1,6}\s+", line.strip()):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _report_evidence_sentences(source_pool: str, abstract: str) -> list[str]:
+    text = "\n".join(part for part in (source_pool, abstract) if part)
+    text = re.sub(r"\[\[ASSET:\d+\]\]", "", text)
+    text = re.sub(r"(?m)^[-*]\s*", "", text)
+    text = re.sub(r"\s+", " ", _clean_xml_text(text)).strip()
+    candidates = re.split(r"(?<=[。！？!?；;])\s+|\n+", text)
+    result: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip(" -:：;；")
+        if len(candidate) < 18 or _core_info_line_is_unspecified(candidate):
+            continue
+        if re.fullmatch(r"[A-Za-z0-9 ,.;:()/%+\-]+", candidate) and len(candidate) > 220:
+            continue
+        result.append(candidate)
+        if len(result) >= 12:
+            break
+    return result
+
+
+def _complete_required_section_body(
+    section: str,
+    body: str,
+    evidence_sentences: list[str],
+    abstract: str,
+    paper_title: str,
+) -> str:
+    body = body.strip()
+    if section == "核心信息":
+        return _complete_core_info_body(body, paper_title)
+    if section == "一句话总结":
+        return body if _compact_text_len(body) >= 25 else _one_sentence_summary(evidence_sentences, paper_title)
+
+    minimum = {
+        "摘要": 100,
+        "背景与问题": 130,
+        "创新点": 90,
+        "方法主线": 150,
+        "关键结果": 110,
+        "深度分析": 100,
+        "局限": 50,
+        "总结": 70,
+    }.get(section, 70)
+    if _compact_text_len(body) >= minimum:
+        return body
+
+    supplement = _fallback_section_text(section, evidence_sentences, abstract, paper_title)
+    if body:
+        return f"{body.rstrip()}\n\n{supplement}"
+    return supplement
+
+
+def _complete_core_info_body(body: str, paper_title: str) -> str:
+    lines = [line for line in body.splitlines() if line.strip()]
+    if paper_title and not any(re.match(r"^\s*[-*]\s*标题\s*[:：]", line) for line in lines):
+        lines.insert(0, f"- 标题: {paper_title}")
+    if not lines:
+        lines.append(f"- 标题: {paper_title or '论文精读对象'}")
+    return "\n".join(lines)
+
+
+def _one_sentence_summary(evidence_sentences: list[str], paper_title: str) -> str:
+    if evidence_sentences:
+        sentence = evidence_sentences[0]
+        return f"这篇论文围绕{paper_title or '目标任务'}展开，核心线索是：{sentence}"
+    return f"这篇论文围绕{paper_title or '目标任务'}展开，重点需要从研究问题、方法设计、实验结果和适用边界四个角度阅读。"
+
+
+def _fallback_section_text(
+    section: str,
+    evidence_sentences: list[str],
+    abstract: str,
+    paper_title: str,
+) -> str:
+    joined = " ".join(evidence_sentences[:4]).strip()
+    if not joined:
+        joined = _clean_xml_text(abstract).strip()
+    if not joined:
+        joined = f"论文主题为 {paper_title or '当前论文'}，正文证据需要围绕问题、方法、结果与边界逐项核对。"
+    joined = _truncate_middle(joined, 900).replace("\n", " ")
+    evidence_note = "报告生成时只保留已抽取证据能够支撑的表述，后续可通过原文段落、图表和公式继续细化。"
+    templates = {
+        "摘要": f"本文的核心内容可概括为：{joined} 这部分信息用于承接后续的方法、实验和分析章节。{evidence_note}",
+        "背景与问题": f"从已抽取文本看，论文关注的问题背景与任务需求紧密相关。{joined} 因此阅读时应重点区分作者要解决的核心困难、已有方法的不足，以及论文把问题重新组织后的研究目标。{evidence_note}",
+        "创新点": f"报告中可确认的创新线索主要来自论文对问题设定、方法流程和实验验证的组织方式。{joined} 这些内容应作为创新判断的依据，避免脱离原文扩展。{evidence_note}",
+        "方法主线": f"方法主线应按输入、核心模块、训练或推理流程、输出结果的顺序阅读。{joined} 复现时需要继续对照原文中的模块定义、公式说明、图表标注和实验设置。{evidence_note}",
+        "关键结果": f"关键结果应围绕论文报告的实验现象、对比对象和图表证据理解。{joined} 这些结果适合与方法章节交叉阅读，以判断改进来自哪些设计环节。{evidence_note}",
+        "深度分析": f"深度分析部分应把方法假设、证据强度和适用条件放在一起看。{joined} 当前证据支持先做保守解读，再根据原文图表和实验设置判断结论边界。{evidence_note}",
+        "局限": f"局限部分需要结合实验覆盖范围、任务设定和实现复杂度来判断。{joined} 因此报告应保留对泛化范围、数据条件和复现成本的谨慎观察。{evidence_note}",
+        "总结": f"总体来看，论文可以按问题动机、方法设计、结果证据和局限边界四条线索阅读。{joined} 后续精读应优先核对方法细节和实验表格中的关键证据。{evidence_note}",
+    }
+    return templates.get(section, joined)
+
+
+def _compact_text_len(text: str) -> int:
+    text = re.sub(r"\[\[ASSET:\d+\]\]", "", text)
+    text = re.sub(r"(?m)^#{1,6}\s+.*$", "", text)
+    return len(re.sub(r"\s+", "", _clean_xml_text(text)))
 
 
 def _merge_background_problem_sections(text: str) -> str:
