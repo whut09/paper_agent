@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import fitz
+from PIL import Image
 
 from paper_agent.agents.contracts import PaperAgentRole
 from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
@@ -33,10 +34,15 @@ from paper_agent.paper_summary import (
     _fallback_visual_rect_for_caption,
     _extract_verifiable_claims,
     _format_guard,
+    _formula_anchor_score,
+    _formula_candidate_is_noise,
+    _formula_column_bounds,
     _load_correction_memories,
     _expand_table_rect_to_borders,
     _figure_caption_continuation_is_body_text,
     _graphic_region_is_page_artifact,
+    _image_size_emu,
+    _is_formula_continuation_line,
     _memory_guard,
     _postprocess_summary,
     _missing_asset_references,
@@ -57,6 +63,7 @@ from paper_agent.paper_summary import (
     _sync_inline_asset_references,
     _suppress_formula_text_when_assets_present,
     _styles_xml,
+    _tighten_table_rect_to_borders,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _verification_should_block_report,
@@ -1225,3 +1232,58 @@ def test_tight_above_figure_wins_over_larger_below_body_region():
 
     assert above is not None and below is not None
     assert selected == above
+
+
+def test_docx_image_sizing_enlarges_formula_and_table_assets():
+    with TemporaryDirectory() as tmp:
+        formula = Path(tmp) / "formula.png"
+        table = Path(tmp) / "table.png"
+        Image.new("RGB", (515, 21), "white").save(formula)
+        Image.new("RGB", (482, 281), "white").save(table)
+
+        formula_cx, _formula_cy = _image_size_emu(formula, "formula")
+        table_cx, _table_cy = _image_size_emu(table, "table")
+
+    assert formula_cx >= int(3.8 * 914400)
+    assert table_cx >= int(5.6 * 914400)
+
+
+def test_inline_math_prose_is_not_formula_asset_candidate():
+    prose = "c \u2208 C, the planner pi conditions on the concatenated input"
+    parameter_sentence = "c = 0.8, eta = 0.55, zeta = 0.7, and distance penalty alpha = 0.05. Experiments"
+    standalone_formula = r"\ma t hcal {C} ( \tau _i) = R_{\max}(\tau_i) - \alpha \|\mathbf {f}_q - \mathbf {f}_i\|_2, (2)"
+
+    assert _formula_anchor_score(prose) == 0
+    assert _formula_anchor_score(parameter_sentence) == 0
+    assert _formula_anchor_score(standalone_formula) > 0
+    assert _formula_anchor_score("human-aligned aesthetics [54] and no-reference IQA") == 0
+    assert _formula_candidate_is_noise(prose)
+    assert not _is_formula_continuation_line("If F(k) != empty and k < Kmax, the planner uses F(k).")
+
+
+def test_table_rect_tightens_to_detected_horizontal_borders():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(300, 110, 560, 111)},
+                {"rect": fitz.Rect(300, 190, 560, 191)},
+            ]
+
+    wide_rect = fitz.Rect(40, 100, 570, 205)
+
+    tightened = _tighten_table_rect_to_borders(FakePage(), wide_rect)
+
+    assert tightened.x0 == 300
+    assert tightened.x1 == 560
+
+
+def test_formula_column_bounds_allow_cross_column_equation_overhang():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    left, right = _formula_column_bounds(FakePage(), fitz.Rect(408, 207, 461, 219))
+
+    assert left < 318
+    assert right > 575

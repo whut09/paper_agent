@@ -1042,6 +1042,7 @@ def _capture_tables(
             continue
         if not caption and not _table_detection_looks_reliable(table, table_text):
             continue
+        table_rect = _tighten_table_rect_to_borders(page, table_rect)
         clip_rect = _merge_rects([table_rect, caption_rect]) if caption_rect else table_rect
         key = _box_key(page_no, clip_rect)
         if key in seen_boxes:
@@ -1288,7 +1289,11 @@ def _page_text_lines(page: fitz.Page) -> list[TextLine]:
 
 def _formula_anchor_score(text: str, paper_text: str = "") -> float:
     line = _clean_xml_text(text).strip()
-    if not line or len(line) > 180:
+    if not line:
+        return 0.0
+    if len(line) > 260:
+        return 0.0
+    if len(line) > 180 and not _line_has_formula_syntax(line):
         return 0.0
     lowered = line.lower()
     if lowered.startswith(
@@ -1296,6 +1301,7 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
             "figure",
             "fig.",
             "table",
+            "if ",
             "where ",
             "when ",
             "we ",
@@ -1309,11 +1315,19 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
         )
     ) or line.startswith(("图", "表")):
         return 0.0
+    if _formula_line_looks_like_inline_prose(line) and not _line_has_standalone_formula_marker(line):
+        return 0.0
 
-    op_match = re.search(r"(=|≈|∈|≤|≥|∝|:=)", line)
+    compact_line = re.sub(r"\s+", "", line)
+    op_pattern = r"(=|≈|∈|≤|≥|∝|:=|\\leftarrow|\\rightarrow|←|→)"
+    match_text = compact_line if re.search(r"\\(?:leftarrow|rightarrow)", compact_line) else line
+    op_match = re.search(op_pattern, match_text)
+    if not op_match and match_text != compact_line:
+        match_text = compact_line
+        op_match = re.search(op_pattern, match_text)
     if not op_match:
         return 0.0
-    lhs = line[: op_match.start()].strip(" ,.;:()[]")
+    lhs = match_text[: op_match.start()].strip(" ,.;:()[]")
     lhs_words = re.findall(r"[A-Za-z]{3,}", lhs)
     if len(lhs_words) > 2:
         return 0.0
@@ -1322,16 +1336,19 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
 
     math_symbols = set("=<>±∞αβγδϵεΔ∆θλμσ∈→×·∑Σ∫√≤≥≈∝⊤−˜~′")
     symbol_count = sum(1 for ch in line if ch in math_symbols)
-    operator_count = sum(line.count(op) for op in ["=", "≈", "∈", "≤", "≥", "∝", "\\frac", "\\sum", "\\prod"])
+    operator_count = sum(
+        (line + compact_line).count(op)
+        for op in ["=", "≈", "∈", "≤", "≥", "∝", "\\frac", "\\sum", "\\prod", "\\leftarrow", "\\rightarrow"]
+    )
     if operator_count == 0 and symbol_count < 2:
         return 0.0
     words = re.findall(r"[A-Za-z]{4,}", line)
-    if len(words) > 5 and symbol_count < 4:
+    if len(words) > 5 and symbol_count < 4 and not _line_has_standalone_formula_marker(line):
         return 0.0
 
     compact = re.sub(r"\s+", "", line).lower()
     score = 10.0 + operator_count * 8 + symbol_count * 1.5
-    if _trailing_equation_number(line):
+    if _equation_number_token(line):
         score += 35
     if "modix" in paper_text.lower():
         if "e=[etext;evision]" in compact or "e=[e_text;e_vision]" in compact:
@@ -1356,21 +1373,87 @@ def _formula_anchor_score(text: str, paper_text: str = "") -> float:
 def _formula_candidate_is_noise(text: str) -> bool:
     cleaned = _clean_xml_text(text)
     lowered = cleaned.lower()
+    if _formula_line_looks_like_inline_prose(cleaned) and not _line_has_standalone_formula_marker(cleaned):
+        return True
     if any(token in lowered for token in ("<answer", "</answer", "<think", "</think", "percentage point")):
         return True
     words = re.findall(r"[A-Za-z]{4,}", cleaned)
     if len(words) > 14:
         return True
     numeric_tokens = re.findall(r"\d+(?:\.\d+)?", cleaned)
-    if len(numeric_tokens) >= 8 and not _trailing_equation_number(cleaned):
+    if len(numeric_tokens) >= 8 and not _equation_number_token(cleaned):
         return True
     if re.search(r"\b(?:total|recall|accuracy|baseline|method)\b", lowered) and len(numeric_tokens) >= 4:
         return True
     return False
 
 
+def _line_has_formula_syntax(text: str) -> bool:
+    line = _clean_xml_text(text)
+    compact = re.sub(r"\s+", "", line)
+    if _equation_number_token(line):
+        return True
+    if re.search(r"\\(?:arg|max|min|sum|prod|frac|sqrt|lambda|tau|mu|alpha|eta|zeta|mathcal|mathrm|leftarrow|rightarrow)", line + compact):
+        return True
+    math_symbols = set("=<>±∞αβγδϵεΔ∆θλμσ∈→←×·∑Σ∫√≤≥≈∝⊤−˜~′")
+    if sum(1 for ch in line if ch in math_symbols) >= 5:
+        return True
+    if re.search(r"[A-Za-z]\([^)]*\)\s*=", compact):
+        return True
+    return False
+
+
+def _line_has_standalone_formula_marker(text: str) -> bool:
+    line = _clean_xml_text(text)
+    compact = re.sub(r"\s+", "", line)
+    if _equation_number_token(line):
+        return True
+    return bool(
+        re.search(
+            r"\\(?:arg|max|min|sum|prod|frac|sqrt|lambda|tau|mu|alpha|eta|zeta|mathcal|mathrm|leftarrow|rightarrow)",
+            line + compact,
+        )
+    )
+
+
+def _formula_line_looks_like_inline_prose(text: str) -> bool:
+    line = _clean_xml_text(text).strip()
+    if not line:
+        return False
+    lowered = line.lower()
+    words = re.findall(r"[A-Za-z]{3,}", line)
+    math_symbols = set("=<>±∞αβγδϵεΔ∆θλμσ∈→×·∑Σ∫√≤≥≈∝⊤−˜~′")
+    symbol_count = sum(1 for ch in line if ch in math_symbols)
+    has_equation_number = bool(_equation_number_token(line))
+    prose_tokens = (
+        " the ",
+        " a ",
+        " an ",
+        " and ",
+        " or ",
+        " if ",
+        " where ",
+        " which ",
+        " with ",
+        " planner ",
+        " executor ",
+        " denotes ",
+        " represents ",
+        " conditions ",
+        " concatenated ",
+        " input ",
+        " uses ",
+    )
+    padded = f" {lowered} "
+    if any(token in padded for token in prose_tokens) and len(words) >= 3 and not has_equation_number:
+        return True
+    if re.search(r"[,;]\s*(?:the|a|an|and|or|if|where|which|with|we|this|that)\b", lowered):
+        return True
+    return len(words) >= 4 and symbol_count < 5 and not has_equation_number
+
+
 def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]) -> fitz.Rect:
-    left, right = _column_bounds(page, anchor)
+    left, right = _formula_column_bounds(page, anchor)
     y0 = anchor.y0
     y1 = anchor.y1
     anchor_mid = (anchor.y0 + anchor.y1) / 2
@@ -1384,6 +1467,15 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
             y0 = min(y0, line.rect.y0)
             y1 = max(y1, line.rect.y1)
     return fitz.Rect(left, max(0, y0), right, min(page.rect.height, y1))
+
+
+def _formula_column_bounds(page: fitz.Page, rect: fitz.Rect) -> tuple[float, float]:
+    left, right = _column_bounds(page, rect)
+    if page.rect.width < 420:
+        return left, right
+    extra = min(55.0, page.rect.width * 0.09)
+    margin = max(18.0, page.rect.width * 0.03)
+    return max(margin, left - extra), min(page.rect.width - margin, right + extra)
 
 
 def _column_bounds(page: fitz.Page, rect: fitz.Rect) -> tuple[float, float]:
@@ -1404,7 +1496,9 @@ def _is_formula_continuation_line(text: str) -> bool:
     if not line or len(line) > 120:
         return False
     lowered = line.lower()
-    if lowered.startswith(("where ", "when ", "figure", "fig.", "table", "the ", "we ", "this ", "is ", "and ")):
+    if lowered.startswith(("if ", "where ", "when ", "figure", "fig.", "table", "the ", "we ", "this ", "is ", "and ")):
+        return False
+    if _formula_line_looks_like_inline_prose(line) and not _line_has_formula_syntax(line):
         return False
     math_symbols = set("=<>±∞αβγδϵεΔ∆θλμσ∈→×·∑Σ∫√≤≥≈∝⊤−˜~′")
     symbol_count = sum(1 for ch in line if ch in math_symbols)
@@ -1707,6 +1801,7 @@ def _table_rect_for_caption(
     if rect.is_empty or rect.width < 60 or rect.height < 20:
         return None, ""
     rect = _expand_table_rect_to_borders(page, rect)
+    rect = _tighten_table_rect_to_borders(page, rect)
     text = "\n".join(_clean_xml_text(" ".join(line.text for line in group)) for group in row_groups if any(line in selected for line in group))
     return rect, text[:2500]
 
@@ -1857,6 +1952,48 @@ def _expand_table_rect_to_borders(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect
     expanded = _merge_rects([rect, *borders])
     expanded &= page.rect
     return expanded
+
+
+def _tighten_table_rect_to_borders(page: fitz.Page, rect: fitz.Rect) -> fitz.Rect:
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return rect
+    search = fitz.Rect(rect.x0 - 16, rect.y0 - 16, rect.x1 + 16, rect.y1 + 16)
+    horizontal_borders: list[fitz.Rect] = []
+    for drawing in drawings:
+        raw_rect = drawing.get("rect")
+        if not raw_rect:
+            continue
+        border = fitz.Rect(raw_rect)
+        if border.width <= 0:
+            continue
+        if border.height <= 0.1:
+            border = fitz.Rect(border.x0, border.y0 - 0.5, border.x1, border.y1 + 0.5)
+        if border.height > 2.5:
+            continue
+        if border.width < max(80.0, rect.width * 0.35):
+            continue
+        if border.y1 < search.y0 or border.y0 > search.y1:
+            continue
+        if border.x1 < search.x0 or border.x0 > search.x1:
+            continue
+        horizontal_borders.append(border)
+    if len(horizontal_borders) < 2:
+        return rect
+    left = min(border.x0 for border in horizontal_borders)
+    right = max(border.x1 for border in horizontal_borders)
+    top = min(border.y0 for border in horizontal_borders)
+    bottom = max(border.y1 for border in horizontal_borders)
+    tightened = fitz.Rect(
+        max(page.rect.x0, left),
+        max(page.rect.y0, min(rect.y0, top)),
+        min(page.rect.x1, right),
+        min(page.rect.y1, max(rect.y1, bottom)),
+    )
+    if tightened.is_empty or tightened.width < 60 or tightened.height < 20:
+        return rect
+    return tightened
 
 
 def _caption_text_and_rect(
@@ -6508,7 +6645,7 @@ def _document_xml(
             if not asset or not media or asset_id in used_assets:
                 continue
             source, _media_name, rel_id = media
-            body.append(_image_paragraph(source, asset_id, rel_id))
+            body.append(_image_paragraph(source, asset_id, rel_id, asset))
             used_assets.add(asset_id)
 
     return f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -6895,9 +7032,21 @@ def _reasonable_equation_number(value: str) -> str:
 
 
 def _trailing_equation_number(text: str) -> str:
-    candidates = re.findall(r"(?:^|\s)[\(\[（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)\]）](?=\s*$)", text)
+    candidates = re.findall(r"(?:^|\s)[\(（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)）](?=\s*$)", text)
     if candidates:
         return candidates[-1]
+    return ""
+
+
+def _equation_number_token(text: str) -> str:
+    trailing = _trailing_equation_number(text)
+    if trailing:
+        return trailing
+    candidates = re.findall(r"(?:^|\s)[\(（]\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[\)）](?:\s|$)", text)
+    for candidate in reversed(candidates):
+        value = _reasonable_equation_number(candidate)
+        if value:
+            return value
     return ""
 
 
@@ -7032,9 +7181,10 @@ def _clean_asset_caption_text(caption: str, asset: PaperAsset | None = None) -> 
     return text
 
 
-def _image_paragraph(path: Path, docpr_id: int, rel_id: str) -> str:
-    cx, cy = _image_size_emu(path)
-    return f"""<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="80" w:after="180"/></w:pPr><w:r><w:drawing>
+def _image_paragraph(path: Path, docpr_id: int, rel_id: str, asset: PaperAsset | None = None) -> str:
+    cx, cy = _image_size_emu(path, asset.kind if asset else "")
+    spacing_after = "220" if asset and asset.kind in {"figure", "table"} else "160"
+    return f"""<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="100" w:after="{spacing_after}"/></w:pPr><w:r><w:drawing>
 <wp:inline distT="0" distB="0" distL="0" distR="0">
 <wp:extent cx="{cx}" cy="{cy}"/>
 <wp:effectExtent l="0" t="0" r="0" b="0"/>
@@ -7053,8 +7203,13 @@ def _image_paragraph(path: Path, docpr_id: int, rel_id: str) -> str:
 </w:drawing></w:r></w:p>"""
 
 
-def _image_size_emu(path: Path) -> tuple[int, int]:
+def _image_size_emu(path: Path, kind: str = "") -> tuple[int, int]:
     max_width_emu = int(6.2 * 914400)
+    min_width_by_kind = {
+        "formula": int(3.9 * 914400),
+        "table": int(5.7 * 914400),
+        "figure": int(5.4 * 914400),
+    }
     try:
         with Image.open(path) as image:
             width, height = image.size
@@ -7062,7 +7217,9 @@ def _image_size_emu(path: Path) -> tuple[int, int]:
         width, height = 800, 500
     if width <= 0 or height <= 0:
         width, height = 800, 500
-    scale = min(1.0, max_width_emu / (width * 9525))
+    natural_width_emu = width * 9525
+    min_width_emu = min_width_by_kind.get(kind, 0)
+    scale = min(max_width_emu / natural_width_emu, max(1.0, min_width_emu / natural_width_emu))
     return int(width * 9525 * scale), int(height * 9525 * scale)
 
 
