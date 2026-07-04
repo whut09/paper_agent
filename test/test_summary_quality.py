@@ -1,3 +1,5 @@
+import threading
+
 import paper_agent.paper_summary as ps
 
 
@@ -89,6 +91,73 @@ def test_final_integration_uses_parallel_partial_summaries():
         assert "[Chunk 10]" in prompt
         assert "note 3" not in prompt
         assert "note 8" not in prompt
+    finally:
+        ps._chat = original_chat
+
+
+def test_parallel_chunk_summary_retries_failed_chunk_after_batch():
+    original_chat = ps._chat
+    original_chunk_text = ps._chunk_text
+    original_concurrency = ps._codex_summary_concurrency
+    calls = {1: 0, 2: 0, 3: 0}
+    lock = threading.Lock()
+
+    def fake_chat(_client, _model, prompt, **_kwargs):
+        idx = next(i for i in calls if f"第 {i}/3" in prompt)
+        with lock:
+            calls[idx] += 1
+            call_count = calls[idx]
+        if idx == 2 and call_count == 1:
+            raise RuntimeError("mock connection dropped")
+        return f"note {idx}"
+
+    try:
+        ps._chat = fake_chat
+        ps._chunk_text = lambda _text, _chars: ["chunk one", "chunk two", "chunk three"]
+        ps._codex_summary_concurrency = lambda: 3
+
+        notes = ps._summarize_chunks_with_codex(
+            None,
+            "fake-model",
+            "paper text",
+            [],
+            "Chinese",
+        )
+
+        assert notes == ["note 1", "note 2", "note 3"]
+        assert calls == {1: 1, 2: 2, 3: 1}
+    finally:
+        ps._chat = original_chat
+        ps._chunk_text = original_chunk_text
+        ps._codex_summary_concurrency = original_concurrency
+
+
+def test_fast_integration_uses_standard_chat_retries():
+    original_chat = ps._chat
+    seen_kwargs = {}
+
+    def fake_chat(*_args, **kwargs):
+        seen_kwargs.update(kwargs)
+        return "# Test\n\n## 摘要\n中文摘要"
+
+    try:
+        ps._chat = fake_chat
+
+        result = ps._fast_integrate_summary_with_codex(
+            None,
+            "fake-model",
+            ["chunk note"],
+            [],
+            "Chinese",
+            "abstract",
+            [],
+            "",
+            "Test Paper",
+            RuntimeError("full integration failed"),
+        )
+
+        assert result.startswith("# Test")
+        assert "max_attempts" not in seen_kwargs
     finally:
         ps._chat = original_chat
 

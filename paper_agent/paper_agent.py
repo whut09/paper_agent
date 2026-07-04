@@ -350,6 +350,7 @@ def main(args: Optional[List[str]] = None) -> int:
                 "CODEX_API_KEY": str(ConfigManager.get("CODEX_API_KEY", "")),
                 "CODEX_MODEL": str(ConfigManager.get("CODEX_MODEL", "")),
                 "CODEX_USE_PROXY": str(ConfigManager.get("CODEX_USE_PROXY", "")),
+                "CODEX_PROXY": str(ConfigManager.get("CODEX_PROXY", "")),
             },
             max_assets=parsed_args.max_assets or DEFAULT_MAX_ASSETS,
             progress=print_progress,

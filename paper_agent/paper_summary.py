@@ -3123,6 +3123,8 @@ def _summarize_chunks_with_codex(
         _write_chunk_notes_cache(cache_path, results, total)
 
     pending_queue = list(pending_chunks)
+    chunks_by_idx = {idx: chunk for idx, chunk in pending_chunks}
+    failed_chunks: dict[int, Exception] = {}
     submitted_partials: set[str] = set(_partial_integration_keys(partial_records))
 
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-summary") as executor:
@@ -3165,7 +3167,8 @@ def _summarize_chunks_with_codex(
                         _idx, note = future.result()
                         idx = _idx
                     except Exception as exc:
-                        raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
+                        failed_chunks[idx] = exc
+                        continue
                     results[idx - 1] = note
                     completed += 1
                     _write_chunk_notes_cache(cache_path, results, total)
@@ -3184,6 +3187,30 @@ def _summarize_chunks_with_codex(
                 _write_partial_integration_cache(partial_cache_path, partial_records, total)
             submit_ready_partials()
             submit_more_chunks()
+    for idx in sorted(failed_chunks):
+        if cancellation_check:
+            cancellation_check()
+        try:
+            _idx, note = summarize_one(idx, chunks_by_idx[idx])
+            idx = _idx
+        except Exception as exc:
+            raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
+        results[idx - 1] = note
+        completed += 1
+        _write_chunk_notes_cache(cache_path, results, total)
+        if progress_callback:
+            progress_callback(completed, total)
+    if group_specs and partial_integrator:
+        _run_missing_partial_integrations(
+            group_specs,
+            results,
+            partial_records,
+            partial_cache_path,
+            total,
+            partial_integrator,
+            cancellation_check,
+            max_workers=1,
+        )
     return results
 
 
@@ -3691,7 +3718,6 @@ def _fast_integrate_summary_with_codex(
             prompt,
             system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
             max_tokens=3600,
-            max_attempts=1,
         )
     except RuntimeError as exc:
         raise RuntimeError(
@@ -5420,7 +5446,7 @@ def _chat(
     if isinstance(last_error, openai.APIConnectionError):
         raise RuntimeError(
             f"Codex 接口连接失败，已重试 {max_attempts} 次仍未成功：服务端断开或网络链路不稳定。"
-            "程序已默认不继承系统代理；如果你的接口必须走代理，请在 config.local.json 中加入 CODEX_USE_PROXY: true 后重试。"
+            "程序默认不继承系统代理；如果已经配置 CODEX_USE_PROXY/CODEX_PROXY，请检查代理地址、代理软件和服务端稳定性。"
         ) from last_error
     if isinstance(last_error, TimeoutError):
         raise RuntimeError(
