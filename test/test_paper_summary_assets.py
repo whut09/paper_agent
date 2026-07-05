@@ -45,6 +45,7 @@ from paper_agent.paper_summary import (
     _graphic_region_is_page_artifact,
     _image_size_emu,
     _is_formula_continuation_line,
+    _local_visual_asset_issues,
     _memory_guard,
     _postprocess_summary,
     _missing_asset_references,
@@ -1203,6 +1204,50 @@ def test_fallback_figure_crop_keeps_wide_short_graphic_group():
     assert rect.y0 < 125
     assert rect.y1 < caption.rect.y0
     assert rect.width > 500
+
+
+def test_captioned_figure_prefers_graphic_region_above_caption_over_body_below():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            assert kind == "dict"
+            return {
+                "blocks": [
+                    {"type": 1, "bbox": (52, 57, 561, 305)},
+                    {"type": 1, "bbox": (138, 132, 296, 303)},
+                    {"type": 1, "bbox": (304, 144, 478, 303)},
+                    {"type": 1, "bbox": (52, 328, 561, 388)},
+                ]
+            }
+
+        def get_drawings(self):
+            return []
+
+    caption = line("Fig. 3: Overview of the SEAR Framework.", 135, 315, 481, 327)
+    lines = [
+        line("Fast Track", 200, 258, 225, 267),
+        line("Deliberate Planner", 260, 276, 288, 293),
+        caption,
+        line("The method starts with problem formulation.", 135, 394, 481, 404),
+    ]
+
+    rect = _visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y0 < 70
+    assert rect.y1 < caption.rect.y0
+
+
+def test_local_visual_asset_guard_blocks_caption_only_figure():
+    with TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "caption-only.png"
+        Image.new("RGB", (900, 150), "white").save(image_path)
+        asset = PaperAsset("figure", 1, image_path, "Fig. 3: Overview")
+
+        issues = _local_visual_asset_issues(1, asset)
+
+    assert any(issue["severity"] == "error" and "text-only" in issue["message"] for issue in issues)
 
 
 def test_formula_reference_keeps_original_paper_number():

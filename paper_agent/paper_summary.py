@@ -2186,7 +2186,7 @@ def _visual_rect_for_caption_direction(
 ) -> fitz.Rect | None:
     left, right = _caption_column_bounds(page, caption_rect)
     if direction == "above":
-        previous_boundary = _previous_caption_or_heading_y(lines, caption_rect, left, right)
+        previous_boundary = _previous_caption_y(lines, caption_rect, left, right)
         search_top = max(previous_boundary or 0, caption_rect.y0 - min(520, page.rect.height * 0.7))
         search_bottom = caption_rect.y0 - 1
     else:
@@ -4693,8 +4693,6 @@ def _visual_asset_guard(
 ) -> GuardResult:
     if not _visual_asset_guard_enabled():
         return _guard_result("Visual Asset Guard", metrics={"skipped": "disabled"})
-    if client is None or not model:
-        return _guard_result("Visual Asset Guard", metrics={"skipped": "no_client"})
 
     selected = _visual_guard_assets_to_check(summary, assets)
     if not selected:
@@ -4702,6 +4700,23 @@ def _visual_asset_guard(
 
     errors: list[str] = []
     warnings: list[str] = []
+    for asset_id, asset in selected:
+        for issue in _local_visual_asset_issues(asset_id, asset):
+            severity = issue.get("severity", "warning")
+            message = issue.get("message", "")
+            if severity == "error":
+                errors.append(message)
+            elif message:
+                warnings.append(message)
+
+    if client is None or not model:
+        return _guard_result(
+            "Visual Asset Guard",
+            errors=errors,
+            warnings=warnings,
+            metrics={"checked": 0, "selected": len(selected), "model_skipped": "no_client"},
+        )
+
     checked = 0
 
     def check_one(item: tuple[int, PaperAsset]) -> tuple[int, PaperAsset, list[dict[str, str]] | None, Exception | None]:
@@ -4744,6 +4759,61 @@ def _visual_asset_guard(
         warnings=warnings,
         metrics={"checked": checked, "selected": len(selected)},
     )
+
+
+def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[str, str]]:
+    if not asset.path.exists():
+        return [{"severity": "warning", "message": f"asset {asset_id} image file is missing: {asset.path}"}]
+    width, height = _image_pixel_size(asset.path)
+    issues: list[dict[str, str]] = []
+    if asset.kind == "figure":
+        if width >= 600 and height < 120:
+            issues.append(
+                {
+                    "severity": "error",
+                    "message": f"asset {asset_id} figure crop is too shallow ({width}x{height}); likely missing the figure body",
+                }
+            )
+        elif width >= 600 and height < 180 and _image_looks_text_only(asset.path):
+            issues.append(
+                {
+                    "severity": "error",
+                    "message": f"asset {asset_id} figure crop looks text-only ({width}x{height}); likely captured caption/body text without the figure",
+                }
+            )
+    if asset.kind == "table" and width >= 650 and height >= 650 and "captioned" not in asset.path.name.lower():
+        issues.append(
+            {
+                "severity": "error",
+                "message": f"asset {asset_id} generic table crop is unusually large ({width}x{height}); likely includes multiple objects",
+            }
+        )
+    return issues
+
+
+def _image_looks_text_only(path: Path) -> bool:
+    try:
+        with Image.open(path) as image:
+            sample = image.convert("RGB")
+            sample.thumbnail((240, 240))
+            pixels = list(sample.getdata())
+    except Exception:
+        return False
+    if not pixels:
+        return False
+    colored = 0
+    non_white = 0
+    for red, green, blue in pixels:
+        max_channel = max(red, green, blue)
+        min_channel = min(red, green, blue)
+        if max_channel < 245:
+            non_white += 1
+        if max_channel - min_channel > 35 and max_channel < 245:
+            colored += 1
+    total = len(pixels)
+    colored_fraction = colored / total
+    non_white_fraction = non_white / total
+    return colored_fraction < 0.01 and non_white_fraction < 0.22
 
 
 def _visual_asset_guard_enabled() -> bool:
