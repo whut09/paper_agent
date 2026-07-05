@@ -28,6 +28,7 @@ from paper_agent.paper_summary import (
     _document_xml,
     _evidence_guard,
     _ensure_asset_markers,
+    _ensure_chinese_report_title,
     _ensure_required_report_sections,
     _enforce_core_original_title,
     _extract_abstract_from_text,
@@ -841,6 +842,25 @@ def test_core_info_title_uses_original_paper_title():
     assert "text-to-linear-image generation" not in result
 
 
+def test_english_report_title_gets_chinese_fallback_title():
+    summary = """# Self-Evolving Agentic Image Restoration via Deliberate Planning and Intuitive Execution
+
+## 核心信息
+- 标题: Self-Evolving Agentic Image Restoration via Deliberate Planning and Intuitive Execution
+- 研究任务: 真实世界图像恢复，即从复杂退化观测图像中恢复高质量图像
+- 方法名称: SEAR
+- 核心思想: 慢速规划与快速记忆执行协同完成工具序列选择
+
+## 摘要
+正文。
+"""
+
+    result = _ensure_chinese_report_title(summary)
+
+    assert result.startswith("# SEAR：面向真实世界图像恢复的慢速规划与快速记忆执行框架")
+    assert "- 中文标题: SEAR：面向真实世界图像恢复的慢速规划与快速记忆执行框架" in result
+
+
 def test_background_sections_normalize_to_background_and_problem():
     summary = """# Title
 
@@ -1324,6 +1344,65 @@ def test_right_column_table_caption_does_not_absorb_left_column_body_text():
     assert "AgenticIR 21.72" in table_text
     assert table_rect is not None
     assert table_rect.x0 >= 340
+
+
+def test_table_crop_stops_before_unnumbered_section_heading():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(40, 470, 610, 471)},
+                {"rect": fitz.Rect(40, 586, 610, 587)},
+            ]
+
+    lines = [
+        line("Table 3: Quantitative comparison on the real-world dataset.", 184, 433, 431, 444),
+        line("Method", 42, 456, 100, 468),
+        line("PSNR", 140, 456, 180, 468),
+        line("SSIM", 215, 456, 255, 468),
+        line("LPIPS", 280, 456, 330, 468),
+        line("MANIQA", 360, 456, 420, 468),
+        line("CLIP-IQA", 455, 456, 525, 468),
+        line("MUSIQ", 555, 456, 610, 468),
+        line("AirNet [28]", 42, 480, 120, 490),
+        line("23.3067", 140, 480, 190, 490),
+        line("0.7471", 215, 480, 260, 490),
+        line("0.4484", 280, 480, 330, 490),
+        line("0.2356", 360, 480, 410, 490),
+        line("0.3272", 455, 480, 505, 490),
+        line("35.2690", 555, 480, 610, 490),
+        line("PromptIR [37]", 42, 500, 120, 510),
+        line("23.8647", 140, 500, 190, 510),
+        line("0.7542", 215, 500, 260, 510),
+        line("0.4341", 280, 500, 330, 510),
+        line("0.2405", 360, 500, 410, 510),
+        line("0.3270", 455, 500, 505, 510),
+        line("35.4811", 555, 500, 610, 510),
+        line("4KAgent [66]", 42, 540, 120, 550),
+        line("23.6295", 140, 540, 190, 550),
+        line("0.7242", 215, 540, 260, 550),
+        line("0.3569", 280, 540, 330, 550),
+        line("0.3200", 360, 540, 410, 550),
+        line("0.4513", 455, 540, 505, 550),
+        line("54.4647", 555, 540, 610, 550),
+        line("SEAR", 42, 560, 85, 570),
+        line("24.4078", 140, 560, 190, 570),
+        line("0.7425", 215, 560, 260, 570),
+        line("0.3371", 280, 560, 330, 570),
+        line("0.3174", 360, 560, 410, 570),
+        line("0.4519", 455, 560, 505, 570),
+        line("54.6686", 555, 560, 610, 570),
+        line("Real-World Generalization", 161, 598, 295, 608),
+        line("Evaluation on the real-world dataset demonstrates robustness.", 135, 619, 481, 629),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 0, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert "Real-World Generalization" not in table_text
+    assert table_rect is not None
+    assert table_rect.y1 < 598
 
 
 def test_formula_column_bounds_allow_cross_column_equation_overhang():

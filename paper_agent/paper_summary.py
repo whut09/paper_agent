@@ -573,6 +573,7 @@ class GenerateReport(_PaperWorkflowNode):
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+        context.summary = _ensure_chinese_report_title(context.summary)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.summary = _suppress_formula_text_when_assets_present(context.summary, context.assets)
         _assert_report_ready_for_docx(context.summary)
@@ -1796,6 +1797,8 @@ def _table_rect_for_caption(
         if row_rect.is_empty:
             continue
         row_text = " ".join(line.text for line in group)
+        if selected and _line_looks_section_heading(row_text):
+            break
         if selected and previous_y1 is not None and row_rect.y0 - previous_y1 > 44:
             break
         if selected and _row_looks_table_section_label(row_text, group):
@@ -1854,7 +1857,7 @@ def _next_caption_or_heading_y(
         if _caption_is_table(line.text) or _caption_is_figure(line.text):
             candidates.append(line.rect.y0 - 2)
             continue
-        if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z ]{2,}$", line.text.strip()):
+        if _line_looks_section_heading(line.text):
             candidates.append(line.rect.y0 - 2)
     return min(candidates) if candidates else None
 
@@ -1876,9 +1879,28 @@ def _previous_caption_or_heading_y(
         if _caption_is_table(line.text) or _caption_is_figure(line.text):
             candidates.append(line.rect.y1 + 2)
             continue
-        if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z ]{2,}$", line.text.strip()):
+        if _line_looks_section_heading(line.text):
             candidates.append(line.rect.y1 + 2)
     return max(candidates) if candidates else None
+
+
+def _line_looks_section_heading(text: str) -> bool:
+    stripped = _clean_xml_text(text).strip()
+    if not stripped:
+        return False
+    if _caption_is_table(stripped) or _caption_is_figure(stripped):
+        return True
+    stripped = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", stripped)
+    if len(stripped) > 90:
+        return False
+    if re.search(r"[.。:：;,，↑↓\d]", stripped):
+        return False
+    words = re.findall(r"[A-Za-z][A-Za-z-]*", stripped)
+    if len(words) < 2 or len(words) > 7:
+        return False
+    if any(len(word.strip("-")) <= 1 for word in words):
+        return False
+    return all(word[:1].isupper() for word in words)
 
 
 def _group_lines_by_row(lines: list[TextLine]) -> list[list[TextLine]]:
@@ -3937,6 +3959,7 @@ def _verify_summary_claims(
         assets,
     )
     summary = _enforce_core_original_title(summary, paper_title)
+    summary = _ensure_chinese_report_title(summary)
     summary = _ensure_asset_markers(summary, assets)
     summary = _suppress_formula_text_when_assets_present(summary, assets)
     _assert_summary_quality(summary)
@@ -4382,6 +4405,7 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
         context.summary = _enforce_core_original_title(context.summary, context.paper_title)
+        context.summary = _ensure_chinese_report_title(context.summary)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.verification.revision_applied = True
     return _NodeResult(
@@ -5785,7 +5809,139 @@ def _normalize_final_sections(text: str) -> str:
     text = _remove_empty_sections(text)
     text = text.replace("翻译", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
+    text = _ensure_chinese_report_title(text)
     return text.strip()
+
+
+def _ensure_chinese_report_title(text: str) -> str:
+    title = _extract_note_title(text)
+    chinese_title = _core_info_field(text, ("中文标题",))
+    if not _looks_like_usable_chinese_title(chinese_title):
+        chinese_title = _build_chinese_title_from_core_info(text)
+    if not chinese_title:
+        return text
+
+    lines = text.splitlines()
+    replaced_h1 = False
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("# ") and not stripped.startswith("## "):
+            if _title_needs_chinese_rewrite(title):
+                lines[index] = f"# {chinese_title}"
+            replaced_h1 = True
+            break
+    if not replaced_h1:
+        lines.insert(0, f"# {chinese_title}")
+    updated = "\n".join(lines)
+    return _ensure_core_chinese_title_line(updated, chinese_title)
+
+
+def _title_needs_chinese_rewrite(title: str) -> bool:
+    title = _clean_xml_text(title).strip()
+    if not title:
+        return True
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", title))
+    ascii_letters = len(re.findall(r"[A-Za-z]", title))
+    if re.search(r"的(?:将|本文|论文|该文|研究)", title) or title.endswith("的"):
+        return True
+    return cjk_chars < 2 and ascii_letters >= 8
+
+
+def _looks_like_usable_chinese_title(title: str) -> bool:
+    title = _clean_xml_text(title).strip()
+    if not title:
+        return False
+    if len(re.findall(r"[\u4e00-\u9fff]", title)) < 2:
+        return False
+    if _core_info_line_is_unspecified(title):
+        return False
+    if re.search(r"的(?:将|本文|论文|该文|研究)", title) or title.endswith("的"):
+        return False
+    return True
+
+
+def _build_chinese_title_from_core_info(text: str) -> str:
+    method = _core_info_field(text, ("方法名称", "方法", "模型", "系统"))
+    task = _core_info_field(text, ("研究任务", "任务", "研究对象"))
+    idea = _core_info_field(text, ("核心思想", "主要技术"))
+    task = _shorten_core_title_phrase(task)
+    idea = _core_idea_title_phrase(idea)
+    if method and task and idea:
+        return f"{method}：面向{task}的{idea}"
+    if method and task:
+        return f"{method}：面向{task}的论文精读"
+    if task and idea:
+        return f"{task}：{idea}"
+    if task:
+        return f"{task}论文精读"
+    return ""
+
+
+def _core_idea_title_phrase(text: str) -> str:
+    text = _clean_xml_text(text).strip()
+    if not text:
+        return ""
+    if "慢速规划" in text and "快速" in text and "记忆" in text:
+        return "慢速规划与快速记忆执行框架"
+    if "规划" in text and "记忆" in text:
+        return "规划与记忆执行框架"
+    if "长时序决策" in text and "规划" in text:
+        return "长时序规划框架"
+    match = re.search(r"(?:用|通过|采用)([^，,；;。]{4,32})", text)
+    if match:
+        return _shorten_core_title_phrase(match.group(1))
+    return _shorten_core_title_phrase(text)
+
+
+def _shorten_core_title_phrase(text: str) -> str:
+    text = _clean_xml_text(text).strip()
+    if not text:
+        return ""
+    text = re.split(r"[，,；;。]|即|包括|例如", text, 1)[0].strip()
+    text = re.sub(r"^(?:本文|论文|该文|研究)\s*", "", text)
+    text = re.sub(r"\s+", " ", text)
+    if len(text) > 28:
+        text = text[:28].rstrip()
+    return text
+
+
+def _core_info_field(text: str, names: tuple[str, ...]) -> str:
+    body = _section_body(text, "核心信息")
+    if not body:
+        return ""
+    for line in body.splitlines():
+        stripped = _clean_xml_text(line).strip()
+        stripped = re.sub(r"^\s*[-*]\s*", "", stripped)
+        match = re.match(r"([^:：]{1,24})[:：]\s*(.+)$", stripped)
+        if not match:
+            continue
+        key = re.sub(r"\s+", "", match.group(1))
+        if any(key == re.sub(r"\s+", "", name) for name in names):
+            return match.group(2).strip()
+    return ""
+
+
+def _ensure_core_chinese_title_line(text: str, chinese_title: str) -> str:
+    pattern = re.compile(r"(?ms)(^##\s*核心信息\s*\n)(.*?)(?=^## |\Z)")
+
+    def replace(match: re.Match) -> str:
+        header = match.group(1)
+        body = match.group(2).strip("\n")
+        lines = body.splitlines()
+        insert_at = 0
+        for index, line in enumerate(lines):
+            stripped = _clean_xml_text(line).strip()
+            if re.match(r"^\s*[-*]\s*中文标题\s*[:：]", stripped):
+                lines[index] = re.sub(r"[:：].*$", f": {chinese_title}", line, count=1)
+                return header + "\n".join(lines).strip() + "\n\n"
+            if re.match(r"^\s*[-*]\s*(?:标题|论文题目)\s*[:：]", stripped):
+                insert_at = index + 1
+        lines.insert(insert_at, f"- 中文标题: {chinese_title}")
+        return header + "\n".join(lines).strip() + "\n\n"
+
+    if pattern.search(text):
+        return pattern.sub(replace, text, count=1)
+    return text
 
 
 def _suppress_formula_text_when_assets_present(summary: str, assets: list[PaperAsset]) -> str:
