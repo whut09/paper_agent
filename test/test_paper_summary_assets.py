@@ -1404,6 +1404,37 @@ def test_docx_image_sizing_enlarges_formula_and_table_assets():
     assert table_cx >= int(5.6 * 914400)
 
 
+def test_docx_image_sizing_does_not_over_enlarge_low_resolution_tables():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "tiny-table.png"
+        Image.new("RGB", (286, 169), "white").save(table)
+
+        table_cx, _table_cy = _image_size_emu(table, "table")
+
+    assert table_cx < int(4.2 * 914400)
+
+
+def test_docx_image_sizing_uses_pdf_rect_for_small_tables():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "high-dpi-small-table.png"
+        Image.new("RGB", (570, 337), "white").save(table)
+
+        table_cx, _table_cy = _image_size_emu(table, "table", fitz.Rect(345, 590, 477, 646))
+
+    assert int(3.7 * 914400) <= table_cx <= int(4.1 * 914400)
+
+
+def test_local_visual_asset_guard_blocks_low_resolution_table():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "tiny-table.png"
+        Image.new("RGB", (286, 169), "white").save(table)
+        asset = PaperAsset("table", 10, table, "Table 2: Efficiency analysis")
+
+        issues = _local_visual_asset_issues(1, asset)
+
+    assert any("resolution is too low" in issue["message"] for issue in issues)
+
+
 def test_inline_math_prose_is_not_formula_asset_candidate():
     prose = "c \u2208 C, the planner pi conditions on the concatenated input"
     parameter_sentence = "c = 0.8, eta = 0.55, zeta = 0.7, and distance penalty alpha = 0.05. Experiments"

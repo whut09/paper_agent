@@ -1020,7 +1020,7 @@ def _capture_captioned_tables(
         seen_boxes.add(key)
         table_index += 1
         path = work_dir / f"page-{page_no:03d}-captioned-table-{table_index:02d}.png"
-        _save_clip(page, clip_rect, path, padding=2)
+        _save_clip(page, clip_rect, path, padding=2, scale=4)
         assets.append(PaperAsset("table", page_no, path, caption_text[:300], table_text, rect=table_rect))
     return assets
 
@@ -1058,7 +1058,7 @@ def _capture_tables(
             continue
         seen_boxes.add(key)
         path = work_dir / f"page-{page_no:03d}-table-{idx:02d}.png"
-        _save_clip(page, clip_rect, path, padding=2)
+        _save_clip(page, clip_rect, path, padding=2, scale=4)
         assets.append(PaperAsset("table", page_no, path, caption or f"Table on page {page_no}", table_text, rect=table_rect))
     return assets
 
@@ -2460,10 +2460,11 @@ def _merge_rects(rects: Iterable[fitz.Rect | None]) -> fitz.Rect:
     return merged
 
 
-def _save_clip(page: fitz.Page, rect: fitz.Rect, path: Path, padding: int = 8) -> None:
+def _save_clip(page: fitz.Page, rect: fitz.Rect, path: Path, padding: int = 8, scale: float = 2.0) -> None:
     clip = rect + (-padding, -padding, padding, padding)
     clip &= page.rect
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip, alpha=False)
+    scale = max(1.0, float(scale or 2.0))
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
     pix.save(path)
 
 
@@ -4786,6 +4787,13 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
             {
                 "severity": "error",
                 "message": f"asset {asset_id} generic table crop is unusually large ({width}x{height}); likely includes multiple objects",
+            }
+        )
+    if asset.kind == "table" and width < 460:
+        issues.append(
+            {
+                "severity": "error",
+                "message": f"asset {asset_id} table crop resolution is too low ({width}x{height}); recapture at higher scale before inserting into Word",
             }
         )
     return issues
@@ -7775,7 +7783,7 @@ def _clean_asset_caption_text(caption: str, asset: PaperAsset | None = None) -> 
 
 
 def _image_paragraph(path: Path, docpr_id: int, rel_id: str, asset: PaperAsset | None = None) -> str:
-    cx, cy = _image_size_emu(path, asset.kind if asset else "")
+    cx, cy = _image_size_emu(path, asset.kind if asset else "", asset.rect if asset else None)
     spacing_after = "220" if asset and asset.kind in {"figure", "table"} else "160"
     return f"""<w:p><w:pPr><w:jc w:val="center"/><w:spacing w:before="100" w:after="{spacing_after}"/></w:pPr><w:r><w:drawing>
 <wp:inline distT="0" distB="0" distL="0" distR="0">
@@ -7796,7 +7804,7 @@ def _image_paragraph(path: Path, docpr_id: int, rel_id: str, asset: PaperAsset |
 </w:drawing></w:r></w:p>"""
 
 
-def _image_size_emu(path: Path, kind: str = "") -> tuple[int, int]:
+def _image_size_emu(path: Path, kind: str = "", rect: fitz.Rect | None = None) -> tuple[int, int]:
     max_width_emu = int(6.2 * 914400)
     min_width_by_kind = {
         "formula": int(3.9 * 914400),
@@ -7812,7 +7820,15 @@ def _image_size_emu(path: Path, kind: str = "") -> tuple[int, int]:
         width, height = 800, 500
     natural_width_emu = width * 9525
     min_width_emu = min_width_by_kind.get(kind, 0)
-    scale = min(max_width_emu / natural_width_emu, max(1.0, min_width_emu / natural_width_emu))
+    if kind == "table" and rect is not None and rect.width < 220:
+        target_width_inches = min(4.4, max(3.2, (rect.width / 72.0) * 2.1))
+        scale = min(max_width_emu / natural_width_emu, (target_width_inches * 914400) / natural_width_emu)
+        return int(width * 9525 * scale), int(height * 9525 * scale)
+    target_scale = max(1.0, min_width_emu / natural_width_emu) if min_width_emu else 1.0
+    if kind == "table":
+        # Small table crops become unreadable if stretched to page width; prefer crisp native scale.
+        target_scale = min(target_scale, 1.35)
+    scale = min(max_width_emu / natural_width_emu, target_scale)
     return int(width * 9525 * scale), int(height * 9525 * scale)
 
 
