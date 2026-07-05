@@ -96,6 +96,7 @@ def test_guard_registry_documents_harness_value():
     assert set(GUARD_SPECS) == {
         "Evidence Guard",
         "Asset Guard",
+        "Visual Asset Guard",
         "Coverage Guard",
         "Format Guard",
         "Citation Guard",
@@ -104,8 +105,10 @@ def test_guard_registry_documents_harness_value():
     }
     assert GUARD_SPECS["Evidence Guard"].blocking
     assert GUARD_SPECS["Asset Guard"].blocking
+    assert GUARD_SPECS["Visual Asset Guard"].blocking
     assert "claim" in GUARD_SPECS["Evidence Guard"].implementation
     assert "asset manifest" in GUARD_SPECS["Asset Guard"].implementation
+    assert "截图" in GUARD_SPECS["Visual Asset Guard"].problem
 
 
 def test_default_workflow_nodes_bind_agent_contracts():

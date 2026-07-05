@@ -25,6 +25,7 @@ from paper_agent.paper_summary import (
     _asset_guard,
     _assert_report_ready_for_docx,
     _correction_memory_context,
+    _deduplicate_assets,
     _document_xml,
     _evidence_guard,
     _ensure_asset_markers,
@@ -55,6 +56,7 @@ from paper_agent.paper_summary import (
     _stream_request_allows_partial_content,
     _prompt_patch_context,
     _parse_verification_result,
+    _parse_visual_asset_guard_response,
     _verification_format_warning,
     _resolve_codex_config,
     _row_is_prose_after_table,
@@ -68,6 +70,7 @@ from paper_agent.paper_summary import (
     _tighten_table_rect_to_borders,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
+    _visual_asset_guard,
     _verification_should_block_report,
     _with_asset_references,
     _run_harness_guards,
@@ -838,8 +841,30 @@ def test_core_info_title_uses_original_paper_title():
         "Linear Image Generation by Synthesizing Exposure Brackets",
     )
 
-    assert "- 标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
+    assert "- 原文标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
     assert "text-to-linear-image generation" not in result
+
+
+def test_core_info_original_title_deduplicates_legacy_title_fields():
+    summary = """# 中文标题
+
+## 核心信息
+- 标题: Old English Title
+- 论文题目: Old English Title
+- 中文标题: 旧中文标题
+- 作者: Test Author
+
+## 摘要
+正文。
+"""
+
+    result = _enforce_core_original_title(summary, "Correct Original English Title")
+
+    assert result.count("Correct Original English Title") == 1
+    assert "- 原文标题: Correct Original English Title" in result
+    assert "- 标题:" not in result
+    assert "- 论文题目:" not in result
+    assert "- 中文标题: 旧中文标题" in result
 
 
 def test_english_report_title_gets_chinese_fallback_title():
@@ -1126,6 +1151,60 @@ def test_fallback_figure_crop_trims_body_text_above_plot():
     assert rect.y0 < 285
 
 
+def test_fallback_figure_crop_does_not_extend_below_caption():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    caption = line("Fig. 5: Qualitative comparison on the real-world dataset.", 192, 314, 424, 326)
+    lines = [
+        line("Input", 180, 279, 200, 292),
+        line("Noise+Blur", 169, 290, 211, 302),
+        caption,
+        line("Table 4: Ablation study on the Group B dataset.", 135, 337, 481, 348),
+    ]
+
+    rect = _fallback_visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y1 < caption.rect.y0
+
+
+def test_fallback_figure_crop_keeps_wide_short_graphic_group():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            assert kind == "dict"
+            return {
+                "blocks": [
+                    {"type": 1, "bbox": (246, 116, 291, 185)},
+                    {"type": 1, "bbox": (293, 163, 338, 199)},
+                    {"type": 1, "bbox": (340, 212, 385, 249)},
+                    {"type": 1, "bbox": (387, 212, 432, 249)},
+                    {"type": 1, "bbox": (435, 259, 479, 295)},
+                    {"type": 1, "bbox": (135, 212, 245, 280)},
+                ]
+            }
+
+        def get_drawings(self):
+            return []
+
+    caption = line("Fig. 5: Qualitative comparison on the real-world dataset.", 192, 314, 424, 326)
+    lines = [
+        line("Input", 180, 279, 200, 292),
+        line("Noise+Blur", 169, 290, 211, 302),
+        caption,
+        line("Table 4: Ablation study on the Group B dataset.", 135, 337, 481, 348),
+    ]
+
+    rect = _fallback_visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y0 < 125
+    assert rect.y1 < caption.rect.y0
+    assert rect.width > 500
+
+
 def test_formula_reference_keeps_original_paper_number():
     text = (
         "公式 13 给出模态贡献的融合方式：C_m = (1−α) I_intra,m + α I_inter,m，"
@@ -1403,6 +1482,62 @@ def test_table_crop_stops_before_unnumbered_section_heading():
     assert "Real-World Generalization" not in table_text
     assert table_rect is not None
     assert table_rect.y1 < 598
+
+
+def test_captioned_assets_win_over_generic_table_covering_figure_and_table():
+    assets = [
+        PaperAsset("table", 12, Path("page-012-captioned-table-01.png"), "Table 4.", rect=fitz.Rect(138, 370, 478, 452)),
+        PaperAsset("figure", 12, Path("page-012-captioned-figure-01.png"), "Fig. 5.", rect=fitz.Rect(37, 267, 575, 347)),
+        PaperAsset("table", 12, Path("page-012-table-01.png"), "Table 4.", rect=fitz.Rect(35, 260, 580, 704)),
+    ]
+
+    result = _deduplicate_assets(assets)
+
+    assert [asset.path.name for asset in result] == [
+        "page-012-captioned-table-01.png",
+        "page-012-captioned-figure-01.png",
+    ]
+
+
+def test_visual_asset_guard_blocks_model_detected_mixed_crop():
+    class FakeMessage:
+        content = (
+            '{"passed": false, "issues": ['
+            '{"severity": "error", "type": "mixed_figure_table", "reason": "table screenshot also contains a separate figure"}'
+            "]}"
+        )
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResponse:
+        choices = [FakeChoice()]
+
+    class FakeCompletions:
+        def create(self, **_request):
+            return FakeResponse()
+
+    class FakeChat:
+        completions = FakeCompletions()
+
+    class FakeClient:
+        chat = FakeChat()
+
+    with TemporaryDirectory() as tmp:
+        image_path = Path(tmp) / "bad-table.png"
+        Image.new("RGB", (640, 360), "white").save(image_path)
+        assets = [PaperAsset("table", 1, image_path, "Table 4. Quantitative comparison")]
+        result = _visual_asset_guard("[[ASSET:1]]", assets, FakeClient(), "vision-test-model")
+
+    assert result.status == "failed"
+    assert any("mixed_figure_table" in error for error in result.errors)
+
+
+def test_parse_visual_asset_guard_response_normalizes_bad_json_as_warning():
+    result = _parse_visual_asset_guard_response("not json")
+
+    assert result["issues"][0]["severity"] == "warning"
+    assert result["issues"][0]["type"] == "invalid_visual_guard_json"
 
 
 def test_formula_column_bounds_allow_cross_column_equation_overhang():

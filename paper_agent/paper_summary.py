@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import os
@@ -78,7 +79,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 
 ## 核心信息
 只输出原文明确出现的字段；没有出现的字段不要写。
-- 标题: 必须填写原文标题，保持英文原文，不要改写、概括或翻译
+- 原文标题: 必须填写原文标题，保持英文原文，不要改写、概括或翻译
 - 中文标题: 可以忠实翻译原文标题
 - 作者:
 - 机构:
@@ -305,6 +306,12 @@ GUARD_SPECS = {
         "Asset Guard",
         "图表引用错、表图混用",
         "[[ASSET:id]] 必须来自 asset manifest，kind 必须匹配",
+        blocking=True,
+    ),
+    "Visual Asset Guard": GuardSpec(
+        "Visual Asset Guard",
+        "截图截多、截少、图表混在一起或不可读",
+        "抽样调用视觉模型检查 Word 中会插入的截图质量",
         blocking=True,
     ),
     "Coverage Guard": GuardSpec(
@@ -932,11 +939,6 @@ def _extract_text_and_assets(
         text_parts.append(f"\n\n[Page {page_no}]\n{page_text}")
 
         if kind_limits.get("table", 0) > 0:
-            table_assets = _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
-            table_assets = _filter_assets_before_y(table_assets, stop_y)
-            assets.extend(table_assets)
-
-        if kind_limits.get("table", 0) > 0:
             table_assets = _capture_captioned_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
             table_assets = _filter_assets_before_y(table_assets, stop_y)
             assets.extend(table_assets)
@@ -945,6 +947,11 @@ def _extract_text_and_assets(
             figure_assets = _capture_captioned_figures(page, work_dir, page_no, candidate_limit, seen_boxes)
             figure_assets = _filter_assets_before_y(figure_assets, stop_y)
             assets.extend(figure_assets)
+
+        if kind_limits.get("table", 0) > 0:
+            table_assets = _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
+            table_assets = _filter_assets_before_y(table_assets, stop_y)
+            assets.extend(table_assets)
 
         if kind_limits.get("figure", 0) > 0:
             figure_assets = _capture_image_blocks(page, work_dir, page_no, candidate_limit, seen_boxes)
@@ -1155,6 +1162,9 @@ def _deduplicate_assets(assets: list[PaperAsset]) -> list[PaperAsset]:
             if _table_is_tiny_fragment(asset):
                 continue
 
+        if _generic_asset_conflicts_with_captioned_asset(asset, result):
+            continue
+
         if _overlaps_existing_asset(asset, result):
             continue
 
@@ -1163,6 +1173,30 @@ def _deduplicate_assets(assets: list[PaperAsset]) -> list[PaperAsset]:
             seen_original_labels.add(label_key)
 
     return result
+
+
+def _asset_is_captioned(asset: PaperAsset) -> bool:
+    return "captioned" in asset.path.name.lower()
+
+
+def _generic_asset_conflicts_with_captioned_asset(
+    asset: PaperAsset,
+    existing_assets: list[PaperAsset],
+) -> bool:
+    if asset.rect is None or _asset_is_captioned(asset):
+        return False
+    for existing in existing_assets:
+        if existing.rect is None or existing.page_number != asset.page_number:
+            continue
+        if not _asset_is_captioned(existing):
+            continue
+        if _rect_iou(asset.rect, existing.rect) > 0.25:
+            return True
+        if _rect_overlap_fraction(existing.rect, asset.rect) > 0.55:
+            return True
+        if _rect_overlap_fraction(asset.rect, existing.rect) > 0.75:
+            return True
+    return False
 
 
 def _table_is_figure_fragment(
@@ -1705,7 +1739,8 @@ def _capture_captioned_figures(
         if visual_rect is None:
             continue
         clip_rect = _merge_rects([visual_rect, caption_rect])
-        if clip_rect.height < 80 or clip_rect.width < 80:
+        min_height = 50 if clip_rect.width >= 420 else 80
+        if clip_rect.height < min_height or clip_rect.width < 80:
             continue
         key = _box_key(page_no, clip_rect)
         if key in seen_boxes:
@@ -2249,14 +2284,77 @@ def _fallback_visual_rect_for_caption(
     lines: list[TextLine] | None = None,
 ) -> fitz.Rect | None:
     left, right = _caption_column_bounds(page, caption_rect)
+    graphic_rect = _fallback_graphic_rect_above_caption(page, caption_rect, left, right, lines or [])
+    if graphic_rect is not None:
+        return graphic_rect
     top = max(0, caption_rect.y0 - min(300, page.rect.height * 0.38))
     barrier_y = _fallback_figure_upper_body_barrier_y(lines or [], caption_rect, left, right, top)
     if barrier_y is not None:
         top = max(top, barrier_y + 8)
-    rect = fitz.Rect(left, top, right, max(top + 80, caption_rect.y0 - 2))
-    if rect.is_empty or rect.width < 40 or rect.height < 40:
+    bottom = caption_rect.y0 - 2
+    rect = fitz.Rect(left, top, right, bottom)
+    if rect.is_empty or rect.width < 40 or rect.height < 28:
         return None
     return rect
+
+
+def _fallback_graphic_rect_above_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+    lines: list[TextLine],
+) -> fitz.Rect | None:
+    bottom = caption_rect.y0 - 2
+    previous_boundary = _previous_caption_y(lines, caption_rect, left, right) if lines else None
+    search_top = max(previous_boundary or 0, caption_rect.y0 - min(260, page.rect.height * 0.42))
+    regions = [
+        region
+        for region in _page_graphic_regions(page)
+        if region.y1 <= bottom
+        and region.y0 >= search_top
+        and _horizontal_overlap_fraction(region, left, right) > 0.05
+    ]
+    if not regions:
+        return None
+    seed = max(regions, key=lambda rect: (rect.y1, rect.width * rect.height))
+    group = fitz.Rect(seed)
+    changed = True
+    while changed:
+        changed = False
+        for region in regions:
+            vertical_gap = max(region.y0 - group.y1, group.y0 - region.y1, 0)
+            if vertical_gap > 70:
+                continue
+            if _horizontal_overlap_fraction(region, group.x0 - 24, group.x1 + 24) < 0.05:
+                continue
+            before = tuple(group)
+            group |= region
+            if tuple(group) != before:
+                changed = True
+    rect = fitz.Rect(left, max(search_top, group.y0 - 2), right, bottom)
+    if rect.is_empty or rect.width < 80 or rect.height < 28:
+        return None
+    return rect
+
+
+def _previous_caption_y(
+    lines: list[TextLine],
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+) -> float | None:
+    candidates: list[float] = []
+    for line in lines:
+        if line.rect.y1 >= caption_rect.y0 - 3:
+            continue
+        if caption_rect.y0 - line.rect.y1 > 430:
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0:
+            continue
+        if _caption_is_table(line.text) or _caption_is_figure(line.text):
+            candidates.append(line.rect.y1 + 2)
+    return max(candidates) if candidates else None
 
 
 def _fallback_figure_upper_body_barrier_y(
@@ -3971,6 +4069,8 @@ def _verify_summary_claims(
         assets,
         paper_title,
         correction_memories or [],
+        client,
+        model,
     )
     guard_errors = _blocking_guard_errors(guard_results)
     if _summary_is_degraded_fallback(summary):
@@ -4315,10 +4415,13 @@ def _run_harness_guards(
     assets: list[PaperAsset],
     paper_title: str,
     memories: list[CorrectionMemory],
+    client: openai.OpenAI | None = None,
+    model: str = "",
 ) -> list[GuardResult]:
     return [
         _evidence_guard(grounded_map),
         _asset_guard(summary, assets),
+        _visual_asset_guard(summary, assets, client, model),
         _coverage_guard(summary, grounded_map),
         _format_guard(summary),
         _citation_guard(summary, paper_title),
@@ -4580,6 +4683,210 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
             "placeholder_count": len(re.findall(r"\[\[ASSET:", summary)),
         },
     )
+
+
+def _visual_asset_guard(
+    summary: str,
+    assets: list[PaperAsset],
+    client: openai.OpenAI | None = None,
+    model: str = "",
+) -> GuardResult:
+    if not _visual_asset_guard_enabled():
+        return _guard_result("Visual Asset Guard", metrics={"skipped": "disabled"})
+    if client is None or not model:
+        return _guard_result("Visual Asset Guard", metrics={"skipped": "no_client"})
+
+    selected = _visual_guard_assets_to_check(summary, assets)
+    if not selected:
+        return _guard_result("Visual Asset Guard", metrics={"checked": 0})
+
+    errors: list[str] = []
+    warnings: list[str] = []
+    checked = 0
+
+    def check_one(item: tuple[int, PaperAsset]) -> tuple[int, PaperAsset, list[dict[str, str]] | None, Exception | None]:
+        asset_id, asset = item
+        if not asset.path.exists():
+            return asset_id, asset, None, FileNotFoundError(str(asset.path))
+        try:
+            return asset_id, asset, _check_asset_with_visual_model(asset_id, asset, client, model), None
+        except openai.BadRequestError as exc:
+            return asset_id, asset, None, exc
+        except Exception as exc:
+            return asset_id, asset, None, exc
+
+    max_workers = min(_visual_guard_concurrency(), len(selected))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(check_one, item): item for item in selected}
+        for future in as_completed(future_map):
+            asset_id, _asset, issues, exc = future.result()
+            if isinstance(exc, openai.BadRequestError):
+                warnings.append(f"视觉模型未接受图片输入，已跳过视觉截图检查：{_clean_xml_text(str(exc))[:180]}")
+                continue
+            if exc is not None:
+                warnings.append(f"asset {asset_id} visual check failed: {_clean_xml_text(str(exc))[:180]}")
+                continue
+            if issues is None:
+                continue
+            checked += 1
+            for issue in issues:
+                severity = str(issue.get("severity", "warning")).lower()
+                issue_type = str(issue.get("type", "visual_issue")).strip() or "visual_issue"
+                reason = _clean_xml_text(str(issue.get("reason", ""))).strip()
+                message = f"asset {asset_id} {issue_type}: {reason}" if reason else f"asset {asset_id} {issue_type}"
+                if severity == "error":
+                    errors.append(message)
+                else:
+                    warnings.append(message)
+    return _guard_result(
+        "Visual Asset Guard",
+        errors=errors,
+        warnings=warnings,
+        metrics={"checked": checked, "selected": len(selected)},
+    )
+
+
+def _visual_asset_guard_enabled() -> bool:
+    raw = _first_value({}, "CODEX_VISUAL_GUARD")
+    return not raw or _truthy(raw)
+
+
+def _visual_guard_assets_to_check(summary: str, assets: list[PaperAsset]) -> list[tuple[int, PaperAsset]]:
+    max_assets = _visual_guard_max_assets()
+    referenced: list[int] = []
+    for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", summary):
+        asset_id = int(match.group(1))
+        if 1 <= asset_id <= len(assets) and asset_id not in referenced:
+            referenced.append(asset_id)
+    ordered = referenced or list(range(1, len(assets) + 1))
+    result: list[tuple[int, PaperAsset]] = []
+    for asset_id in ordered:
+        asset = assets[asset_id - 1]
+        if asset.kind not in {"figure", "table", "formula"}:
+            continue
+        result.append((asset_id, asset))
+        if len(result) >= max_assets:
+            break
+    return result
+
+
+def _visual_guard_max_assets() -> int:
+    raw_value = _first_value({}, "CODEX_VISUAL_GUARD_MAX_ASSETS")
+    try:
+        value = int(raw_value) if raw_value else 4
+    except ValueError:
+        value = 4
+    return max(1, min(value, 20))
+
+
+def _visual_guard_concurrency() -> int:
+    raw_value = _first_value({}, "CODEX_VISUAL_GUARD_CONCURRENCY")
+    try:
+        value = int(raw_value) if raw_value else 3
+    except ValueError:
+        value = 3
+    return max(1, min(value, 6))
+
+
+def _check_asset_with_visual_model(
+    asset_id: int,
+    asset: PaperAsset,
+    client: openai.OpenAI,
+    model: str,
+) -> list[dict[str, str]]:
+    data_url = _image_file_to_data_url(asset.path)
+    width, height = _image_pixel_size(asset.path)
+    prompt = (
+        "你是论文 Word 报告的截图质检员。请只检查这张截图是否适合插入报告，不评价论文内容。\n"
+        f"截图编号: ASSET:{asset_id}\n"
+        f"声明类型: {asset.kind}\n"
+        f"像素尺寸: {width}x{height}\n"
+        f"原始 caption/说明: {_clean_xml_text(asset.caption)[:500]}\n\n"
+        "严重错误判定为 severity=error：\n"
+        "1. 截图把两个独立对象混在一起，例如一张图和一个表格同时进入同一截图；\n"
+        "2. 图、表或公式主体被明显截断，标题/caption 与主体不匹配，或主体缺失；\n"
+        "3. 截图包含大段正文、章节标题、页眉页脚等无关内容，影响阅读；\n"
+        "4. 声明类型与画面不符，例如声明为 table 但主要是 figure；\n"
+        "5. 图表小到无法阅读或画面明显空白。\n"
+        "轻微留白、少量 caption、正常表题/图题不算错误。\n\n"
+        "只输出 JSON，不要输出 Markdown："
+        "{\"passed\": true/false, \"issues\": [{\"severity\": \"error|warning\", \"type\": \"...\", \"reason\": \"...\"}]}"
+    )
+    request = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You are a strict visual QA guard for generated research-paper Word reports. Output only valid JSON.",
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            },
+        ],
+        "temperature": 0.0,
+        "max_tokens": 600,
+    }
+    try:
+        response = client.chat.completions.create(**request)
+    except openai.BadRequestError:
+        request.pop("max_tokens", None)
+        response = client.chat.completions.create(**request)
+    content = response.choices[0].message.content or ""
+    payload = _parse_visual_asset_guard_response(str(content))
+    return payload.get("issues", [])
+
+
+def _parse_visual_asset_guard_response(text: str) -> dict:
+    try:
+        payload = json.loads(_extract_json_object(text))
+    except Exception:
+        return {
+            "passed": True,
+            "issues": [
+                {
+                    "severity": "warning",
+                    "type": "invalid_visual_guard_json",
+                    "reason": _clean_xml_text(text)[:180] or "visual guard returned invalid JSON",
+                }
+            ],
+        }
+    issues = payload.get("issues", [])
+    if not isinstance(issues, list):
+        issues = []
+    normalized_issues = []
+    for issue in issues:
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity", "warning")).lower()
+        if severity not in {"error", "warning"}:
+            severity = "warning"
+        normalized_issues.append(
+            {
+                "severity": severity,
+                "type": str(issue.get("type", "visual_issue")),
+                "reason": str(issue.get("reason", "")),
+            }
+        )
+    return {"passed": bool(payload.get("passed", not normalized_issues)), "issues": normalized_issues}
+
+
+def _image_file_to_data_url(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".") or "png"
+    mime = "jpeg" if suffix in {"jpg", "jpeg"} else "png"
+    encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+    return f"data:image/{mime};base64,{encoded}"
+
+
+def _image_pixel_size(path: Path) -> tuple[int, int]:
+    try:
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return (0, 0)
 
 
 def _coverage_guard(
@@ -5934,7 +6241,7 @@ def _ensure_core_chinese_title_line(text: str, chinese_title: str) -> str:
             if re.match(r"^\s*[-*]\s*中文标题\s*[:：]", stripped):
                 lines[index] = re.sub(r"[:：].*$", f": {chinese_title}", line, count=1)
                 return header + "\n".join(lines).strip() + "\n\n"
-            if re.match(r"^\s*[-*]\s*(?:标题|论文题目)\s*[:：]", stripped):
+            if re.match(r"^\s*[-*]\s*(?:标题|论文题目|原文标题)\s*[:：]", stripped):
                 insert_at = index + 1
         lines.insert(insert_at, f"- 中文标题: {chinese_title}")
         return header + "\n".join(lines).strip() + "\n\n"
@@ -6183,10 +6490,10 @@ def _normalize_report_section_name(title: str) -> str:
 
 def _complete_core_info_body(body: str, paper_title: str) -> str:
     lines = [line for line in body.splitlines() if line.strip()]
-    if paper_title and not any(re.match(r"^\s*[-*]\s*标题\s*[:：]", line) for line in lines):
-        lines.insert(0, f"- 标题: {paper_title}")
+    if paper_title and not any(re.match(r"^\s*[-*]\s*原文标题\s*[:：]", line) for line in lines):
+        lines.insert(0, f"- 原文标题: {paper_title}")
     if not lines:
-        lines.append(f"- 标题: {paper_title or '论文精读对象'}")
+        lines.append(f"- 原文标题: {paper_title or '论文精读对象'}")
     return "\n".join(lines)
 
 
@@ -6246,16 +6553,29 @@ def _enforce_core_original_title(text: str, paper_title: str) -> str:
         header = match.group(1)
         body = match.group(2).strip("\n")
         lines = body.splitlines()
-        for index, line in enumerate(lines):
-            if re.match(r"^\s*[-*]\s*标题\s*[:：]", line):
-                prefix = re.match(r"^(\s*[-*]\s*标题\s*[:：]\s*)", line).group(1)
-                lines[index] = f"{prefix}{paper_title}"
-                return header + "\n".join(lines).strip() + "\n\n"
-        return header + f"- 标题: {paper_title}\n" + body.strip() + "\n\n"
+        kept: list[str] = []
+        insert_at = 0
+        for line in lines:
+            key = _core_info_line_key(line)
+            if key in {"标题", "论文题目", "原文题目", "原文标题"}:
+                insert_at = len(kept)
+                continue
+            kept.append(line)
+        kept.insert(insert_at, f"- 原文标题: {paper_title}")
+        return header + "\n".join(line for line in kept if line.strip()).strip() + "\n\n"
 
     if pattern.search(text):
         return pattern.sub(replace, text, count=1)
     return text
+
+
+def _core_info_line_key(line: str) -> str:
+    stripped = _clean_xml_text(line).strip()
+    stripped = re.sub(r"^\s*[-*]\s*", "", stripped)
+    match = re.match(r"([^:：]{1,24})[:：]", stripped)
+    if not match:
+        return ""
+    return re.sub(r"\s+", "", match.group(1))
 
 
 def _remove_unspecified_placeholders(text: str) -> str:
