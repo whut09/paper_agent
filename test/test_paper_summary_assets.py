@@ -1,4 +1,4 @@
-from pathlib import Path
+﻿from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import fitz
@@ -64,6 +64,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_section_label,
     _row_looks_table_like,
     _report_substance_issues,
+    _remove_mismatched_asset_markers,
     _sync_inline_asset_references,
     _suppress_formula_text_when_assets_present,
     _styles_xml,
@@ -488,6 +489,21 @@ def test_asset_guard_still_fails_adjacent_reference_kind_mismatch():
 
     assert result.status == "failed"
     assert any("kind mismatch" in error for error in result.errors)
+
+
+def test_mismatched_formula_marker_is_removed_from_generic_problem_text():
+    assets = [PaperAsset("formula", 3, Path("formula.png"), "Formula screenshot")]
+    summary = (
+        "## 方法主线\n"
+        "在问题定义中，论文将复杂图像恢复描述为包含多个 restoration tools 的工具库。\n"
+        "[[ASSET:1]]\n"
+        "训练部分采用 actor-critic 思路。\n"
+    )
+
+    result = _remove_mismatched_asset_markers(summary, assets)
+
+    assert "[[ASSET:1]]" not in result
+    assert "actor-critic" in result
 
 
 def test_harness_guards_report_coverage_warnings():
@@ -1239,6 +1255,38 @@ def test_captioned_figure_prefers_graphic_region_above_caption_over_body_below()
     assert rect.y1 < caption.rect.y0
 
 
+def test_captioned_figure_crop_trims_front_matter_above_first_page_figure():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            assert kind == "dict"
+            return {
+                "blocks": [
+                    {"type": 1, "bbox": (219, 184, 637, 419)},
+                    {"type": 1, "bbox": (318, 232, 342, 250)},
+                    {"type": 1, "bbox": (477, 232, 553, 307)},
+                ]
+            }
+
+        def get_drawings(self):
+            return []
+
+    caption = line("Figure 1.", 317, 380, 351, 389)
+    lines = [
+        line("1Amazon, 2Northeastern University", 145, 176, 487, 190),
+        line("jianglinlu@outlook.com, author@example.com", 103, 193, 526, 203),
+        line("Input", 352, 237, 366, 243),
+        caption,
+    ]
+
+    rect = _visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y0 > 205
+    assert rect.y1 < caption.rect.y0
+
+
 def test_local_visual_asset_guard_blocks_caption_only_figure():
     with TemporaryDirectory() as tmp:
         image_path = Path(tmp) / "caption-only.png"
@@ -1262,19 +1310,18 @@ def test_formula_reference_keeps_original_paper_number():
     assert _with_asset_references(text, labels) == text
 
 
-def test_formula_marker_is_inserted_before_fallback_figures():
+def test_formula_marker_is_not_inserted_without_explicit_numbered_reference():
     assets = [
         PaperAsset("figure", 1, Path("figure1.png"), "Figure 1. Overview"),
         PaperAsset("figure", 1, Path("figure2.png"), "Figure 2. Framework"),
-        PaperAsset("formula", 1, Path("formula2.png"), "关键公式截图：Y = X (2)", text="Y = X (2)"),
+        PaperAsset("formula", 1, Path("formula2.png"), "Formula screenshot (2)", text="Y = X (2)"),
     ]
-    summary = "## 方法主线\n公式（2）描述输出结构，如公式2所示。"
+    summary = "## 方法主线\n相关公式的工程含义是把恢复过程改写为工具选择问题。"
 
     result = _ensure_asset_markers(summary, assets)
 
-    assert result.index("[[ASSET:3]]") < result.index("[[ASSET:1]]")
-    assert "[[ASSET:3]]" in result
-
+    assert "[[ASSET:3]]" not in result
+    assert "[[ASSET:1]]" in result
 
 def test_formula_marker_is_inserted_after_plain_formula_reference():
     assets = [
@@ -1624,3 +1671,4 @@ def test_formula_column_bounds_allow_cross_column_equation_overhang():
 
     assert left < 318
     assert right > 575
+

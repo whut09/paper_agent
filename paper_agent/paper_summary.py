@@ -2238,7 +2238,46 @@ def _visual_rect_for_caption_direction(
     group &= column_rect
     if group.is_empty or group.width < 40 or group.height < 30:
         return None
+    group = _trim_figure_region_top_text(group, lines, caption_rect, left, right)
+    if group.is_empty or group.width < 40 or group.height < 30:
+        return None
     return group
+
+
+def _trim_figure_region_top_text(
+    region: fitz.Rect,
+    lines: list[TextLine],
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+) -> fitz.Rect:
+    barrier: float | None = None
+    for line in lines:
+        if line.rect.y0 < region.y0 - 2 or line.rect.y1 > min(caption_rect.y0, region.y0 + 85):
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0:
+            continue
+        text = _clean_xml_text(line.text).strip()
+        if _line_is_front_matter_or_body_before_figure(text):
+            barrier = max(barrier or line.rect.y1, line.rect.y1)
+    if barrier is None or barrier + 4 >= region.y1:
+        return region
+    return fitz.Rect(region.x0, barrier + 4, region.x1, region.y1)
+
+
+def _line_is_front_matter_or_body_before_figure(text: str) -> bool:
+    if not text:
+        return False
+    if "@" in text:
+        return True
+    lowered = text.lower()
+    if lowered in {"abstract", "introduction"}:
+        return True
+    if re.search(r"\b(?:amazon|university|institute|college|foundation|proceedings|xplore|open access|accepted version)\b", lowered):
+        return True
+    if re.search(r"\b(?:aims|recent|restoration agents|suffer|bottlenecks|models|paper)\b", lowered) and len(text) > 45:
+        return True
+    return False
 
 
 def _figure_region_belongs_to_group(region: fitz.Rect, seed: fitz.Rect, group: fitz.Rect) -> bool:
@@ -4059,7 +4098,9 @@ def _verify_summary_claims(
     )
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_chinese_report_title(summary)
+    summary = _remove_mismatched_asset_markers(summary, assets)
     summary = _ensure_asset_markers(summary, assets)
+    summary = _remove_mismatched_asset_markers(summary, assets)
     summary = _suppress_formula_text_when_assets_present(summary, assets)
     _assert_summary_quality(summary)
     claims = _extract_verifiable_claims(summary)
@@ -4684,6 +4725,28 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
             "placeholder_count": len(re.findall(r"\[\[ASSET:", summary)),
         },
     )
+
+
+def _remove_mismatched_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
+    if not assets or "[[ASSET:" not in summary:
+        return summary
+    spans_to_remove: list[tuple[int, int]] = []
+    for match in re.finditer(r"(?m)^[ \t]*\[\[ASSET:(\d+)\]\][ \t]*(?:\r?\n)?", summary):
+        asset_id = int(match.group(1))
+        if asset_id < 1 or asset_id > len(assets):
+            continue
+        nearby = _asset_reference_text_for_marker(summary, match.start())
+        if _asset_reference_kind_mismatch(nearby, assets[asset_id - 1]):
+            spans_to_remove.append(match.span())
+    if not spans_to_remove:
+        return summary
+    result_parts: list[str] = []
+    cursor = 0
+    for start, end in spans_to_remove:
+        result_parts.append(summary[cursor:start])
+        cursor = end
+    result_parts.append(summary[cursor:])
+    return re.sub(r"\n{3,}", "\n\n", "".join(result_parts)).strip()
 
 
 def _visual_asset_guard(
@@ -6936,7 +6999,7 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
             continue
         if asset.kind == "table" and len([i for i in missing_ids if assets[i - 1].kind == "table" and i <= asset_id]) > 8:
             continue
-        if asset.kind == "formula" and len([i for i in missing_ids if assets[i - 1].kind == "formula" and i <= asset_id]) > 4:
+        if asset.kind == "formula":
             continue
         target = _target_section_for_asset(asset)
         insertions.setdefault(target, []).extend(_asset_placeholder_lines(asset_id, asset, target))
