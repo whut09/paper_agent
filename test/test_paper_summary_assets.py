@@ -63,6 +63,7 @@ from paper_agent.paper_summary import (
     _sync_inline_asset_references,
     _suppress_formula_text_when_assets_present,
     _styles_xml,
+    _table_rect_for_caption,
     _tighten_table_rect_to_borders,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
@@ -1131,6 +1132,17 @@ def test_formula_marker_is_inserted_before_fallback_figures():
     assert "[[ASSET:3]]" in result
 
 
+def test_formula_marker_is_inserted_after_plain_formula_reference():
+    assets = [
+        PaperAsset("formula", 6, Path("formula1.png"), "Formula screenshot", text="R(I_H) = score (1)"),
+    ]
+    summary = "## 方法主线\n公式1用于定义终端恢复结果的 hybrid reward。\n"
+
+    result = _ensure_asset_markers(summary, assets)
+
+    assert "公式1用于定义终端恢复结果的 hybrid reward。\n[[ASSET:1]]" in result
+
+
 def test_formula_text_is_suppressed_when_formula_screenshot_exists():
     assets = [PaperAsset("formula", 3, Path("formula.png"), "关键公式截图：quality score")]
     summary = (
@@ -1277,6 +1289,41 @@ def test_table_rect_tightens_to_detected_horizontal_borders():
 
     assert tightened.x0 == 300
     assert tightened.x1 == 560
+
+
+def test_right_column_table_caption_does_not_absorb_left_column_body_text():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(345, 596, 478, 597)},
+                {"rect": fitz.Rect(345, 646, 478, 647)},
+            ]
+
+    lines = [
+        line("Efficiency Analysis. Table 2 evaluates ef-", 135, 548, 332, 558),
+        line("Table 2: Efficiency analysis on the", 342, 566, 481, 578),
+        line("and tool calls per image. SEAR balances fi-", 135, 572, 332, 581),
+        line("Group B dataset [64].", 342, 577, 430, 589),
+        line("Method PSNR Time Tool Calls", 346, 597, 478, 606),
+        line("AgenticIR, SEAR improves PSNR by 0.42", 135, 607, 332, 617),
+        line("AgenticIR 21.72 1.09 6.11", 346, 610, 478, 619),
+        line("dB with limited runtime and tool overhead.", 135, 619, 332, 629),
+        line("4KAgent 21.54 2.55 8.26", 346, 622, 478, 631),
+        line("SEAR also outperforms 4KAgent in restora-", 135, 631, 332, 641),
+        line("SEAR 22.13 1.98 8.15", 346, 634, 478, 643),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 1, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert "tool calls per image" not in caption_text
+    assert "Group B dataset" in caption_text
+    assert "improves PSNR" not in table_text
+    assert "AgenticIR 21.72" in table_text
+    assert table_rect is not None
+    assert table_rect.x0 >= 340
 
 
 def test_formula_column_bounds_allow_cross_column_equation_overhang():

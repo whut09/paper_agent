@@ -573,6 +573,7 @@ class GenerateReport(_PaperWorkflowNode):
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+        context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.summary = _suppress_formula_text_when_assets_present(context.summary, context.assets)
         _assert_report_ready_for_docx(context.summary)
         try:
@@ -1246,10 +1247,14 @@ def _capture_formula_blocks_from_doc(
     candidates.sort(key=lambda item: (-item[0], item[1], item[2].y0))
     assets: list[PaperAsset] = []
     formula_index_by_page: dict[int, int] = {}
+    selected_formula_labels: set[str] = set()
     for _score, page_index, rect, text in candidates:
         if len(assets) >= limit:
             break
         page_no = page_index + 1
+        formula_label = _original_asset_label(PaperAsset("formula", page_no, Path(""), "", text=text))
+        if formula_label and formula_label in selected_formula_labels:
+            continue
         key = _box_key(page_no, rect)
         if key in seen_boxes:
             continue
@@ -1263,6 +1268,8 @@ def _capture_formula_blocks_from_doc(
         latex = _recognize_formula_latex(path)
         caption = _formula_caption(text, latex)
         assets.append(PaperAsset("formula", page_no, path, caption, text=text, latex=latex, rect=rect))
+        if formula_label:
+            selected_formula_labels.add(formula_label)
     return assets
 
 
@@ -1456,17 +1463,28 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
     left, right = _formula_column_bounds(page, anchor)
     y0 = anchor.y0
     y1 = anchor.y1
+    x0 = left
+    x1 = right
     anchor_mid = (anchor.y0 + anchor.y1) / 2
     for line in lines:
-        if line.rect.x1 < left or line.rect.x0 > right:
-            continue
         line_mid = (line.rect.y0 + line.rect.y1) / 2
         if abs(line_mid - anchor_mid) > 34:
+            continue
+        in_formula_column = not (line.rect.x1 < left or line.rect.x0 > right)
+        same_row_formula_fragment = (
+            abs(line_mid - anchor_mid) < 7
+            and _line_has_standalone_formula_marker(line.text)
+            and not _formula_line_looks_like_inline_prose(line.text)
+        )
+        if not in_formula_column and not same_row_formula_fragment:
             continue
         if _is_formula_continuation_line(line.text) or abs(line_mid - anchor_mid) < 7:
             y0 = min(y0, line.rect.y0)
             y1 = max(y1, line.rect.y1)
-    return fitz.Rect(left, max(0, y0), right, min(page.rect.height, y1))
+            if same_row_formula_fragment:
+                x0 = min(x0, line.rect.x0 - 24)
+                x1 = max(x1, line.rect.x1 + 24)
+    return fitz.Rect(max(page.rect.x0, x0), max(0, y0), min(page.rect.x1, x1), min(page.rect.height, y1))
 
 
 def _formula_column_bounds(page: fitz.Page, rect: fitz.Rect) -> tuple[float, float]:
@@ -1767,7 +1785,7 @@ def _table_rect_for_caption(
         for line in lines
         if line.rect.y0 >= search_top
         and line.rect.y0 < search_bottom
-        and _horizontal_overlap_fraction(line.rect, left, right) > 0
+        and _line_belongs_to_column(line.rect, left, right, min_overlap=0.35)
     ]
     row_groups = _group_lines_by_row(candidate_lines)
     selected: list[TextLine] = []
@@ -1804,6 +1822,18 @@ def _table_rect_for_caption(
     rect = _tighten_table_rect_to_borders(page, rect)
     text = "\n".join(_clean_xml_text(" ".join(line.text for line in group)) for group in row_groups if any(line in selected for line in group))
     return rect, text[:2500]
+
+
+def _line_belongs_to_column(rect: fitz.Rect, left: float, right: float, min_overlap: float = 0.25) -> bool:
+    if rect.x1 < left or rect.x0 > right:
+        return False
+    overlap = min(rect.x1, right) - max(rect.x0, left)
+    if overlap <= 0:
+        return False
+    width = max(1.0, rect.width)
+    if overlap / width >= min_overlap:
+        return True
+    return rect.x0 >= left - 8 and rect.x1 <= right + 8
 
 
 def _next_caption_or_heading_y(
@@ -2009,7 +2039,7 @@ def _caption_text_and_rect(
     for next_line in lines[caption_index + 1 : caption_index + 4]:
         if next_line.rect.y0 < previous.rect.y0:
             continue
-        if next_line.rect.x1 < left or next_line.rect.x0 > right:
+        if not _line_belongs_to_column(next_line.rect, left, right, min_overlap=0.35):
             continue
         gap = next_line.rect.y0 - previous.rect.y1
         if gap > 16:
@@ -6340,7 +6370,7 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     missing_ids = [
         idx
         for idx, asset in enumerate(assets, 1)
-        if str(idx) not in referenced and asset.kind in {"figure", "table"}
+        if str(idx) not in referenced and asset.kind in {"figure", "table", "formula"}
     ]
     if not missing_ids:
         return summary
@@ -6351,6 +6381,8 @@ def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
         if asset.kind == "figure" and len([i for i in missing_ids if assets[i - 1].kind == "figure" and i <= asset_id]) > 6:
             continue
         if asset.kind == "table" and len([i for i in missing_ids if assets[i - 1].kind == "table" and i <= asset_id]) > 8:
+            continue
+        if asset.kind == "formula" and len([i for i in missing_ids if assets[i - 1].kind == "formula" and i <= asset_id]) > 4:
             continue
         target = _target_section_for_asset(asset)
         insertions.setdefault(target, []).extend(_asset_placeholder_lines(asset_id, asset, target))
@@ -6413,7 +6445,7 @@ def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAs
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
                 continue
-            if re.search(pattern, stripped):
+            if _line_mentions_asset_label(stripped, compact, pattern, asset):
                 insert_after.setdefault(line_index, []).append(f"[[ASSET:{asset_id}]]")
                 referenced.add(str(asset_id))
                 break
@@ -6426,6 +6458,21 @@ def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAs
         result.append(line)
         result.extend(insert_after.get(index, []))
     return "\n".join(result)
+
+
+def _line_mentions_asset_label(line: str, compact_label: str, pattern: str, asset: PaperAsset) -> bool:
+    if re.search(pattern, line):
+        return True
+    if asset.kind != "formula":
+        return False
+    compact_line = _compact_asset_label(line)
+    if compact_label and compact_label in compact_line:
+        return True
+    match = re.match(r"^公式(.+)$", compact_label)
+    if not match:
+        return False
+    number = re.escape(match.group(1))
+    return bool(re.search(rf"(?i)(?:equation|eq\.?|formula)\s*[\(:：]?\s*{number}\b", line))
 
 
 def _asset_placeholder_lines(asset_id: int, asset: PaperAsset, section: str) -> list[str]:
