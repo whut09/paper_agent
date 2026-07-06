@@ -599,6 +599,7 @@ class TestV2BridgeEndToEnd(unittest.TestCase):
         self.assertEqual(env["PAPER_AGENT_GEMINI_MODEL"], "gemini-pro")
 
     def test_output_defaults_to_input_parent(self):
+        from pathlib import Path
         from paper_agent.kernel.v2_bridge import request_to_cli_args
         from paper_agent.kernel.protocol import TranslateRequest
 
@@ -606,7 +607,7 @@ class TestV2BridgeEndToEnd(unittest.TestCase):
         args = request_to_cli_args(req)
         self.assertIn("--output", args)
         idx = args.index("--output")
-        self.assertEqual(args[idx + 1], "/some/dir")
+        self.assertEqual(args[idx + 1], str(Path("/some/dir").resolve()))
 
     def test_output_resolved_to_absolute_path(self):
         from pathlib import Path

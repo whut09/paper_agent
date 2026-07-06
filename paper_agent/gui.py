@@ -371,7 +371,7 @@ def _try_parallel_range_download(
             headers=DOWNLOAD_HEADERS,
         )
         head.raise_for_status()
-    except requests.exceptions.RequestException as exc:
+    except (AttributeError, requests.exceptions.RequestException) as exc:
         logger.debug("Parallel download HEAD failed, falling back: %s", exc)
         return None
 
