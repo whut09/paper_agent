@@ -80,6 +80,8 @@ DOWNLOAD_CHUNK_SIZE = 64 * 1024
 DOWNLOAD_RETRIES = 3
 PARALLEL_DOWNLOAD_CHUNK_SIZE = 256 * 1024
 PARALLEL_DOWNLOAD_WORKERS = 4
+DOWNLOAD_CONNECT_TIMEOUT = 25
+DOWNLOAD_READ_TIMEOUT = 120
 DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 PaperAgent/0.1 (+https://github.com/whut09/paper_agent)",
     "Accept": "application/pdf,application/octet-stream,*/*",
@@ -106,7 +108,9 @@ def download_with_limit(
     """
     url = _normalize_paper_url(url)
     download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
-    curl_result = _try_curl_download(url, save_path, size_limit, download_proxy, progress_callback)
+    curl_result = _try_curl_download(
+        url, save_path, size_limit, download_proxy, progress_callback
+    )
     if curl_result:
         return curl_result
 
@@ -122,75 +126,177 @@ def download_with_limit(
     if parallel_result:
         return parallel_result
 
-    session = requests.Session()
-    session.trust_env = trust_env
-    download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
-    if download_proxy:
-        session.proxies.update({"http": download_proxy, "https": download_proxy})
     target: Path | None = None
     temp_target: Path | None = None
     last_error: requests.exceptions.RequestException | None = None
+    timeout = _download_timeout()
     try:
-        for attempt in range(DOWNLOAD_RETRIES):
-            resume_from = temp_target.stat().st_size if temp_target and temp_target.exists() else 0
-            headers = dict(DOWNLOAD_HEADERS)
-            if resume_from:
-                headers["Range"] = f"bytes={resume_from}-"
-            try:
-                with session.get(url, stream=True, timeout=(8, 45), headers=headers) as response:
-                    response.raise_for_status()
-                    if target is None:
-                        target = save_path / _download_filename(url, response)
-                        temp_target = target.with_name(f"{target.name}.part")
-                        resume_from = temp_target.stat().st_size if temp_target.exists() else 0
-                    if resume_from and response.status_code != 206:
-                        temp_target.unlink(missing_ok=True)
-                        resume_from = 0
-                    expected_size = _download_expected_size(response, resume_from)
-                    if size_limit and expected_size and expected_size > size_limit:
-                        temp_target.unlink(missing_ok=True)
-                        raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
-                    total_size = resume_from
-                    if progress_callback:
-                        progress_callback(total_size, expected_size)
-                    mode = "ab" if resume_from else "wb"
-                    with open(temp_target, mode) as file:
-                        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-                            if not chunk:
-                                continue
-                            total_size += len(chunk)
-                            if size_limit and total_size > size_limit:
-                                temp_target.unlink(missing_ok=True)
-                                raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
-                            file.write(chunk)
-                            if progress_callback:
-                                progress_callback(total_size, expected_size)
-                    if expected_size and total_size < expected_size:
-                        raise requests.exceptions.ChunkedEncodingError(
-                            f"incomplete download: {total_size} bytes read, {expected_size} expected"
-                        )
-                    temp_target.replace(target)
-                    return str(target)
-            except requests.exceptions.RequestException as exc:
-                last_error = exc
-                if attempt + 1 >= DOWNLOAD_RETRIES:
-                    break
-                time.sleep(0.8 * (attempt + 1))
+        for mode, proxy, candidate_trust_env in _request_download_candidates(
+            url, trust_env, download_proxy
+        ):
+            session = requests.Session()
+            session.trust_env = candidate_trust_env
+            if proxy:
+                _set_session_proxy(session, proxy)
+
+            for attempt in range(DOWNLOAD_RETRIES):
+                resume_from = (
+                    temp_target.stat().st_size
+                    if temp_target and temp_target.exists()
+                    else 0
+                )
+                headers = dict(DOWNLOAD_HEADERS)
+                if resume_from:
+                    headers["Range"] = f"bytes={resume_from}-"
+                try:
+                    logger.info("Downloading paper with requests (%s).", mode)
+                    with session.get(
+                        url, stream=True, timeout=timeout, headers=headers
+                    ) as response:
+                        response.raise_for_status()
+                        if target is None:
+                            target = save_path / _download_filename(url, response)
+                            temp_target = target.with_name(f"{target.name}.part")
+                            resume_from = (
+                                temp_target.stat().st_size
+                                if temp_target.exists()
+                                else 0
+                            )
+                        if resume_from and response.status_code != 206:
+                            temp_target.unlink(missing_ok=True)
+                            resume_from = 0
+                        expected_size = _download_expected_size(response, resume_from)
+                        if size_limit and expected_size and expected_size > size_limit:
+                            temp_target.unlink(missing_ok=True)
+                            raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+                        total_size = resume_from
+                        if progress_callback:
+                            progress_callback(total_size, expected_size)
+                        mode_flag = "ab" if resume_from else "wb"
+                        with open(temp_target, mode_flag) as file:
+                            for chunk in response.iter_content(
+                                chunk_size=DOWNLOAD_CHUNK_SIZE
+                            ):
+                                if not chunk:
+                                    continue
+                                total_size += len(chunk)
+                                if size_limit and total_size > size_limit:
+                                    temp_target.unlink(missing_ok=True)
+                                    raise gr.Error(
+                                        "文件超过大小限制，请下载后使用文件上传。"
+                                    )
+                                file.write(chunk)
+                                if progress_callback:
+                                    progress_callback(total_size, expected_size)
+                        if expected_size and total_size < expected_size:
+                            raise requests.exceptions.ChunkedEncodingError(
+                                f"incomplete download: {total_size} bytes read, {expected_size} expected"
+                            )
+                        temp_target.replace(target)
+                        return str(target)
+                except requests.exceptions.RequestException as exc:
+                    last_error = exc
+                    logger.debug(
+                        "requests download failed in %s mode, attempt %s/%s: %s",
+                        mode,
+                        attempt + 1,
+                        DOWNLOAD_RETRIES,
+                        exc,
+                    )
+                    if attempt + 1 >= DOWNLOAD_RETRIES:
+                        break
+                    time.sleep(0.8 * (attempt + 1))
+            if temp_target and temp_target.exists():
+                temp_target.unlink(missing_ok=True)
         raise last_error or requests.exceptions.ConnectionError("download failed")
     except gr.Error:
         raise
     except requests.exceptions.RequestException as exc:
         proxy_hint = ""
         if download_proxy:
-            proxy_hint = "当前论文下载请求已配置 PAPER_AGENT_DOWNLOAD_PROXY；如果代理不可用，请检查代理地址或改用文件上传。"
-        elif session.trust_env and (os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")):
             proxy_hint = (
-                "当前检测到 HTTP_PROXY/HTTPS_PROXY，下载请求会经过代理；"
-                "如果代理不稳定，可以在 config.local.json 中设置 "
-                '"PAPER_AGENT_DOWNLOAD_NO_PROXY": true 后重启，或改用文件上传。'
+                "当前论文下载请求已配置 PAPER_AGENT_DOWNLOAD_PROXY，但程序也已经自动尝试其他下载路径；"
+                "如果代理链路不稳定，请检查代理地址，或先在浏览器下载 PDF 后使用文件上传。"
             )
-        retry_hint = "已自动重试下载但仍失败；可以再次点击生成，或先在浏览器下载 PDF 后使用文件上传。"
+        elif trust_env and (
+            os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
+        ):
+            proxy_hint = (
+                "当前检测到 HTTP_PROXY/HTTPS_PROXY，下载请求会尝试环境代理；"
+                '如果代理不稳定，可以在 config.local.json 中设置 "PAPER_AGENT_DOWNLOAD_NO_PROXY": true 后重启，'
+                "或改用文件上传。"
+            )
+        retry_hint = (
+            "已自动重试并切换下载路径但仍失败；可以再次点击生成，或先在浏览器下载 PDF 后使用文件上传。"
+            "如需等待更慢的站点，可提高 PAPER_AGENT_DOWNLOAD_CONNECT_TIMEOUT 或 "
+            "PAPER_AGENT_DOWNLOAD_READ_TIMEOUT。"
+        )
         raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
+
+
+def _download_timeout() -> tuple[float, float]:
+    return (
+        _get_config_float(
+            "PAPER_AGENT_DOWNLOAD_CONNECT_TIMEOUT", DOWNLOAD_CONNECT_TIMEOUT
+        ),
+        _get_config_float("PAPER_AGENT_DOWNLOAD_READ_TIMEOUT", DOWNLOAD_READ_TIMEOUT),
+    )
+
+
+def _get_config_float(key: str, default: float) -> float:
+    value = get_config_or_env(key)
+    if not value:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _request_download_candidates(
+    url: str, default_trust_env: bool, configured_proxy: str
+) -> list[tuple[str, str | None, bool]]:
+    if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_NO_PROXY"):
+        return [("noproxy", None, False)]
+
+    candidates: list[tuple[str, str | None, bool]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add(mode: str, proxy: str | None, trust_env: bool) -> None:
+        key = ("env" if trust_env else proxy or "", mode)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append((mode, proxy, trust_env))
+
+    if configured_proxy:
+        add("configured-proxy", configured_proxy, False)
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
+        value = os.environ.get(name)
+        if value:
+            add(f"env-{name}", value, False)
+    system_proxy = _windows_system_proxy()
+    if system_proxy:
+        add("windows-system-proxy", system_proxy, False)
+    add("requests-default", None, default_trust_env)
+    if default_trust_env:
+        add("noproxy", None, False)
+    return candidates
+
+
+def _set_session_proxy(session: requests.Session, proxy: str) -> None:
+    try:
+        session.proxies.update({"http": proxy, "https": proxy})
+    except AttributeError:
+        logger.debug("Session object has no proxies attribute; skipping proxy setup.")
 
 
 def _try_curl_download(
@@ -263,7 +369,12 @@ def _try_curl_download(
 
         if process.returncode == 0:
             break
-        logger.debug("curl download failed with code %s in %s mode: %s", process.returncode, mode, stderr.strip())
+        logger.debug(
+            "curl download failed with code %s in %s mode: %s",
+            process.returncode,
+            mode,
+            stderr.strip(),
+        )
     else:
         temp_target.unlink(missing_ok=True)
         return None
@@ -302,7 +413,14 @@ def _curl_proxy_candidates(configured_proxy: str) -> list[tuple[str, str | None]
 
     if configured_proxy:
         add("configured-proxy", configured_proxy)
-    for name in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+    for name in (
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ):
         value = os.environ.get(name)
         if value:
             add(f"env-{name}", value)
@@ -341,7 +459,11 @@ def _windows_system_proxy() -> str:
                 continue
             scheme, value = item.split("=", 1)
             entries[scheme.strip().lower()] = value.strip()
-        proxy = entries.get("https") or entries.get("http") or next(iter(entries.values()), "")
+        proxy = (
+            entries.get("https")
+            or entries.get("http")
+            or next(iter(entries.values()), "")
+        )
     if proxy and "://" not in proxy:
         proxy = f"http://{proxy}"
     return proxy
@@ -377,7 +499,11 @@ def _try_parallel_range_download(
 
     accept_ranges = (head.headers.get("Accept-Ranges") or "").lower()
     content_length = head.headers.get("Content-Length")
-    if "bytes" not in accept_ranges or not content_length or not content_length.isdigit():
+    if (
+        "bytes" not in accept_ranges
+        or not content_length
+        or not content_length.isdigit()
+    ):
         return None
 
     total_size = int(content_length)
@@ -392,7 +518,9 @@ def _try_parallel_range_download(
     part_dir.mkdir(parents=True, exist_ok=True)
 
     ranges: list[tuple[int, int, Path]] = []
-    part_size = (total_size + PARALLEL_DOWNLOAD_WORKERS - 1) // PARALLEL_DOWNLOAD_WORKERS
+    part_size = (
+        total_size + PARALLEL_DOWNLOAD_WORKERS - 1
+    ) // PARALLEL_DOWNLOAD_WORKERS
     for index, start in enumerate(range(0, total_size, part_size)):
         end = min(start + part_size - 1, total_size - 1)
         ranges.append((start, end, part_dir / f"part-{index:02d}"))
@@ -415,13 +543,19 @@ def _try_parallel_range_download(
             session.proxies.update({"http": download_proxy, "https": download_proxy})
         headers = dict(DOWNLOAD_HEADERS)
         headers["Range"] = f"bytes={start}-{end}"
-        with session.get(url, stream=True, timeout=(8, 60), headers=headers) as response:
+        with session.get(
+            url, stream=True, timeout=(8, 60), headers=headers
+        ) as response:
             response.raise_for_status()
             if response.status_code != 206:
-                raise requests.exceptions.RequestException(f"range request returned {response.status_code}")
+                raise requests.exceptions.RequestException(
+                    f"range request returned {response.status_code}"
+                )
             written = 0
             with open(part_path, "wb") as file:
-                for chunk in response.iter_content(chunk_size=PARALLEL_DOWNLOAD_CHUNK_SIZE):
+                for chunk in response.iter_content(
+                    chunk_size=PARALLEL_DOWNLOAD_CHUNK_SIZE
+                ):
                     if not chunk:
                         continue
                     file.write(chunk)
@@ -436,8 +570,13 @@ def _try_parallel_range_download(
     try:
         if progress_callback:
             progress_callback(0, total_size)
-        with ThreadPoolExecutor(max_workers=min(PARALLEL_DOWNLOAD_WORKERS, len(ranges))) as executor:
-            futures = [executor.submit(download_range, start, end, part_path) for start, end, part_path in ranges]
+        with ThreadPoolExecutor(
+            max_workers=min(PARALLEL_DOWNLOAD_WORKERS, len(ranges))
+        ) as executor:
+            futures = [
+                executor.submit(download_range, start, end, part_path)
+                for start, end, part_path in ranges
+            ]
             for future in as_completed(futures):
                 future.result()
 
@@ -499,7 +638,9 @@ def _download_filename(url: str, response: requests.Response) -> str:
     return os.path.splitext(os.path.basename(filename))[0] + ".pdf"
 
 
-def _download_expected_size(response: requests.Response, resume_from: int) -> int | None:
+def _download_expected_size(
+    response: requests.Response, resume_from: int
+) -> int | None:
     content_range = response.headers.get("Content-Range", "")
     if "/" in content_range:
         total = content_range.rsplit("/", 1)[-1].strip()
@@ -569,7 +710,10 @@ def summarize_file(
                 ratio = min(downloaded / max(total, 1), 1.0)
                 downloaded_mb = downloaded / 1024 / 1024
                 total_mb = total / 1024 / 1024
-                progress(0.01 + ratio * 0.09, desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB")
+                progress(
+                    0.01 + ratio * 0.09,
+                    desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB",
+                )
             else:
                 downloaded_mb = downloaded / 1024 / 1024
                 progress(0.03, desc=f"Downloading paper... {downloaded_mb:.1f} MB")
@@ -730,7 +874,12 @@ with gr.Blocks(
             )
             gr.Markdown("## 总结选项")
             page_range = gr.Radio(
-                choices=[("全部", "All"), ("第一页", "First"), ("前5页", "First 5 pages"), ("其他", "Others")],
+                choices=[
+                    ("全部", "All"),
+                    ("第一页", "First"),
+                    ("前5页", "First 5 pages"),
+                    ("其他", "Others"),
+                ],
                 label="页面",
                 value="All",
             )
@@ -763,9 +912,7 @@ with gr.Blocks(
                     return gr.update(visible=False)
 
             output_title = gr.Markdown("## 已生成论文总结", visible=False)
-            output_file_mono = gr.File(
-                label="下载 Word 总结文档", visible=False
-            )
+            output_file_mono = gr.File(label="下载 Word 总结文档", visible=False)
             recaptcha_response = gr.Textbox(
                 label="reCAPTCHA响应", elem_id="verify", visible=False
             )
