@@ -73,6 +73,7 @@ from paper_agent.paper_summary import (
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _visual_asset_guard,
+    _visual_guard_assets_to_check,
     _verification_should_block_report,
     _with_asset_references,
     _run_harness_guards,
@@ -1296,6 +1297,95 @@ def test_local_visual_asset_guard_blocks_caption_only_figure():
         issues = _local_visual_asset_issues(1, asset)
 
     assert any(issue["severity"] == "error" and "text-only" in issue["message"] for issue in issues)
+
+
+def test_chinese_title_rewrites_mixed_english_placeholder_title():
+    summary = (
+        "# complex image restoration论文精读\n\n"
+        "## 核心信息\n"
+        "- 原文标题: Restore-R1: Efficient Image Restoration Agents via Reinforcement Learning with Multimodal LLM Perceptual Feedback\n"
+        "- 中文标题: complex image restoration论文精读\n"
+        "- 研究任务: complex image restoration，从同时含有 blur、noise 等多种退化的输入图像中恢复高质量图像\n"
+        "- 方法主张: 将图像复原工具调用建模为序列决策问题，用 policy optimization 训练轻量级 agent\n\n"
+        "## 摘要\n中文摘要。"
+    )
+
+    result = _ensure_chinese_report_title(summary)
+
+    assert result.startswith("# Restore-R1：面向复杂图像复原的工具序列策略学习")
+    assert "- 中文标题: Restore-R1：面向复杂图像复原的工具序列策略学习" in result
+    assert "complex image restoration论文精读" not in result
+
+
+def test_table_caption_continuation_skips_interleaved_other_column_lines():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(58, 150, 295, 151)},
+                {"rect": fitz.Rect(58, 370, 295, 371)},
+            ]
+
+    lines = [
+        line("Table 3. Performance comparison across different reward strate-", 58, 72, 295, 82),
+        line("350", 333, 74, 343, 83),
+        line("AgenticIR", 374, 78, 407, 88),
+        line("Ours", 440, 78, 457, 88),
+        line("gies. Ours (Ni) denotes the use of the i-th no-reference quality", 58, 84, 295, 93),
+        line("assessment model for reward computation. Results are reported", 58, 95, 295, 104),
+        line("on Full-reference metrics: F1 (PSNR), F2 (SSIM), F3 (LPIPS),", 58, 106, 295, 115),
+        line("and No-reference metrics: N1 (MANIQA), N2 (CLIP-IQA), N3", 58, 117, 295, 126),
+        line("(MUSIQ), and N4 (DeQA-Score).", 58, 128, 182, 137),
+        line("Full-Reference", 125, 152, 178, 161),
+        line("No-Reference", 216, 152, 266, 161),
+        line("Rewards", 74, 158, 105, 167),
+        line("F1 ↑ F2 ↑ F3 ↓ N1 ↑ N2 ↑ N3 ↑ N4 ↑", 119, 162, 289, 173),
+        line("Ours (N1) 18.955 0.602 0.448 0.383 0.476 61.652 3.316", 74, 179, 290, 188),
+        line("Ours (N2) 18.340 0.610 0.411 0.332 0.523 60.129 3.230", 74, 190, 290, 199),
+        line("Setting II", 60, 230, 69, 264),
+        line("Ours (N3) 16.762 0.584 0.422 0.331 0.466 60.711 3.220", 74, 250, 290, 259),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 0, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert "quality" in caption_text
+    assert "DeQA-Score" in caption_text
+    assert table_rect is not None
+    assert "Ours (N1)" in table_text
+    assert "Setting II" in table_text
+    assert "Ours (N3)" in table_text
+
+
+def test_local_visual_asset_guard_blocks_header_only_table():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "header-only-table.png"
+        Image.new("RGB", (1200, 300), "white").save(table)
+        asset = PaperAsset(
+            "table",
+            7,
+            table,
+            "Table 3. Performance comparison",
+            text="Rewards | Full-Reference | No-Reference\nF1 ↑ | F2 ↑ | F3 ↓ | N1 ↑",
+        )
+
+        issues = _local_visual_asset_issues(1, asset)
+
+    assert any("caption/header" in issue["message"] for issue in issues)
+
+
+def test_visual_asset_guard_prioritizes_referenced_tables_for_model_check():
+    assets = [
+        PaperAsset("figure", 1, Path("figure1.png"), "Fig. 1"),
+        PaperAsset("figure", 2, Path("figure2.png"), "Fig. 2"),
+        PaperAsset("table", 3, Path("table3.png"), "Table 3", text="A 1 2\nB 3 4"),
+    ]
+    summary = "[[ASSET:1]]\n[[ASSET:2]]\n[[ASSET:3]]"
+
+    selected = _visual_guard_assets_to_check(summary, assets)
+
+    assert selected[0][0] == 3
 
 
 def test_formula_reference_keeps_original_paper_number():

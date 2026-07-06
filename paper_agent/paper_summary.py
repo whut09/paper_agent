@@ -4,6 +4,7 @@ import asyncio
 import base64
 import html
 import json
+import logging
 import os
 import re
 import shutil
@@ -37,6 +38,7 @@ from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy
 from paper_agent.schemas.evidence import Claim as _Claim, ClaimGrounding as _ClaimGrounding, Evidence as _Evidence, EvidenceMap as _EvidenceMap
 from paper_agent.skill_prompts import load_paper_skill_reference
 
+logger = logging.getLogger(__name__)
 _TEXTELLER_FAILED = False
 DEFAULT_MAX_ASSETS = 13
 DEFAULT_FIGURE_ASSET_LIMIT = 5
@@ -539,6 +541,7 @@ class ReviseReport(_PaperWorkflowNode):
                 "patch_suggestions": len(context.verification.patch_suggestions),
             }
         )
+        _record_harness_learnings(context)
         if decision == _GateDecision.REVISE:
             return _revise_report_once(context)
         if decision == _GateDecision.BLOCK:
@@ -1925,6 +1928,8 @@ def _line_looks_section_heading(text: str) -> bool:
         return False
     if _caption_is_table(stripped) or _caption_is_figure(stripped):
         return True
+    if re.fullmatch(r"(?i)setting\s+[ivxlcdm\d]+", stripped):
+        return False
     stripped = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", stripped)
     if len(stripped) > 90:
         return False
@@ -2093,7 +2098,7 @@ def _caption_text_and_rect(
     left, right = _caption_column_bounds(page, caption_line.rect)
     caption_lines = [caption_line]
     previous = caption_line
-    for next_line in lines[caption_index + 1 : caption_index + 4]:
+    for next_line in lines[caption_index + 1 : caption_index + 14]:
         if next_line.rect.y0 < previous.rect.y0:
             continue
         if not _line_belongs_to_column(next_line.rect, left, right, min_overlap=0.35):
@@ -2114,7 +2119,7 @@ def _caption_text_and_rect(
             if len(caption_lines) >= 1 and not _line_looks_caption_continuation(next_line.text):
                 break
         if kind == "table":
-            if len(caption_lines) >= 4:
+            if len(caption_lines) >= 7:
                 break
             if len(caption_lines) >= 2 and not _line_looks_caption_continuation(next_line.text):
                 break
@@ -2844,12 +2849,12 @@ def record_summary_correction(
     """Store user feedback as correction memory for future paper summaries."""
     normalized_paper_id = _paper_memory_id(paper_id)
     memory = CorrectionMemory(
-        paper_id=normalized_paper_id,
+        paper_id="global" if _normalize_memory_scope(scope) == "global" else normalized_paper_id,
         original=_clean_xml_text(original).strip(),
         corrected=_clean_xml_text(corrected).strip(),
         note=_clean_xml_text(note).strip(),
         category=_clean_xml_text(category).strip() or "summary",
-        scope="paper",
+        scope=_normalize_memory_scope(scope) or "paper",
         confidence=_clamped_confidence(confidence),
         created_at=datetime.now(timezone.utc).isoformat(),
     )
@@ -4525,6 +4530,101 @@ def _verification_warning_messages(verification: VerificationResult) -> list[str
     return warnings
 
 
+def _record_harness_learnings(context: _PaperWorkflowContext) -> None:
+    if not _auto_harness_learning_enabled() or context.verification is None:
+        return
+    paper_id = context.paper_title or context.paper_name or context.input_path or "global"
+    entries: list[tuple[str, str, str, str]] = []
+    for failure in context.verification.hard_failures[:6]:
+        reason = failure.get("reason", "") or failure.get("message", "")
+        failure_type = failure.get("type", "hard_failure")
+        rule = _learning_rule_for_issue(failure_type, reason)
+        if rule:
+            entries.append(("verification", failure_type, reason, rule))
+    for suggestion in context.verification.patch_suggestions[:6]:
+        operation = suggestion.get("operation", "patch")
+        target = suggestion.get("target", "") or suggestion.get("reason", "")
+        if target:
+            entries.append(("summary", operation, target, f"自动应用 verifier patch：{operation}，目标：{target[:160]}"))
+    for guard in context.guard_results:
+        for message in list(guard.errors)[:4] + list(guard.warnings)[:3]:
+            rule = _learning_rule_for_issue(guard.name, message)
+            if rule:
+                category = "extraction" if "Asset" in guard.name else "verification"
+                entries.append((category, guard.name, message, rule))
+    for category, original, corrected, note in entries[:10]:
+        _record_correction_once(
+            paper_id,
+            original=original,
+            corrected=corrected,
+            note=note,
+            category=category,
+            scope="domain",
+            confidence=0.72,
+        )
+
+
+def _auto_harness_learning_enabled() -> bool:
+    raw = _first_value({}, "PAPER_AGENT_AUTO_LEARN")
+    return not raw or _truthy(raw)
+
+
+def _learning_rule_for_issue(issue_type: str, message: str) -> str:
+    text = _clean_xml_text(f"{issue_type}: {message}").strip()
+    lowered = text.lower()
+    if not text:
+        return ""
+    if "table" in lowered and any(token in lowered for token in ("caption", "header", "body", "crop", "resolution")):
+        return "表格截图必须包含表题、表头和至少两行数值主体；只截到 caption/表头或低分辨率表格时应重裁剪或剔除该 asset。"
+    if "mixed_figure_table" in lowered or ("figure" in lowered and "table" in lowered and "crop" in lowered):
+        return "图和表必须作为独立 asset 截取；如果一个截图同时包含图、表或正文，应阻断并重新定位。"
+    if "figure" in lowered and any(token in lowered for token in ("caption", "text-only", "too shallow", "missing")):
+        return "图截图必须包含图主体和必要 caption；caption-only、正文-only 或主体缺失的图片不能插入 Word。"
+    if "title" in lowered or "标题" in text:
+        return "中文标题必须是自然中文，可保留方法名，但不能使用英文任务短语加“论文精读”的半翻译标题。"
+    if "asset" in lowered:
+        return "正文图表引用必须与 asset manifest 的 kind、编号和原始 caption 对齐，发现不匹配时先修正文案或移除 marker。"
+    if "missing required section" in lowered or "format guard" in lowered:
+        return "最终报告必须在生成 Word 前补齐必需章节，并确保每个章节有可读中文内容。"
+    return ""
+
+
+def _record_correction_once(
+    paper_id: str,
+    *,
+    original: str,
+    corrected: str,
+    note: str,
+    category: str,
+    scope: str,
+    confidence: float,
+) -> None:
+    normalized_original = _normalize_memory_text(original)
+    normalized_corrected = _normalize_memory_text(corrected)
+    if not normalized_original and not normalized_corrected:
+        return
+    try:
+        existing = _read_all_correction_memories()
+        for memory in existing:
+            if (
+                _normalize_memory_text(memory.original) == normalized_original
+                and _normalize_memory_text(memory.corrected) == normalized_corrected
+                and memory.category == category
+            ):
+                return
+        record_summary_correction(
+            paper_id,
+            original,
+            corrected,
+            note=note,
+            category=category,
+            scope=scope,
+            confidence=confidence,
+        )
+    except Exception as exc:
+        logger.debug("failed to record harness learning: %s", exc)
+
+
 def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     if context.verification is None:
         raise ValueError("Revision requires a verification report.")
@@ -4758,13 +4858,14 @@ def _visual_asset_guard(
     if not _visual_asset_guard_enabled():
         return _guard_result("Visual Asset Guard", metrics={"skipped": "disabled"})
 
+    local_selected = _local_visual_guard_assets_to_check(summary, assets)
     selected = _visual_guard_assets_to_check(summary, assets)
-    if not selected:
+    if not local_selected and not selected:
         return _guard_result("Visual Asset Guard", metrics={"checked": 0})
 
     errors: list[str] = []
     warnings: list[str] = []
-    for asset_id, asset in selected:
+    for asset_id, asset in local_selected:
         for issue in _local_visual_asset_issues(asset_id, asset):
             severity = issue.get("severity", "warning")
             message = issue.get("message", "")
@@ -4778,7 +4879,12 @@ def _visual_asset_guard(
             "Visual Asset Guard",
             errors=errors,
             warnings=warnings,
-            metrics={"checked": 0, "selected": len(selected), "model_skipped": "no_client"},
+            metrics={
+                "checked": 0,
+                "selected": len(selected),
+                "local_checked": len(local_selected),
+                "model_skipped": "no_client",
+            },
         )
 
     checked = 0
@@ -4821,7 +4927,7 @@ def _visual_asset_guard(
         "Visual Asset Guard",
         errors=errors,
         warnings=warnings,
-        metrics={"checked": checked, "selected": len(selected)},
+        metrics={"checked": checked, "selected": len(selected), "local_checked": len(local_selected)},
     )
 
 
@@ -4859,7 +4965,30 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
                 "message": f"asset {asset_id} table crop resolution is too low ({width}x{height}); recapture at higher scale before inserting into Word",
             }
         )
+    if asset.kind == "table" and _table_asset_text_looks_incomplete(asset, width, height):
+        issues.append(
+            {
+                "severity": "error",
+                "message": f"asset {asset_id} table crop appears to contain only caption/header or lacks numeric body rows; recapture the full table body before inserting into Word",
+            }
+        )
     return issues
+
+
+def _table_asset_text_looks_incomplete(asset: PaperAsset, width: int, height: int) -> bool:
+    text = _clean_xml_text(asset.text or "")
+    if not text.strip():
+        return width >= 700 and height < 420
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    numeric_rows = [line for line in lines if len(re.findall(r"\d+(?:\.\d+)?", line)) >= 2]
+    header_like_rows = [
+        line
+        for line in lines
+        if re.search(r"(?i)\b(?:method|reward|metric|full-reference|no-reference|psnr|ssim|lpips|maniqa)\b", line)
+    ]
+    if len(numeric_rows) < 2 and width >= 700 and height < 520:
+        return True
+    return len(lines) <= 2 and bool(header_like_rows) and len(numeric_rows) < 2
 
 
 def _image_looks_text_only(path: Path) -> bool:
@@ -4892,6 +5021,18 @@ def _visual_asset_guard_enabled() -> bool:
     return not raw or _truthy(raw)
 
 
+def _local_visual_guard_assets_to_check(summary: str, assets: list[PaperAsset]) -> list[tuple[int, PaperAsset]]:
+    if not assets:
+        return []
+    referenced = {
+        int(match.group(1))
+        for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", summary)
+        if 1 <= int(match.group(1)) <= len(assets)
+    }
+    ids = sorted(referenced) if referenced else list(range(1, len(assets) + 1))
+    return [(asset_id, assets[asset_id - 1]) for asset_id in ids]
+
+
 def _visual_guard_assets_to_check(summary: str, assets: list[PaperAsset]) -> list[tuple[int, PaperAsset]]:
     max_assets = _visual_guard_max_assets()
     referenced: list[int] = []
@@ -4900,6 +5041,13 @@ def _visual_guard_assets_to_check(summary: str, assets: list[PaperAsset]) -> lis
         if 1 <= asset_id <= len(assets) and asset_id not in referenced:
             referenced.append(asset_id)
     ordered = referenced or list(range(1, len(assets) + 1))
+    ordered = sorted(
+        ordered,
+        key=lambda asset_id: (
+            {"table": 0, "figure": 1, "formula": 2}.get(assets[asset_id - 1].kind, 3),
+            ordered.index(asset_id),
+        ),
+    )
     result: list[tuple[int, PaperAsset]] = []
     for asset_id in ordered:
         asset = assets[asset_id - 1]
@@ -6290,6 +6438,8 @@ def _title_needs_chinese_rewrite(title: str) -> bool:
         return True
     cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", title))
     ascii_letters = len(re.findall(r"[A-Za-z]", title))
+    if _mixed_english_placeholder_title(title):
+        return True
     if re.search(r"的(?:将|本文|论文|该文|研究)", title) or title.endswith("的"):
         return True
     return cjk_chars < 2 and ascii_letters >= 8
@@ -6301,6 +6451,8 @@ def _looks_like_usable_chinese_title(title: str) -> bool:
         return False
     if len(re.findall(r"[\u4e00-\u9fff]", title)) < 2:
         return False
+    if _mixed_english_placeholder_title(title):
+        return False
     if _core_info_line_is_unspecified(title):
         return False
     if re.search(r"的(?:将|本文|论文|该文|研究)", title) or title.endswith("的"):
@@ -6308,11 +6460,30 @@ def _looks_like_usable_chinese_title(title: str) -> bool:
     return True
 
 
+def _mixed_english_placeholder_title(title: str) -> bool:
+    title = _clean_xml_text(title).strip()
+    if not title:
+        return False
+    if re.search(r"[A-Za-z][A-Za-z -]{6,}(?:论文精读|论文笔记|精读)$", title):
+        return True
+    if re.search(r"(?:paper|summary|reading|analysis)\s*(?:论文|精读|笔记)", title, flags=re.IGNORECASE):
+        return True
+    cjk_chars = len(re.findall(r"[\u4e00-\u9fff]", title))
+    ascii_letters = len(re.findall(r"[A-Za-z]", title))
+    tail = re.split(r"[：:|｜]", title, 1)[-1] if re.search(r"[：:|｜]", title) else title
+    tail_cjk = len(re.findall(r"[\u4e00-\u9fff]", tail))
+    if tail_cjk >= 6:
+        return False
+    return cjk_chars <= 6 and ascii_letters > max(14, cjk_chars * 2)
+
+
 def _build_chinese_title_from_core_info(text: str) -> str:
     method = _core_info_field(text, ("方法名称", "方法", "模型", "系统"))
+    if not method:
+        method = _method_name_from_original_title(text)
     task = _core_info_field(text, ("研究任务", "任务", "研究对象"))
-    idea = _core_info_field(text, ("核心思想", "主要技术"))
-    task = _shorten_core_title_phrase(task)
+    idea = _core_info_field(text, ("方法主张", "核心思想", "主要技术"))
+    task = _translate_core_task_phrase(_shorten_core_title_phrase(task))
     idea = _core_idea_title_phrase(idea)
     if method and task and idea:
         return f"{method}：面向{task}的{idea}"
@@ -6325,16 +6496,51 @@ def _build_chinese_title_from_core_info(text: str) -> str:
     return ""
 
 
+def _method_name_from_original_title(text: str) -> str:
+    original = _core_info_field(text, ("原文标题", "论文标题", "标题"))
+    original = _clean_xml_text(original).strip()
+    if not original:
+        return ""
+    match = re.match(r"^\s*([A-Za-z][A-Za-z0-9_.+\- ]{1,36})\s*[:：]", original)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+    match = re.search(r"\b([A-Z][A-Za-z0-9_.+\-]*-[A-Za-z0-9_.+\-]+)\b", original)
+    return match.group(1) if match else ""
+
+
+def _translate_core_task_phrase(text: str) -> str:
+    text = _clean_xml_text(text).strip()
+    if not text:
+        return ""
+    replacements = [
+        (r"(?i)\bcomplex image restoration\b", "复杂图像复原"),
+        (r"(?i)\bimage restoration\b", "图像复原"),
+        (r"(?i)\brestoration agents?\b", "恢复智能体"),
+        (r"(?i)\bno-reference\b", "无参考"),
+        (r"(?i)\bfull-reference\b", "全参考"),
+    ]
+    for pattern, replacement in replacements:
+        text = re.sub(pattern, replacement, text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.split(r"[，,；;。]", text, 1)[0].strip()
+    return text[:28].rstrip()
+
+
 def _core_idea_title_phrase(text: str) -> str:
     text = _clean_xml_text(text).strip()
     if not text:
         return ""
+    lowered = text.lower()
+    if "policy optimization" in lowered and ("perceptual" in lowered or "reward" in lowered):
+        return "感知反馈驱动的策略优化"
     if "慢速规划" in text and "快速" in text and "记忆" in text:
         return "慢速规划与快速记忆执行框架"
     if "规划" in text and "记忆" in text:
         return "规划与记忆执行框架"
     if "长时序决策" in text and "规划" in text:
         return "长时序规划框架"
+    if "工具" in text and "序列" in text:
+        return "工具序列策略学习"
     match = re.search(r"(?:用|通过|采用)([^，,；;。]{4,32})", text)
     if match:
         return _shorten_core_title_phrase(match.group(1))
