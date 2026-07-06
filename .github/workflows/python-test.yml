@@ -1,8 +1,8 @@
 name: Test and Build Python Package
 
 on:
-  pull_request:
   workflow_call:
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
