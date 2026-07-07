@@ -1402,10 +1402,14 @@ def test_visual_asset_failures_are_removable_revision_targets():
                 "type": "guard_failure",
                 "reason": "Visual Asset Guard: asset 5 generic table crop is unusually large (1156x678); likely includes multiple objects",
             },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 6 truncated_table: 表格主体在截图底部被明显截断，最后一行只露出上半部分，表格内容不完整，不适合插入报告。",
+            },
         ],
     )
 
-    assert _visual_asset_failure_ids(verification) == {4, 5}
+    assert _visual_asset_failure_ids(verification) == {4, 5, 6}
 
 
 def test_drop_bad_assets_rewrites_remaining_markers():

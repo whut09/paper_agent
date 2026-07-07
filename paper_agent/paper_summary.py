@@ -4702,10 +4702,19 @@ def _visual_asset_failure_is_removable(reason: str) -> bool:
             "generic table crop is unusually large",
             "mixed_figure_table",
             "multiple objects",
+            "truncated",
+            "incomplete",
+            "cut off",
+            "cropped",
             "too shallow",
             "text-only",
             "missing the figure body",
             "body before inserting",
+            "截断",
+            "不完整",
+            "裁剪",
+            "缺失",
+            "只露出",
         )
     )
 
