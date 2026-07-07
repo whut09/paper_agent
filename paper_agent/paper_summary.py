@@ -49,7 +49,7 @@ DOCX_FONT = "Microsoft YaHei"
 
 DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精读笔记助手。
 你的目标是先写一份高质量 Markdown 论文笔记，再由程序把图表截图插入 Word。
-请像顶级 AI 研究员或算法工程师写复现实验笔记一样写，不要写公众号营销文，也不要写浅层摘要。
+请像顶级 AI 研究员或算法工程师写论文精读报告一样写，不要写公众号营销文，也不要写浅层摘要。
 
 必须遵守：
 1. 证据优先：只能依据论文正文、图表标题/上下文和抽取到的表格文本写结论；原文没有提及的信息、术语、数据集、指标、模型名、应用场景或结论一律省略，不要写“原文未明确说明”“未提及”“未知”等占位句。
@@ -63,6 +63,7 @@ DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精
 9. 不要输出思考过程，不要输出 `<think>`、`<thinking>`、代码块、HTML、JSON。
 10. 关键公式必须解读，但公式本体只通过 `[[ASSET:编号]]` 截图展示。正文不要复写 LaTeX、等式、arg max/min、求和式、矩阵式或长变量表达；只写公式编号、变量含义、工程作用和对应截图占位符。
 11. 每个公式后必须有一句工程含义解释；如果没有公式截图，只写简短中文描述，不要补写完整公式字符串。
+12. 不要写“复现”“复现实验”“复现建议”“复现时应关注”等段落或句子；报告是论文精读，不是实验复现清单。
 """
 
 CRITIC_SYSTEM_PROMPT = (
@@ -122,7 +123,7 @@ FINAL_NOTE_PROMPT = """请将下面的分段阅读笔记整合为一份 DeepPape
 写真实局限，包括数据、评价、部署、复杂度、泛化或基线不足。
 
 ## 总结
-收束全文，说明这篇论文原文直接支持的结论和复现时应关注的实验点；原文没有提及的后续工作、引用价值或应用场景不要补写。
+收束全文，只说明这篇论文原文直接支持的结论、方法价值和证据边界；不要写“复现”“复现实验”“复现建议”或操作清单式段落。
 
 图表占位符规则：
 - 只能使用“可用图表截图”中列出的 `[[ASSET:编号]]`。
@@ -1280,6 +1281,8 @@ def _capture_formula_blocks_from_doc(
             text = _formula_block_text(lines, rect) or line.text
             if _formula_candidate_is_noise(text):
                 continue
+            if _formula_asset_text_looks_contaminated(text):
+                continue
             candidates.append((score, page_index, rect, text))
 
     candidates.sort(key=lambda item: (-item[0], item[1], item[2].y0))
@@ -1303,6 +1306,7 @@ def _capture_formula_blocks_from_doc(
         formula_index_by_page[page_no] = formula_index_by_page.get(page_no, 0) + 1
         path = work_dir / f"page-{page_no:03d}-formula-{formula_index_by_page[page_no]:02d}.png"
         _save_clip(doc[page_index], rect, path, padding=0)
+        _trim_formula_edge_fragments(path)
         latex = _recognize_formula_latex(path)
         caption = _formula_caption(text, latex)
         assets.append(PaperAsset("formula", page_no, path, caption, text=text, latex=latex, rect=rect))
@@ -1501,8 +1505,8 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
     left, right = _formula_column_bounds(page, anchor)
     y0 = anchor.y0
     y1 = anchor.y1
-    x0 = left
-    x1 = right
+    x0 = anchor.x0
+    x1 = anchor.x1
     anchor_mid = (anchor.y0 + anchor.y1) / 2
     for line in lines:
         line_mid = (line.rect.y0 + line.rect.y1) / 2
@@ -1516,13 +1520,27 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
         )
         if not in_formula_column and not same_row_formula_fragment:
             continue
-        if _is_formula_continuation_line(line.text) or abs(line_mid - anchor_mid) < 7:
+        line_is_anchor = _rect_overlap_fraction(anchor, line.rect) > 0.65
+        line_is_formula = (
+            line_is_anchor
+            or same_row_formula_fragment
+            or _is_formula_continuation_line(line.text)
+            or _line_has_formula_syntax(line.text)
+        )
+        if line_is_formula:
             y0 = min(y0, line.rect.y0)
             y1 = max(y1, line.rect.y1)
-            if same_row_formula_fragment:
-                x0 = min(x0, line.rect.x0 - 24)
-                x1 = max(x1, line.rect.x1 + 24)
-    return fitz.Rect(max(page.rect.x0, x0), max(0, y0), min(page.rect.x1, x1), min(page.rect.height, y1))
+            x0 = min(x0, line.rect.x0)
+            x1 = max(x1, line.rect.x1)
+    pad_x = 18.0
+    pad_top = 4.0
+    pad_bottom = 7.0
+    return fitz.Rect(
+        max(page.rect.x0, left, x0 - pad_x),
+        max(0, y0 - pad_top),
+        min(page.rect.x1, right, x1 + pad_x),
+        min(page.rect.height, y1 + pad_bottom),
+    )
 
 
 def _formula_column_bounds(page: fitz.Page, rect: fitz.Rect) -> tuple[float, float]:
@@ -1565,7 +1583,8 @@ def _is_formula_continuation_line(text: str) -> bool:
 def _formula_block_text(lines: list[TextLine], rect: fitz.Rect) -> str:
     parts = []
     for line in lines:
-        if line.rect.y1 < rect.y0 - 1 or line.rect.y0 > rect.y1 + 1:
+        line_mid = (line.rect.y0 + line.rect.y1) / 2
+        if line_mid < rect.y0 - 1 or line_mid > rect.y1 + 1:
             continue
         if line.rect.x1 < rect.x0 - 1 or line.rect.x0 > rect.x1 + 1:
             continue
@@ -2510,6 +2529,66 @@ def _save_clip(page: fitz.Page, rect: fitz.Rect, path: Path, padding: int = 8, s
     scale = max(1.0, float(scale or 2.0))
     pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip, alpha=False)
     pix.save(path)
+
+
+def _trim_formula_edge_fragments(path: Path) -> None:
+    try:
+        with Image.open(path) as image:
+            sample = image.convert("L")
+            width, height = sample.size
+            if width < 120 or height < 35:
+                return
+            pixels = sample.load()
+            threshold = max(2, int(width * 0.004))
+            content_rows = []
+            for y in range(height):
+                dark = 0
+                for x in range(width):
+                    if pixels[x, y] < 235:
+                        dark += 1
+                if dark >= threshold:
+                    content_rows.append(y)
+            if not content_rows:
+                return
+            groups = _contiguous_number_groups(content_rows)
+            if len(groups) <= 1:
+                return
+            top = 0
+            bottom = height
+            first_start, first_end = groups[0]
+            last_start, last_end = groups[-1]
+            edge_limit = max(6, int(height * 0.12))
+            max_fragment_height = max(8, int(height * 0.18))
+            if first_start <= 2 and first_end - first_start + 1 <= max_fragment_height:
+                top = min(groups[1][0] - 4, height - 1)
+            if height - 1 - last_end <= 2 and last_end - last_start + 1 <= max_fragment_height:
+                bottom = max(groups[-2][1] + 5, 1)
+            if first_start > edge_limit:
+                top = 0
+            if height - 1 - last_end > edge_limit:
+                bottom = height
+            if top <= 0 and bottom >= height:
+                return
+            if bottom - top < max(24, int(height * 0.45)):
+                return
+            image.crop((0, top, width, bottom)).save(path)
+    except Exception:
+        return
+
+
+def _contiguous_number_groups(values: list[int]) -> list[tuple[int, int]]:
+    if not values:
+        return []
+    groups: list[tuple[int, int]] = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value <= previous + 1:
+            previous = value
+            continue
+        groups.append((start, previous))
+        start = previous = value
+    groups.append((start, previous))
+    return groups
 
 
 def _table_to_text(table) -> str:
@@ -4198,6 +4277,10 @@ def _summary_quality_issues(summary: str) -> list[str]:
         "后续可结合原文",
         "后续应结合原文",
         "已被整理为中文保守表述",
+        "复现实验时应",
+        "复现时应重点关注",
+        "复现建议",
+        "复现要点",
     ]
     found_markers = [marker for marker in forbidden_markers if marker in summary]
     if found_markers:
@@ -4702,6 +4785,8 @@ def _visual_asset_failure_is_removable(reason: str) -> bool:
             "generic table crop is unusually large",
             "mixed_figure_table",
             "multiple objects",
+            "surrounding prose",
+            "formula crop",
             "truncated",
             "incomplete",
             "cut off",
@@ -5068,7 +5153,37 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
                 "message": f"asset {asset_id} table crop appears to contain only caption/header or lacks numeric body rows; recapture the full table body before inserting into Word",
             }
         )
+    if asset.kind == "formula" and _formula_asset_text_looks_contaminated(asset.text):
+        issues.append(
+            {
+                "severity": "error",
+                "message": f"asset {asset_id} formula crop contains surrounding prose fragments; recapture a tighter formula-only screenshot before inserting into Word",
+            }
+        )
     return issues
+
+
+def _formula_asset_text_looks_contaminated(text: str) -> bool:
+    cleaned = _clean_xml_text(text or "").strip()
+    if not cleaned or not _line_has_formula_syntax(cleaned):
+        return False
+    words = re.findall(r"[A-Za-z]{3,}", cleaned)
+    if len(words) >= 7:
+        return True
+    lowered = f" {cleaned.lower()} "
+    prose_fragments = (
+        " as shown",
+        " the ",
+        " and ",
+        " with ",
+        " from ",
+        " state-of-the-art",
+        " weights and",
+        " rights and",
+        " levers ",
+        " batch ",
+    )
+    return any(fragment in lowered for fragment in prose_fragments) and len(words) >= 2
 
 
 def _table_asset_text_looks_incomplete(asset: PaperAsset, width: int, height: int) -> bool:
@@ -6471,6 +6586,7 @@ def _postprocess_summary(text: str) -> str:
     text = _strip_thinking(text)
     text = _strip_markdown_fences(text)
     text = _strip_preface_before_markdown_report(text)
+    text = _remove_reproduction_advice(text)
     text = _textualize_latex(text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -6496,6 +6612,7 @@ def _normalize_final_sections(text: str) -> str:
     text = re.sub(r"(?m)^##\s*我的笔记\s*$", "## 总结", text)
     text = re.sub(r"(?ms)(?:^|\n)##\s*引用\s*\n.*?(?=\n## |\Z)", "\n", text)
     text = _remove_figure_reading_sections(text)
+    text = _remove_reproduction_advice(text)
     text = _clean_core_info_section(text)
     text = _remove_unspecified_placeholders(text)
     text = _remove_empty_sections(text)
@@ -6503,6 +6620,53 @@ def _normalize_final_sections(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = _ensure_chinese_report_title(text)
     return text.strip()
+
+
+def _remove_reproduction_advice(text: str) -> str:
+    paragraphs = re.split(r"(\n{2,})", text)
+    kept: list[str] = []
+    for part in paragraphs:
+        if part.startswith("\n"):
+            kept.append(part)
+            continue
+        stripped = part.strip()
+        if not stripped:
+            kept.append(part)
+            continue
+        if _paragraph_is_reproduction_advice(stripped):
+            continue
+        cleaned = _remove_reproduction_sentences(part)
+        if cleaned.strip():
+            kept.append(cleaned)
+    result = "".join(kept)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
+def _paragraph_is_reproduction_advice(paragraph: str) -> bool:
+    if paragraph.lstrip().startswith("#"):
+        return False
+    compact = re.sub(r"\s+", "", paragraph)
+    if not re.search(r"复现|reproduc", compact, flags=re.IGNORECASE):
+        return False
+    if re.match(r"^(?:[-*]\s*)?(?:复现实验|复现建议|复现时|可复现性|复现要点)", paragraph):
+        return True
+    return bool(re.search(r"复现(?:实验)?(?:时)?(?:应|需要|建议|重点关注|要关注|可关注)", compact))
+
+
+def _remove_reproduction_sentences(text: str) -> str:
+    pieces = re.split(r"([。！？!?]\s*)", text)
+    result: list[str] = []
+    for index in range(0, len(pieces), 2):
+        sentence = pieces[index]
+        punct = pieces[index + 1] if index + 1 < len(pieces) else ""
+        if _paragraph_is_reproduction_advice((sentence + punct).strip()):
+            continue
+        result.append(sentence + punct)
+    cleaned = "".join(result)
+    cleaned = re.sub(r"结论和复现时应关注的实验点", "结论和证据边界", cleaned)
+    cleaned = re.sub(r"以及复现时应关注的实验点", "以及证据边界", cleaned)
+    return cleaned.strip()
 
 
 def _ensure_chinese_report_title(text: str) -> str:

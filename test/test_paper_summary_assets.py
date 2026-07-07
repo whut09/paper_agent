@@ -39,6 +39,7 @@ from paper_agent.paper_summary import (
     _format_guard,
     _formula_anchor_score,
     _formula_candidate_is_noise,
+    _formula_clip_rect,
     _formula_column_bounds,
     _load_correction_memories,
     _expand_table_rect_to_borders,
@@ -71,6 +72,7 @@ from paper_agent.paper_summary import (
     _styles_xml,
     _table_rect_for_caption,
     _tighten_table_rect_to_borders,
+    _trim_formula_edge_fragments,
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _visual_asset_guard,
@@ -562,7 +564,7 @@ def test_format_guard_does_not_mark_parent_section_empty_when_it_has_children():
         "## 关键结果\n实验结果比较了多个基线、约束条件和退化场景，说明方法在主要指标上取得更稳定的表现。\n\n"
         "## 深度分析\n论文证据显示主要收益来自分阶段退化建模和专家工具调度，但证据仍集中在有限任务设置中。\n\n"
         "## 局限\n实验覆盖范围有限，部署复杂度和更多退化组合下的泛化仍需要进一步验证。\n\n"
-        "## 总结\n这篇论文给出了一个围绕退化先验和专家调度的图像复原框架，复现时应重点关注阶段划分和工具选择。"
+        "## 总结\n这篇论文给出了一个围绕退化先验和专家调度的图像复原框架，结论边界主要受阶段划分和工具选择影响。"
     )
 
     assert "empty required section: 方法主线" not in result.errors
@@ -1301,6 +1303,26 @@ def test_local_visual_asset_guard_blocks_caption_only_figure():
     assert any(issue["severity"] == "error" and "text-only" in issue["message"] for issue in issues)
 
 
+def test_formula_clip_rect_excludes_same_row_prose_fragments():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    formula = line("rho = sqrt((x_pred - x_gt)^2 + (y_pred - y_gt)^2)", 225, 240, 454, 252)
+    lines = [
+        line("weights and", 72, 240, 118, 252),
+        formula,
+        line("(3)", 526, 240, 544, 252),
+        line("As shown", 573, 240, 611, 252),
+    ]
+
+    rect = _formula_clip_rect(FakePage(), formula.rect, lines)
+
+    assert rect.x0 > 190
+    assert rect.x1 < 570
+    assert rect.x0 <= formula.rect.x0
+    assert rect.x1 >= 544
+
+
 def test_chinese_title_rewrites_mixed_english_placeholder_title():
     summary = (
         "# complex image restoration论文精读\n\n"
@@ -1317,6 +1339,25 @@ def test_chinese_title_rewrites_mixed_english_placeholder_title():
     assert result.startswith("# Restore-R1：面向复杂图像复原的工具序列策略学习")
     assert "- 中文标题: Restore-R1：面向复杂图像复原的工具序列策略学习" in result
     assert "complex image restoration论文精读" not in result
+
+
+def test_normalize_final_sections_removes_reproduction_advice_paragraphs():
+    summary = (
+        "# 测试论文\n\n"
+        "## 核心信息\n"
+        "- 原文标题: Test Paper\n"
+        "- 中文标题: 测试论文\n\n"
+        "## 总结\n"
+        "论文直接支持的结论是方法在目标数据集上提升了检测效率。\n\n"
+        "复现实验时应重点关注四类细节：输入设置、训练超参数、数据增强和消融配置。\n\n"
+        "这些结论仍受实验数据集和部署环境限制。"
+    )
+
+    result = _normalize_final_sections(summary)
+
+    assert "复现" not in result
+    assert "检测效率" in result
+    assert "部署环境限制" in result
 
 
 def test_table_caption_continuation_skips_interleaved_other_column_lines():
@@ -1375,6 +1416,45 @@ def test_local_visual_asset_guard_blocks_header_only_table():
         issues = _local_visual_asset_issues(1, asset)
 
     assert any("caption/header" in issue["message"] for issue in issues)
+
+
+def test_local_visual_asset_guard_blocks_formula_with_surrounding_prose():
+    with TemporaryDirectory() as tmp:
+        formula = Path(tmp) / "bad-formula.png"
+        Image.new("RGB", (662, 49), "white").save(formula)
+        asset = PaperAsset(
+            "formula",
+            5,
+            formula,
+            "Formula screenshot (9)",
+            text="L = sum T_s [b,n,c] / sum T_s [b,n,c] (9) As shown in the-art papers",
+        )
+
+        issues = _local_visual_asset_issues(1, asset)
+
+    assert any("surrounding prose" in issue["message"] for issue in issues)
+
+
+def test_trim_formula_edge_fragments_removes_bottom_text_sliver():
+    with TemporaryDirectory() as tmp:
+        formula = Path(tmp) / "formula.png"
+        image = Image.new("L", (300, 90), 255)
+        pixels = image.load()
+        for y in range(24, 56):
+            for x in range(70, 230):
+                if (x + y) % 7 == 0:
+                    pixels[x, y] = 0
+        for y in range(84, 90):
+            for x in range(5, 295):
+                if x % 4 == 0:
+                    pixels[x, y] = 0
+        image.convert("RGB").save(formula)
+
+        _trim_formula_edge_fragments(formula)
+
+        with Image.open(formula) as trimmed:
+            assert trimmed.height < 88
+            assert trimmed.height > 45
 
 
 def test_visual_asset_guard_prioritizes_referenced_tables_for_model_check():
