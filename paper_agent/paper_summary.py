@@ -4630,7 +4630,15 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
         raise ValueError("Revision requires a verification report.")
     context.verification.revision_attempted = True
     context.revision_attempts += 1
-    if _verification_needs_full_report_rewrite(context.verification):
+    bad_asset_ids = _visual_asset_failure_ids(context.verification)
+    if bad_asset_ids:
+        revised_summary, revised_assets = _drop_assets_and_rewrite_markers(
+            context.summary,
+            context.assets,
+            bad_asset_ids,
+        )
+        context.assets = revised_assets
+    elif _verification_needs_full_report_rewrite(context.verification):
         client, config = _ensure_workflow_codex_client(context)
         revised_summary = _repair_report_format_with_codex(
             client,
@@ -4665,6 +4673,85 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
         ],
         metrics={"revision_attempts": context.revision_attempts},
     )
+
+
+def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:
+    ids: set[int] = set()
+    failures = verification.hard_failures or [
+        {"reason": error} for error in verification.errors
+    ]
+    for failure in failures:
+        reason = _clean_xml_text(
+            failure.get("reason", "") or failure.get("message", "")
+        )
+        if "Visual Asset Guard" not in reason:
+            continue
+        if not _visual_asset_failure_is_removable(reason):
+            continue
+        ids.update(int(match) for match in re.findall(r"\basset\s+(\d+)\b", reason))
+    return ids
+
+
+def _visual_asset_failure_is_removable(reason: str) -> bool:
+    lowered = reason.lower()
+    return any(
+        token in lowered
+        for token in (
+            "caption/header",
+            "lacks numeric body rows",
+            "generic table crop is unusually large",
+            "mixed_figure_table",
+            "multiple objects",
+            "too shallow",
+            "text-only",
+            "missing the figure body",
+            "body before inserting",
+        )
+    )
+
+
+def _drop_assets_and_rewrite_markers(
+    summary: str,
+    assets: list[PaperAsset],
+    remove_ids: set[int],
+) -> tuple[str, list[PaperAsset]]:
+    valid_remove_ids = {
+        asset_id for asset_id in remove_ids if 1 <= asset_id <= len(assets)
+    }
+    if not valid_remove_ids:
+        return summary, assets
+
+    mapping: dict[int, int] = {}
+    kept_assets: list[PaperAsset] = []
+    for old_id, asset in enumerate(assets, 1):
+        if old_id in valid_remove_ids:
+            continue
+        kept_assets.append(asset)
+        mapping[old_id] = len(kept_assets)
+
+    def replace_line(match: re.Match) -> str:
+        asset_id = int(match.group(1))
+        if asset_id in valid_remove_ids:
+            return ""
+        return match.group(0)
+
+    summary = re.sub(
+        r"(?m)^[ \t]*\[\[ASSET:(\d+)\]\][ \t]*(?:\r?\n)?",
+        replace_line,
+        summary,
+    )
+
+    def replace_inline(match: re.Match) -> str:
+        asset_id = int(match.group(1))
+        if asset_id in valid_remove_ids:
+            return ""
+        if asset_id not in mapping:
+            return match.group(0)
+        return f"[[ASSET:{mapping[asset_id]}]]"
+
+    summary = re.sub(r"\[\[ASSET:(\d+)\]\]", replace_inline, summary)
+    summary = re.sub(r"\n{3,}", "\n\n", summary).strip()
+    return summary, kept_assets
 
 
 def _verification_needs_full_report_rewrite(verification: VerificationResult) -> bool:

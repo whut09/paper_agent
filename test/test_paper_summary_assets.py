@@ -27,6 +27,7 @@ from paper_agent.paper_summary import (
     _correction_memory_context,
     _deduplicate_assets,
     _document_xml,
+    _drop_assets_and_rewrite_markers,
     _evidence_guard,
     _ensure_asset_markers,
     _ensure_chinese_report_title,
@@ -74,6 +75,7 @@ from paper_agent.paper_summary import (
     _visual_rect_for_caption_direction,
     _visual_asset_guard,
     _visual_guard_assets_to_check,
+    _visual_asset_failure_ids,
     _verification_should_block_report,
     _with_asset_references,
     _run_harness_guards,
@@ -1386,6 +1388,58 @@ def test_visual_asset_guard_prioritizes_referenced_tables_for_model_check():
     selected = _visual_guard_assets_to_check(summary, assets)
 
     assert selected[0][0] == 3
+
+
+def test_visual_asset_failures_are_removable_revision_targets():
+    verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 4 table crop appears to contain only caption/header or lacks numeric body rows; recapture the full table body before inserting into Word",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 5 generic table crop is unusually large (1156x678); likely includes multiple objects",
+            },
+        ],
+    )
+
+    assert _visual_asset_failure_ids(verification) == {4, 5}
+
+
+def test_drop_bad_assets_rewrites_remaining_markers():
+    assets = [
+        PaperAsset("figure", 1, Path("figure1.png"), "Fig. 1"),
+        PaperAsset("table", 2, Path("table2.png"), "Table 1"),
+        PaperAsset("figure", 3, Path("figure3.png"), "Fig. 2"),
+        PaperAsset("table", 4, Path("bad-table4.png"), "Table 2"),
+        PaperAsset("table", 5, Path("bad-table5.png"), "Table 3"),
+        PaperAsset("figure", 6, Path("figure6.png"), "Fig. 4"),
+    ]
+    summary = (
+        "## 方法主线\n"
+        "[[ASSET:1]]\n"
+        "表2说明工具集合。\n"
+        "[[ASSET:4]]\n"
+        "表3说明结果。\n"
+        "[[ASSET:5]]\n"
+        "图4仍然有效。\n"
+        "[[ASSET:6]]\n"
+    )
+
+    rewritten, kept_assets = _drop_assets_and_rewrite_markers(summary, assets, {4, 5})
+
+    assert [asset.path.name for asset in kept_assets] == [
+        "figure1.png",
+        "table2.png",
+        "figure3.png",
+        "figure6.png",
+    ]
+    assert "[[ASSET:4]]" in rewritten
+    assert "figure6.png" == kept_assets[3].path.name
+    assert "[[ASSET:5]]" not in rewritten
+    assert "表2说明工具集合" in rewritten
 
 
 def test_formula_reference_keeps_original_paper_number():
