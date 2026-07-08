@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import requests
 
-from paper_agent.gui import download_with_limit
+from paper_agent.gui import download_with_limit, _looks_like_dns_failure
 
 
 class FakeResponse:
@@ -94,6 +94,41 @@ def test_download_with_limit_reuses_existing_local_pdf_before_network():
         curl_download.assert_not_called()
         parallel_download.assert_not_called()
         session_factory.assert_not_called()
+
+
+def test_download_with_limit_reuses_near_matching_browser_download_name():
+    with TemporaryDirectory() as temp_dir:
+        output = Path(temp_dir)
+        local_pdf = output / "Mahalingam Computer Vision with a Superpixelation Camera CVPR 2026 paper (1).pdf"
+        local_pdf.write_bytes(b"%PDF-1.7\nbrowser")
+
+        with (
+            patch("paper_agent.gui._try_curl_download") as curl_download,
+            patch("paper_agent.gui._try_parallel_range_download") as parallel_download,
+            patch("paper_agent.gui.requests.Session") as session_factory,
+        ):
+            path = Path(
+                download_with_limit(
+                    "https://openaccess.thecvf.com/content/CVPR2026/papers/Mahalingam_Computer_Vision_with_a_Superpixelation_Camera_CVPR_2026_paper.pdf",
+                    output,
+                    None,
+                )
+            )
+
+        assert path.name == "Mahalingam_Computer_Vision_with_a_Superpixelation_Camera_CVPR_2026_paper.pdf"
+        assert path.read_bytes() == b"%PDF-1.7\nbrowser"
+        assert local_pdf.read_bytes() == b"%PDF-1.7\nbrowser"
+        curl_download.assert_not_called()
+        parallel_download.assert_not_called()
+        session_factory.assert_not_called()
+
+
+def test_dns_failure_detection_matches_requests_name_resolution_error():
+    exc = requests.exceptions.ConnectionError(
+        "Failed to resolve 'openaccess.thecvf.com' ([Errno 11001] getaddrinfo failed)"
+    )
+
+    assert _looks_like_dns_failure(exc)
 
 
 def test_download_with_limit_falls_back_after_proxy_timeout():

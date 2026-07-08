@@ -1,6 +1,7 @@
 import asyncio
 import cgi
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -235,6 +236,12 @@ def download_with_limit(
             "如需等待更慢的站点，可提高 PAPER_AGENT_DOWNLOAD_CONNECT_TIMEOUT 或 "
             "PAPER_AGENT_DOWNLOAD_READ_TIMEOUT。"
         )
+        if _looks_like_dns_failure(exc):
+            retry_hint += (
+                "当前错误是系统 DNS 解析失败；浏览器能打开通常是因为浏览器插件、DoH 或代理软件接管了 DNS，"
+                "但 Python/curl 不会自动继承这条链路。程序已优先搜索 paper_agent_files、Downloads 和 Desktop "
+                "里的同名或近似同名 PDF；如果浏览器能下载，把 PDF 放在这些目录后再次点击生成即可自动复用。"
+            )
         raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
 
 
@@ -274,6 +281,22 @@ def _find_local_pdf_candidate(filename: str, save_path: Path) -> Path | None:
         for candidate in matches:
             if _usable_local_pdf(candidate):
                 return candidate
+    expected_tokens = _filename_match_tokens(filename)
+    if not expected_tokens:
+        return None
+    for directory in search_dirs:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        try:
+            candidates = sorted(directory.glob("*.pdf"), key=lambda item: item.stat().st_mtime, reverse=True)
+        except OSError:
+            continue
+        for candidate in candidates[:80]:
+            if not _usable_local_pdf(candidate):
+                continue
+            candidate_tokens = _filename_match_tokens(candidate.name)
+            if expected_tokens.issubset(candidate_tokens):
+                return candidate
     return None
 
 
@@ -303,6 +326,31 @@ def _usable_local_pdf(path: Path) -> bool:
         return path.is_file() and path.suffix.lower() == ".pdf" and path.stat().st_size > 0
     except OSError:
         return False
+
+
+def _filename_match_tokens(filename: str) -> set[str]:
+    stem = Path(filename).stem.lower()
+    stem = re.sub(r"\(\d+\)$", "", stem).strip()
+    tokens = {
+        token
+        for token in re.split(r"[^a-z0-9]+", stem)
+        if len(token) >= 4 and token not in {"paper", "cvpr", "2026", "content"}
+    }
+    return tokens
+
+
+def _looks_like_dns_failure(exc: BaseException) -> bool:
+    text = repr(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "nameresolutionerror",
+            "failed to resolve",
+            "getaddrinfo failed",
+            "could not resolve host",
+            "temporary failure in name resolution",
+        )
+    )
 
 
 def _download_timeout() -> tuple[float, float]:
