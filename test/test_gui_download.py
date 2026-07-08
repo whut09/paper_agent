@@ -70,6 +70,32 @@ def test_download_with_limit_retries_and_resumes_partial_stream():
         assert not path.with_name(f"{path.name}.part").exists()
 
 
+def test_download_with_limit_reuses_existing_local_pdf_before_network():
+    with TemporaryDirectory() as temp_dir:
+        output = Path(temp_dir)
+        local_pdf = output / "Kennerley_Mind_the_Gap_Transferring_Labels_to_Align_Object_Detection_Datasets_CVPR_2026_paper.pdf"
+        local_pdf.write_bytes(b"%PDF-1.7\nlocal")
+
+        with (
+            patch("paper_agent.gui._try_curl_download") as curl_download,
+            patch("paper_agent.gui._try_parallel_range_download") as parallel_download,
+            patch("paper_agent.gui.requests.Session") as session_factory,
+        ):
+            path = Path(
+                download_with_limit(
+                    "https://openaccess.thecvf.com/content/CVPR2026/papers/Kennerley_Mind_the_Gap_Transferring_Labels_to_Align_Object_Detection_Datasets_CVPR_2026_paper.pdf",
+                    output,
+                    None,
+                )
+            )
+
+        assert path == local_pdf
+        assert path.read_bytes() == b"%PDF-1.7\nlocal"
+        curl_download.assert_not_called()
+        parallel_download.assert_not_called()
+        session_factory.assert_not_called()
+
+
 def test_download_with_limit_falls_back_after_proxy_timeout():
     class ProxyTimeoutSession:
         def __init__(self):

@@ -107,6 +107,10 @@ def download_with_limit(
         - The path of the downloaded file
     """
     url = _normalize_paper_url(url)
+    local_result = _try_local_pdf_download(url, save_path, size_limit)
+    if local_result:
+        return local_result
+
     download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
     curl_result = _try_curl_download(
         url, save_path, size_limit, download_proxy, progress_callback
@@ -232,6 +236,73 @@ def download_with_limit(
             "PAPER_AGENT_DOWNLOAD_READ_TIMEOUT。"
         )
         raise gr.Error(f"论文链接下载失败：{exc}。{retry_hint}{proxy_hint}") from exc
+
+
+def _try_local_pdf_download(url: str, save_path: Path, size_limit: int | None) -> str | None:
+    filename = _download_filename_from_url(url)
+    candidate = _find_local_pdf_candidate(filename, save_path)
+    if candidate is None:
+        return None
+    if size_limit and candidate.stat().st_size > size_limit:
+        raise gr.Error("文件超过大小限制，请下载后使用文件上传。")
+    save_path.mkdir(parents=True, exist_ok=True)
+    target = save_path / filename
+    try:
+        if candidate.resolve() == target.resolve():
+            logger.info("Using existing local PDF for download URL: %s", candidate)
+            return str(candidate)
+    except OSError:
+        pass
+    shutil.copy2(candidate, target)
+    logger.info("Reusing local PDF %s for download URL.", candidate)
+    return str(target)
+
+
+def _find_local_pdf_candidate(filename: str, save_path: Path) -> Path | None:
+    search_dirs = _local_pdf_search_dirs(save_path)
+    for directory in search_dirs:
+        candidate = directory / filename
+        if _usable_local_pdf(candidate):
+            return candidate
+    for directory in search_dirs:
+        if not directory.exists() or not directory.is_dir():
+            continue
+        try:
+            matches = sorted(directory.glob(filename))
+        except OSError:
+            continue
+        for candidate in matches:
+            if _usable_local_pdf(candidate):
+                return candidate
+    return None
+
+
+def _local_pdf_search_dirs(save_path: Path) -> list[Path]:
+    dirs = [
+        save_path,
+        Path.cwd() / "paper_agent_files",
+        Path.home() / "Downloads",
+        Path.home() / "Desktop",
+    ]
+    result: list[Path] = []
+    seen: set[str] = set()
+    for directory in dirs:
+        try:
+            key = str(directory.resolve()).lower()
+        except OSError:
+            key = str(directory).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(directory)
+    return result
+
+
+def _usable_local_pdf(path: Path) -> bool:
+    try:
+        return path.is_file() and path.suffix.lower() == ".pdf" and path.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def _download_timeout() -> tuple[float, float]:
