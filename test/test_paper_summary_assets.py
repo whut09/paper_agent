@@ -1486,10 +1486,44 @@ def test_visual_asset_failures_are_removable_revision_targets():
                 "type": "guard_failure",
                 "reason": "Visual Asset Guard: asset 6 truncated_table: 表格主体在截图底部被明显截断，最后一行只露出上半部分，表格内容不完整，不适合插入报告。",
             },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 7 missing_table_body: 截图声明为表格且包含 Table 6 caption，但未显示表格主体。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 7 irrelevant_text: 截图主要包含大段正文段落和行内引用，影响作为表格插入报告的阅读。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 8 caption_truncated: 截图底部的 Figure 2 caption 被截断，最后一行在句中结束，作为报告插图会呈现不完整说明。",
+            },
         ],
     )
 
-    assert _visual_asset_failure_ids(verification) == {4, 5, 6}
+    assert _visual_asset_failure_ids(verification) == {4, 5, 6, 7, 8}
+
+
+def test_visual_asset_failure_ids_handle_kennerley_visual_guard_regression():
+    verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 6 missing_table_body: 截图声明为表格且包含 Table 6 caption，但未显示表格主体。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 6 irrelevant_text: 截图主要包含大段正文段落和行内引用，影响作为表格插入报告的阅读。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 2 caption_truncated: 截图底部的 Figure 2 caption 被截断，最后一行在句中结束，作为报告插图会呈现不完整说明。",
+            },
+        ],
+    )
+
+    assert _visual_asset_failure_ids(verification) == {2, 6}
 
 
 def test_drop_bad_assets_rewrites_remaining_markers():

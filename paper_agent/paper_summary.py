@@ -4783,6 +4783,13 @@ def _visual_asset_failure_is_removable(reason: str) -> bool:
             "caption/header",
             "lacks numeric body rows",
             "generic table crop is unusually large",
+            "missing_table_body",
+            "missing table body",
+            "irrelevant_text",
+            "irrelevant content",
+            "irrelevant_content",
+            "caption_truncated",
+            "partial_caption",
             "mixed_figure_table",
             "multiple objects",
             "surrounding prose",
@@ -4800,6 +4807,10 @@ def _visual_asset_failure_is_removable(reason: str) -> bool:
             "裁剪",
             "缺失",
             "只露出",
+            "未显示表格主体",
+            "大段正文",
+            "无关内容",
+            "图题",
         )
     )
 
