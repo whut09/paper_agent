@@ -19,12 +19,13 @@ import requests
 from gradio_pdf import PDF
 import logging
 
-from paper_agent import __version__
+from paper_agent import __version__, sanitize_no_proxy_env
 from paper_agent.config import ConfigManager
 from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
 from paper_agent.harness.workflow import summarize_paper
 
 logger = logging.getLogger(__name__)
+sanitize_no_proxy_env()
 
 # The following variable associate strings with page ranges
 page_map = {
@@ -112,7 +113,7 @@ def download_with_limit(
     if local_result:
         return local_result
 
-    download_proxy = get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY")
+    download_proxy = _download_proxy_config()
     curl_result = _try_curl_download(
         url, save_path, size_limit, download_proxy, progress_callback
     )
@@ -220,7 +221,8 @@ def download_with_limit(
         proxy_hint = ""
         if download_proxy:
             proxy_hint = (
-                "当前论文下载请求已配置 PAPER_AGENT_DOWNLOAD_PROXY，但程序也已经自动尝试其他下载路径；"
+                "当前论文下载请求已配置 PAPER_AGENT_DOWNLOAD_PROXY/PAPER_AGENT_DOWNLOAD_PROXIES，"
+                "程序已自动展开并尝试 http、https、socks5h、socks5 等代理协议；"
                 "如果代理链路不稳定，请检查代理地址，或先在浏览器下载 PDF 后使用文件上传。"
             )
         elif trust_env and (
@@ -373,6 +375,14 @@ def _get_config_float(key: str, default: float) -> float:
     return parsed if parsed > 0 else default
 
 
+def _download_proxy_config() -> str:
+    values = [
+        get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXIES"),
+        get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY"),
+    ]
+    return " ".join(value for value in values if value)
+
+
 def _request_download_candidates(
     url: str, default_trust_env: bool, configured_proxy: str
 ) -> list[tuple[str, str | None, bool]]:
@@ -389,8 +399,8 @@ def _request_download_candidates(
         seen.add(key)
         candidates.append((mode, proxy, trust_env))
 
-    if configured_proxy:
-        add("configured-proxy", configured_proxy, False)
+    for mode, proxy in _configured_proxy_candidates(configured_proxy):
+        add(mode, proxy, False)
     for name in (
         "HTTPS_PROXY",
         "https_proxy",
@@ -400,11 +410,11 @@ def _request_download_candidates(
         "all_proxy",
     ):
         value = os.environ.get(name)
-        if value:
-            add(f"env-{name}", value, False)
+        for mode, proxy in _configured_proxy_candidates(value or "", f"env-{name}"):
+            add(mode, proxy, False)
     system_proxy = _windows_system_proxy()
-    if system_proxy:
-        add("windows-system-proxy", system_proxy, False)
+    for mode, proxy in _configured_proxy_candidates(system_proxy, "windows-system-proxy"):
+        add(mode, proxy, False)
     add("requests-default", None, default_trust_env)
     if default_trust_env:
         add("noproxy", None, False)
@@ -416,6 +426,45 @@ def _set_session_proxy(session: requests.Session, proxy: str) -> None:
         session.proxies.update({"http": proxy, "https": proxy})
     except AttributeError:
         logger.debug("Session object has no proxies attribute; skipping proxy setup.")
+
+
+def _configured_proxy_candidates(raw_value: str, label: str = "configured-proxy") -> list[tuple[str, str]]:
+    proxies = _split_proxy_config(raw_value)
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index, proxy in enumerate(proxies, 1):
+        for variant_label, variant in _proxy_protocol_variants(proxy):
+            normalized = variant.strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            suffix = f"-{index}" if len(proxies) > 1 else ""
+            candidates.append((f"{label}{suffix}-{variant_label}", variant))
+    return candidates
+
+
+def _split_proxy_config(raw_value: str) -> list[str]:
+    result: list[str] = []
+    for item in re.split(r"[\s,;]+", raw_value or ""):
+        proxy = item.strip()
+        if proxy:
+            result.append(proxy)
+    return result
+
+
+def _proxy_protocol_variants(proxy: str) -> list[tuple[str, str]]:
+    proxy = proxy.strip()
+    if not proxy:
+        return []
+    parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+    if not parsed.netloc:
+        return [("as-is", proxy)]
+    original = proxy if "://" in proxy else f"http://{proxy}"
+    variants = [("as-is", original)]
+    if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_EXPAND_PROXY_VARIANTS", True):
+        for scheme in ("http", "https", "socks5h", "socks5"):
+            variants.append((scheme, parsed._replace(scheme=scheme).geturl()))
+    return variants
 
 
 def _try_curl_download(
@@ -530,8 +579,8 @@ def _curl_proxy_candidates(configured_proxy: str) -> list[tuple[str, str | None]
         candidates.append((mode, proxy))
         seen_modes.add(mode)
 
-    if configured_proxy:
-        add("configured-proxy", configured_proxy)
+    for mode, proxy in _configured_proxy_candidates(configured_proxy):
+        add(mode, proxy)
     for name in (
         "HTTPS_PROXY",
         "https_proxy",
@@ -541,11 +590,11 @@ def _curl_proxy_candidates(configured_proxy: str) -> list[tuple[str, str | None]
         "all_proxy",
     ):
         value = os.environ.get(name)
-        if value:
-            add(f"env-{name}", value)
+        for mode, proxy in _configured_proxy_candidates(value or "", f"env-{name}"):
+            add(mode, proxy)
     system_proxy = _windows_system_proxy()
-    if system_proxy:
-        add("windows-system-proxy", system_proxy)
+    for mode, proxy in _configured_proxy_candidates(system_proxy, "windows-system-proxy"):
+        add(mode, proxy)
 
     add("curl-default", None)
     return candidates
@@ -599,32 +648,45 @@ def _try_parallel_range_download(
     if get_config_bool_or_env("PAPER_AGENT_DISABLE_PARALLEL_DOWNLOAD"):
         return None
 
-    head_session = requests.Session()
-    head_session.trust_env = trust_env
-    if download_proxy:
-        head_session.proxies.update({"http": download_proxy, "https": download_proxy})
+    head = None
+    selected_mode = ""
+    selected_proxy: str | None = None
+    selected_trust_env = trust_env
+    for mode, proxy, candidate_trust_env in _request_download_candidates(url, trust_env, download_proxy):
+        head_session = requests.Session()
+        head_session.trust_env = candidate_trust_env
+        if proxy:
+            _set_session_proxy(head_session, proxy)
+        try:
+            candidate_head = head_session.head(
+                url,
+                allow_redirects=True,
+                timeout=(6, 20),
+                headers=DOWNLOAD_HEADERS,
+            )
+            candidate_head.raise_for_status()
+        except (AttributeError, requests.exceptions.RequestException) as exc:
+            logger.debug("Parallel download HEAD failed in %s mode, falling back: %s", mode, exc)
+            continue
+        accept_ranges = (candidate_head.headers.get("Accept-Ranges") or "").lower()
+        content_length = candidate_head.headers.get("Content-Length")
+        if (
+            "bytes" not in accept_ranges
+            or not content_length
+            or not content_length.isdigit()
+        ):
+            logger.debug("Parallel download skipped in %s mode: server did not advertise byte ranges.", mode)
+            continue
+        head = candidate_head
+        selected_mode = mode
+        selected_proxy = proxy
+        selected_trust_env = candidate_trust_env
+        break
 
-    try:
-        head = head_session.head(
-            url,
-            allow_redirects=True,
-            timeout=(6, 20),
-            headers=DOWNLOAD_HEADERS,
-        )
-        head.raise_for_status()
-    except (AttributeError, requests.exceptions.RequestException) as exc:
-        logger.debug("Parallel download HEAD failed, falling back: %s", exc)
+    if head is None:
         return None
 
-    accept_ranges = (head.headers.get("Accept-Ranges") or "").lower()
-    content_length = head.headers.get("Content-Length")
-    if (
-        "bytes" not in accept_ranges
-        or not content_length
-        or not content_length.isdigit()
-    ):
-        return None
-
+    content_length = head.headers.get("Content-Length") or "0"
     total_size = int(content_length)
     if total_size <= PARALLEL_DOWNLOAD_CHUNK_SIZE:
         return None
@@ -657,9 +719,9 @@ def _try_parallel_range_download(
 
     def download_range(start: int, end: int, part_path: Path) -> None:
         session = requests.Session()
-        session.trust_env = trust_env
-        if download_proxy:
-            session.proxies.update({"http": download_proxy, "https": download_proxy})
+        session.trust_env = selected_trust_env
+        if selected_proxy:
+            _set_session_proxy(session, selected_proxy)
         headers = dict(DOWNLOAD_HEADERS)
         headers["Range"] = f"bytes={start}-{end}"
         with session.get(
@@ -689,6 +751,7 @@ def _try_parallel_range_download(
     try:
         if progress_callback:
             progress_callback(0, total_size)
+        logger.info("Downloading paper with parallel range requests (%s).", selected_mode)
         with ThreadPoolExecutor(
             max_workers=min(PARALLEL_DOWNLOAD_WORKERS, len(ranges))
         ) as executor:
@@ -722,7 +785,7 @@ def _download_should_trust_env(url: str) -> bool:
         return False
     if get_config_bool_or_env("PAPER_AGENT_DOWNLOAD_USE_ENV_PROXY"):
         return True
-    if get_config_or_env("PAPER_AGENT_DOWNLOAD_PROXY"):
+    if _download_proxy_config():
         return False
     host = urlparse(url).netloc.lower()
     if host.endswith("arxiv.org"):

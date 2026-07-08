@@ -1,10 +1,17 @@
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import requests
 
-from paper_agent.gui import download_with_limit, _looks_like_dns_failure
+from paper_agent import sanitize_no_proxy_env
+from paper_agent.gui import (
+    download_with_limit,
+    _configured_proxy_candidates,
+    _download_proxy_config,
+    _looks_like_dns_failure,
+)
 
 
 class FakeResponse:
@@ -131,6 +138,41 @@ def test_dns_failure_detection_matches_requests_name_resolution_error():
     assert _looks_like_dns_failure(exc)
 
 
+def test_sanitize_no_proxy_env_removes_ipv6_entries(monkeypatch):
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost,::1,::1/128")
+
+    sanitize_no_proxy_env()
+
+    assert "::1" not in os.environ["no_proxy"]
+    assert "127.0.0.1" in os.environ["no_proxy"]
+
+
+def test_configured_proxy_candidates_expand_protocol_variants():
+    candidates = _configured_proxy_candidates("172.16.48.193:7897, http://backup.test:8080")
+    proxies = [proxy for _mode, proxy in candidates]
+
+    assert "http://172.16.48.193:7897" in proxies
+    assert "socks5h://172.16.48.193:7897" in proxies
+    assert "socks5://172.16.48.193:7897" in proxies
+    assert "http://backup.test:8080" in proxies
+
+
+def test_download_proxy_config_combines_primary_and_optional_proxies():
+    def fake_config(key, default=""):
+        if key == "PAPER_AGENT_DOWNLOAD_PROXIES":
+            return "http://backup.test:8080 socks5h://backup2.test:1080"
+        if key == "PAPER_AGENT_DOWNLOAD_PROXY":
+            return "http://primary.test:7890"
+        return default
+
+    with patch("paper_agent.gui.get_config_or_env", side_effect=fake_config):
+        value = _download_proxy_config()
+
+    assert "http://backup.test:8080" in value
+    assert "socks5h://backup2.test:1080" in value
+    assert "http://primary.test:7890" in value
+
+
 def test_download_with_limit_falls_back_after_proxy_timeout():
     class ProxyTimeoutSession:
         def __init__(self):
@@ -179,5 +221,5 @@ def test_download_with_limit_falls_back_after_proxy_timeout():
         assert path.read_bytes() == b"ok"
         assert sessions[0].proxies["https"] == "http://proxy.test:7890"
         assert sessions[0].calls == 3
-        assert sessions[1].proxies == {}
-        assert sessions[1].calls == 1
+        assert sessions[-1].proxies == {}
+        assert sessions[-1].calls == 1
