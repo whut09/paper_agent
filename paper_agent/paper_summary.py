@@ -532,6 +532,8 @@ class ReviseReport(_PaperWorkflowNode):
             raise ValueError("ReviseReport requires a verification report.")
         policy = _GatePolicy()
         decision = policy.decide(context.verification, context.revision_attempts)
+        if decision == _GateDecision.BLOCK and _valid_visual_asset_failure_ids(context):
+            decision = _GateDecision.REVISE
         context.gate_decision = decision.value
         context.gate_history.append(
             {
@@ -4751,11 +4753,21 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
             "revision_attempt": context.revision_attempts,
         },
         warnings=[
-            f"Verifier requested revision attempt {context.revision_attempts}/2",
+            f"Verifier requested revision attempt {context.revision_attempts}",
             *_verification_warning_messages(context.verification),
         ],
         metrics={"revision_attempts": context.revision_attempts},
     )
+
+
+def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
+    if context.verification is None:
+        return set()
+    return {
+        asset_id
+        for asset_id in _visual_asset_failure_ids(context.verification)
+        if 1 <= asset_id <= len(context.assets)
+    }
 
 
 def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:

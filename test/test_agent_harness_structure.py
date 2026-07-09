@@ -317,3 +317,39 @@ def test_workflow_blocks_after_revision_limit_and_writes_failure_report():
         assert result.verification_failed_path is not None
         assert result.verification_failed_path.exists()
         assert "Verifier Agent 未通过" in result.verification_failed_path.read_text(encoding="utf-8")
+
+
+def test_visual_asset_repair_can_continue_past_generic_revision_limit():
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=Path("."),
+        pages=None,
+        summary_language="中文",
+        codex_envs={},
+        max_assets=0,
+    )
+    context.revision_attempts = 2
+    context.summary = "图1说明流程。\n[[ASSET:1]]\n表2仍可用。\n[[ASSET:2]]"
+    context.assets = [
+        PaperAsset("figure", 1, Path("bad-figure.png"), "Fig. 1"),
+        PaperAsset("table", 2, Path("table2.png"), "Table 2"),
+    ]
+    context.verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 1 caption_truncated: 截图底部的 figure caption 明显未完整显示。",
+            }
+        ],
+    )
+
+    result = ReviseReport().run(context)
+
+    assert result.status == "warning"
+    assert context.gate_decision == "revise"
+    assert context.revision_attempts == 3
+    assert "[[ASSET:2]]" not in context.summary
+    assert "[[ASSET:1]]" in context.summary
+    assert len(context.assets) == 1
+    assert context.assets[0].path.name == "table2.png"
