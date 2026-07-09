@@ -467,7 +467,7 @@ def test_asset_guard_fails_invalid_and_mismatched_assets():
 
 def test_asset_guard_ignores_distant_reference_text_for_formula_marker():
     assets = [PaperAsset("formula", 1, Path("formula.png"), "关键公式截图：normalized advantage")]
-    summary = """如表2所示，训练配置保持一致。
+    summary = """如表3所示，训练配置保持一致。
 
 对 `k` 个 response 的 reward 做归一化，得到 normalized advantage。
 [[ASSET:1]]"""
@@ -494,6 +494,38 @@ def test_asset_guard_still_fails_adjacent_reference_kind_mismatch():
 
     assert result.status == "failed"
     assert any("kind mismatch" in error for error in result.errors)
+
+
+def test_asset_guard_fails_when_critical_table_reference_has_no_marker():
+    assets = [PaperAsset("table", 1, Path("table1.png"), "Table 1. Main results")]
+
+    result = _asset_guard("表1汇总了主要实验结果。", assets)
+
+    assert result.status == "failed"
+    assert any("表1" in error and "missing screenshot marker" in error for error in result.errors)
+
+
+def test_asset_guard_fails_when_critical_reference_missing_from_manifest():
+    assets = [PaperAsset("table", 1, Path("table1.png"), "Table 1. Main results")]
+
+    result = _asset_guard("表2展示了消融结果。", assets)
+
+    assert result.status == "failed"
+    assert any("表2" in error and "missing from asset manifest" in error for error in result.errors)
+
+
+def test_asset_guard_ignores_layout_hint_for_missing_critical_figure():
+    assets = [PaperAsset("table", 1, Path("table1.png"), "Table 1. Main results")]
+
+    result = _asset_guard("表1截图位于图1附近。\n[[ASSET:1]]", assets)
+
+    assert result.status == "passed"
+
+
+def test_asset_guard_does_not_treat_table_10_as_table_1():
+    result = _asset_guard("表10给出了补充实验。", [])
+
+    assert result.status == "passed"
 
 
 def test_mismatched_formula_marker_is_removed_from_generic_problem_text():
@@ -1624,6 +1656,31 @@ def test_formula_marker_is_not_inserted_without_explicit_numbered_reference():
 
     assert "[[ASSET:3]]" not in result
     assert "[[ASSET:1]]" in result
+
+
+def test_ensure_asset_markers_inserts_marker_after_plain_critical_table_reference():
+    assets = [PaperAsset("table", 1, Path("table1.png"), "Table 1. Main results")]
+    summary = "## 关键结果\n表1汇总了主要实验结果，能直接支撑论文的效率结论。\n"
+
+    result = _ensure_asset_markers(summary, assets)
+
+    assert "表1汇总了主要实验结果，能直接支撑论文的效率结论。\n[[ASSET:1]]" in result
+    assert _asset_guard(result, assets).status == "passed"
+
+
+def test_ensure_asset_markers_inserts_marker_after_plain_critical_figure_reference():
+    assets = [
+        PaperAsset("figure", 1, Path("figure1.png"), "Figure 1. Overview"),
+        PaperAsset("figure", 1, Path("figure2.png"), "Figure 2. Framework"),
+    ]
+    summary = "## 方法主线\nFigure 2 展示了整体框架，图1给出了问题设置。\n"
+
+    result = _ensure_asset_markers(summary, assets)
+
+    assert "[[ASSET:1]]" in result
+    assert "[[ASSET:2]]" in result
+    assert _asset_guard(result, assets).status == "passed"
+
 
 def test_formula_marker_is_inserted_after_plain_formula_reference():
     assets = [

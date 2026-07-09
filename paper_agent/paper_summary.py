@@ -5023,6 +5023,7 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
         asset = assets[asset_id - 1]
         if _asset_reference_kind_mismatch(nearby, asset):
             errors.append(f"asset id {asset_id} kind mismatch: text references {nearby[:80]!r}, manifest kind is {asset.kind}")
+    errors.extend(_critical_referenced_asset_errors(summary, assets))
     return _guard_result(
         "Asset Guard",
         errors=errors,
@@ -5031,6 +5032,100 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
             "placeholder_count": len(re.findall(r"\[\[ASSET:", summary)),
         },
     )
+
+
+def _critical_referenced_asset_errors(summary: str, assets: list[PaperAsset]) -> list[str]:
+    references = _critical_referenced_asset_keys(summary)
+    if not references:
+        return []
+    available = _critical_asset_key_map(assets)
+    used_ids = {int(match.group(1)) for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", summary)}
+    errors: list[str] = []
+    for key in sorted(references, key=_critical_asset_sort_key):
+        label = _critical_asset_label(key)
+        asset_id = available.get(key)
+        if asset_id is None:
+            errors.append(f"referenced critical asset {label} is missing from asset manifest")
+            continue
+        if asset_id not in used_ids:
+            errors.append(f"missing screenshot marker for critical referenced asset {label} ([[ASSET:{asset_id}]])")
+    return errors
+
+
+def _critical_asset_key_map(assets: list[PaperAsset]) -> dict[tuple[str, str], int]:
+    key_map: dict[tuple[str, str], int] = {}
+    for asset_id, asset in enumerate(assets, 1):
+        key = _asset_label_key(asset)
+        if key and key[1] in {"1", "2"}:
+            key_map.setdefault(key, asset_id)
+    return key_map
+
+
+def _asset_label_key(asset: PaperAsset) -> tuple[str, str] | None:
+    label = _compact_asset_label(_original_asset_label(asset))
+    match = re.match(r"^(图|表)([0-9一二三四五六七八九十]+[A-Za-z]?)$", label)
+    if not match:
+        return None
+    kind = "figure" if match.group(1) == "图" else "table"
+    number = _critical_asset_number(match.group(2))
+    if not number:
+        return None
+    return kind, number
+
+
+def _critical_referenced_asset_keys(summary: str) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    for line in summary.splitlines():
+        stripped = _clean_xml_text(line.strip())
+        if not stripped or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
+            continue
+        keys.update(_critical_referenced_asset_keys_in_text(stripped))
+    return keys
+
+
+def _critical_referenced_asset_keys_in_text(text: str) -> set[tuple[str, str]]:
+    keys: set[tuple[str, str]] = set()
+    chinese_patterns = [
+        ("table", r"表\s*([12一二])(?![0-9A-Za-z一二三四五六七八九十])"),
+        ("figure", r"图\s*([12一二])(?![0-9A-Za-z一二三四五六七八九十])"),
+    ]
+    for kind, pattern in chinese_patterns:
+        for match in re.finditer(pattern, text):
+            if _asset_reference_is_layout_hint(text, match.end()):
+                continue
+            number = _critical_asset_number(match.group(1))
+            if number:
+                keys.add((kind, number))
+    english_patterns = [
+        ("table", r"(?i)\b(?:table|tab\.)\s*([12])\b"),
+        ("figure", r"(?i)\b(?:figure|fig\.?)\s*([12])\b"),
+    ]
+    for kind, pattern in english_patterns:
+        for match in re.finditer(pattern, text):
+            if _asset_reference_is_layout_hint(text, match.end()):
+                continue
+            keys.add((kind, match.group(1)))
+    return keys
+
+
+def _asset_reference_is_layout_hint(text: str, end: int) -> bool:
+    tail = text[end : end + 8].lstrip()
+    return bool(re.match(r"(附近|周边|旁边|位置|区域|上方|下方|左侧|右侧)", tail))
+
+
+def _critical_asset_number(value: str) -> str:
+    normalized = {"一": "1", "二": "2"}.get(str(value).strip(), str(value).strip())
+    return normalized if normalized in {"1", "2"} else ""
+
+
+def _critical_asset_label(key: tuple[str, str]) -> str:
+    prefix = "图" if key[0] == "figure" else "表"
+    return f"{prefix}{key[1]}"
+
+
+def _critical_asset_sort_key(key: tuple[str, str]) -> tuple[int, int]:
+    kind_rank = 0 if key[0] == "figure" else 1
+    return kind_rank, int(key[1])
 
 
 def _remove_mismatched_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
@@ -7570,6 +7665,9 @@ def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAs
 
 def _line_mentions_asset_label(line: str, compact_label: str, pattern: str, asset: PaperAsset) -> bool:
     if re.search(pattern, line):
+        return True
+    key = _asset_label_key(asset)
+    if key and key in _critical_referenced_asset_keys_in_text(line):
         return True
     if asset.kind != "formula":
         return False
