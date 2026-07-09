@@ -84,6 +84,7 @@ def test_download_with_limit_reuses_existing_local_pdf_before_network():
         local_pdf.write_bytes(b"%PDF-1.7\nlocal")
 
         with (
+            patch("paper_agent.gui._local_pdf_search_dirs", return_value=[output]),
             patch("paper_agent.gui._try_curl_download") as curl_download,
             patch("paper_agent.gui._try_parallel_range_download") as parallel_download,
             patch("paper_agent.gui.requests.Session") as session_factory,
@@ -110,6 +111,7 @@ def test_download_with_limit_reuses_near_matching_browser_download_name():
         local_pdf.write_bytes(b"%PDF-1.7\nbrowser")
 
         with (
+            patch("paper_agent.gui._local_pdf_search_dirs", return_value=[output]),
             patch("paper_agent.gui._try_curl_download") as curl_download,
             patch("paper_agent.gui._try_parallel_range_download") as parallel_download,
             patch("paper_agent.gui.requests.Session") as session_factory,

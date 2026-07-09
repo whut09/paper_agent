@@ -4760,18 +4760,20 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
 
 def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:
     ids: set[int] = set()
-    failures = verification.hard_failures or [
-        {"reason": error} for error in verification.errors
-    ]
+    failures = verification.hard_failures or [{"reason": error} for error in verification.errors]
+    structured_hard_failures = bool(verification.hard_failures)
     for failure in failures:
         reason = _clean_xml_text(
             failure.get("reason", "") or failure.get("message", "")
         )
         if "Visual Asset Guard" not in reason:
             continue
-        if not _visual_asset_failure_is_removable(reason):
+        asset_ids = {int(match) for match in re.findall(r"\basset\s+(\d+)\b", reason)}
+        if not asset_ids:
             continue
-        ids.update(int(match) for match in re.findall(r"\basset\s+(\d+)\b", reason))
+        if not structured_hard_failures and not _visual_asset_failure_is_removable(reason):
+            continue
+        ids.update(asset_ids)
     return ids
 
 

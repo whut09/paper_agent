@@ -1526,6 +1526,46 @@ def test_visual_asset_failure_ids_handle_kennerley_visual_guard_regression():
     assert _visual_asset_failure_ids(verification) == {2, 6}
 
 
+def test_visual_asset_failure_ids_handle_tang_mixed_objects_regression():
+    verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 6 mixed_objects: 截图中同时包含表格和下方的人脸图像网格，属于两个独立对象混在同一截图中。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 6 type_mismatch: 声明类型为 table，但画面中除表格外还包含显著的图像/figure 内容，影响作为单独表格插入报告。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 7 mixed_objects: 截图中同时包含表格和下方的图像示例网格，属于两个独立对象混在一起，不适合作为单独的 table 插入报告。",
+            },
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 7 declared_type_mismatch: 声明类型为 table，但画面除表格外还包含明显的图像/figure 内容，主体不纯。",
+            },
+        ],
+    )
+
+    assert _visual_asset_failure_ids(verification) == {6, 7}
+
+
+def test_visual_asset_hard_failures_with_asset_ids_are_repairable_by_default():
+    verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Visual Asset Guard: asset 9 newly_named_visual_defect: future visual model wording should still drop the bad screenshot.",
+            },
+        ],
+    )
+
+    assert _visual_asset_failure_ids(verification) == {9}
+
+
 def test_drop_bad_assets_rewrites_remaining_markers():
     assets = [
         PaperAsset("figure", 1, Path("figure1.png"), "Fig. 1"),
