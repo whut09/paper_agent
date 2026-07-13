@@ -17,6 +17,7 @@ import gradio as gr
 import requests
 from gradio_pdf import PDF
 import logging
+from logging.handlers import RotatingFileHandler
 
 from paper_agent import __version__, sanitize_no_proxy_env
 from paper_agent.config import ConfigManager
@@ -25,6 +26,34 @@ from paper_agent.harness.workflow import summarize_paper
 
 logger = logging.getLogger(__name__)
 sanitize_no_proxy_env()
+
+GUI_LOG_PATH = Path("paper_agent_files") / "paper_agent-gui.log"
+
+
+def _configure_gui_file_logging() -> None:
+    GUI_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    resolved_path = GUI_LOG_PATH.resolve()
+    if any(
+        isinstance(handler, RotatingFileHandler)
+        and getattr(handler, "baseFilename", None) == str(resolved_path)
+        for handler in logger.handlers
+    ):
+        return
+    file_handler = RotatingFileHandler(
+        resolved_path,
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(file_handler)
+    logger.setLevel(min(logger.level or logging.INFO, logging.INFO))
+
+
+_configure_gui_file_logging()
 
 # The following variable associate strings with page ranges
 page_map = {
@@ -971,9 +1000,16 @@ def summarize_file(
             cancellation_event=cancellation_event,
         )
     except CancelledError:
+        logger.info("Summary cancelled for session %s", session_id)
         raise gr.Error("Summary cancelled")
-    except RuntimeError as exc:
-        raise gr.Error(str(exc)) from exc
+    except gr.Error as exc:
+        logger.warning("Summary request rejected for session %s: %s", session_id, exc)
+        raise gr.Error(f"{exc}\n详细日志：{GUI_LOG_PATH.resolve()}") from exc
+    except Exception as exc:
+        logger.exception("Summary failed for session %s", session_id)
+        raise gr.Error(
+            f"总结失败：{type(exc).__name__}: {exc}\n详细日志：{GUI_LOG_PATH.resolve()}"
+        ) from exc
     finally:
         with cancellation_event_lock:
             cancellation_event_map.pop(session_id, None)

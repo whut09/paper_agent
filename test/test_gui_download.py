@@ -8,6 +8,7 @@ import pytest
 
 from paper_agent import sanitize_no_proxy_env
 from paper_agent.gui import (
+    GUI_LOG_PATH,
     download_with_limit,
     _configured_proxy_candidates,
     _download_proxy_config,
@@ -100,7 +101,7 @@ def test_summarize_file_cleans_session_after_input_error():
     _clear_summary_sessions()
     state = {"session_id": None}
 
-    with pytest.raises(Exception, match="No input"):
+    with pytest.raises(Exception, match="No input") as error_info:
         summarize_file(
             "Link",
             None,
@@ -115,6 +116,7 @@ def test_summarize_file_cleans_session_after_input_error():
 
     assert state["session_id"] is None
     assert not cancellation_event_map
+    assert str(GUI_LOG_PATH.resolve()) in str(error_info.value.args[0])
 
 
 def test_download_with_limit_retries_and_resumes_partial_stream():
