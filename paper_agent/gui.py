@@ -1,4 +1,3 @@
-import asyncio
 import cgi
 import os
 import re
@@ -835,6 +834,30 @@ def _download_expected_size(
     return None
 
 
+def _cancel_active_summary_sessions(exclude_session_id=None) -> int:
+    with cancellation_event_lock:
+        active = [
+            (session_id, event)
+            for session_id, event in cancellation_event_map.items()
+            if session_id != exclude_session_id and not event.is_set()
+        ]
+    for session_id, event in active:
+        logger.info("Stopping summary for session %s", session_id)
+        event.set()
+    return len(active)
+
+
+def _start_summary_session(state: dict) -> tuple[uuid.UUID, threading.Event]:
+    if not flag_demo:
+        _cancel_active_summary_sessions()
+    session_id = uuid.uuid4()
+    cancellation_event = threading.Event()
+    with cancellation_event_lock:
+        cancellation_event_map[session_id] = cancellation_event
+    state["session_id"] = session_id
+    return session_id, cancellation_event
+
+
 def stop_summary_file(state: dict) -> None:
     """
     This function stops the summary process.
@@ -844,15 +867,13 @@ def stop_summary_file(state: dict) -> None:
 
     Returns:- None
     """
-    session_id = state["session_id"]
+    session_id = state.get("session_id")
     if session_id is None:
+        if not flag_demo:
+            _cancel_active_summary_sessions()
         return
-    if session_id in cancellation_event_map:
-        logger.info(f"Stopping summary for session {session_id}")
-        cancellation_event_map[session_id].set()
-        # 清理取消事件，允许下一次总结
-        del cancellation_event_map[session_id]
-        state["session_id"] = None
+    _cancel_active_summary_sessions()
+    state["session_id"] = None
 
 
 def summarize_file(
@@ -866,71 +887,73 @@ def summarize_file(
     state,
     progress=gr.Progress(),
 ):
-    session_id = uuid.uuid4()
-    state["session_id"] = session_id
-    cancellation_event_map[session_id] = asyncio.Event()
-
-    if flag_demo and not verify_recaptcha(recaptcha_response):
-        raise gr.Error("reCAPTCHA fail")
-
-    progress(0, desc="Preparing paper...")
-    output = Path("paper_agent_files")
-    output.mkdir(parents=True, exist_ok=True)
-
-    if file_type == "File":
-        if not file_input:
-            raise gr.Error("No input")
-        progress(0.03, desc="Preparing uploaded paper...")
-        file_path = shutil.copy(file_input, output)
-    else:
-        if not link_input:
-            raise gr.Error("No input")
-        progress(0.01, desc="Downloading paper...")
-
-        def download_progress(downloaded: int, total: int | None) -> None:
-            if total:
-                ratio = min(downloaded / max(total, 1), 1.0)
-                downloaded_mb = downloaded / 1024 / 1024
-                total_mb = total / 1024 / 1024
-                progress(
-                    0.01 + ratio * 0.09,
-                    desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB",
-                )
-            else:
-                downloaded_mb = downloaded / 1024 / 1024
-                progress(0.03, desc=f"Downloading paper... {downloaded_mb:.1f} MB")
-
-        file_path = download_with_limit(
-            link_input,
-            output,
-            5 * 1024 * 1024 if flag_demo else None,
-            progress_callback=download_progress,
-        )
-        progress(0.1, desc="Download complete. Parsing paper...")
-
-    if page_range != "Others":
-        selected_page = page_map[page_range]
-    else:
-        selected_page = []
-        for p in page_input.split(","):
-            p = p.strip()
-            if not p:
-                continue
-            if "-" in p:
-                start, end = p.split("-")
-                selected_page.extend(range(int(start) - 1, int(end)))
-            else:
-                selected_page.append(int(p) - 1)
-
+    session_id, cancellation_event = _start_summary_session(state)
     try:
-        max_assets_value = int(max_assets)
-    except (TypeError, ValueError):
-        max_assets_value = DEFAULT_MAX_ASSETS
+        if flag_demo and not verify_recaptcha(recaptcha_response):
+            raise gr.Error("reCAPTCHA fail")
 
-    def progress_bar(value: float, desc: str):
-        progress(value, desc=desc)
+        progress(0, desc="Preparing paper...")
+        output = Path("paper_agent_files")
+        output.mkdir(parents=True, exist_ok=True)
 
-    try:
+        if file_type == "File":
+            if not file_input:
+                raise gr.Error("No input")
+            progress(0.03, desc="Preparing uploaded paper...")
+            file_path = shutil.copy(file_input, output)
+        else:
+            if not link_input:
+                raise gr.Error("No input")
+            progress(0.01, desc="Downloading paper...")
+
+            def download_progress(downloaded: int, total: int | None) -> None:
+                if cancellation_event.is_set():
+                    raise CancelledError("task cancelled")
+                if total:
+                    ratio = min(downloaded / max(total, 1), 1.0)
+                    downloaded_mb = downloaded / 1024 / 1024
+                    total_mb = total / 1024 / 1024
+                    progress(
+                        0.01 + ratio * 0.09,
+                        desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB",
+                    )
+                else:
+                    downloaded_mb = downloaded / 1024 / 1024
+                    progress(0.03, desc=f"Downloading paper... {downloaded_mb:.1f} MB")
+
+            file_path = download_with_limit(
+                link_input,
+                output,
+                5 * 1024 * 1024 if flag_demo else None,
+                progress_callback=download_progress,
+            )
+            progress(0.1, desc="Download complete. Parsing paper...")
+
+        if cancellation_event.is_set():
+            raise CancelledError("task cancelled")
+
+        if page_range != "Others":
+            selected_page = page_map[page_range]
+        else:
+            selected_page = []
+            for page in page_input.split(","):
+                page = page.strip()
+                if not page:
+                    continue
+                if "-" in page:
+                    start, end = page.split("-")
+                    selected_page.extend(range(int(start) - 1, int(end)))
+                else:
+                    selected_page.append(int(page) - 1)
+
+        try:
+            max_assets_value = int(max_assets)
+        except (TypeError, ValueError):
+            max_assets_value = DEFAULT_MAX_ASSETS
+
+        def progress_bar(value: float, desc: str):
+            progress(value, desc=desc)
+
         docx_path = summarize_paper(
             file_path,
             output,
@@ -945,15 +968,17 @@ def summarize_file(
             },
             max_assets=max_assets_value,
             progress=progress_bar,
-            cancellation_event=cancellation_event_map[session_id],
+            cancellation_event=cancellation_event,
         )
     except CancelledError:
         raise gr.Error("Summary cancelled")
     except RuntimeError as exc:
         raise gr.Error(str(exc)) from exc
     finally:
-        cancellation_event_map.pop(session_id, None)
-        state["session_id"] = None
+        with cancellation_event_lock:
+            cancellation_event_map.pop(session_id, None)
+        if state.get("session_id") == session_id:
+            state["session_id"] = None
 
     preview_path = str(file_path) if str(file_path).lower().endswith(".pdf") else None
     return (
@@ -1023,6 +1048,7 @@ tech_details_string = f"""
                     - 版本: {__version__}
                 """
 cancellation_event_map = {}
+cancellation_event_lock = threading.RLock()
 
 
 # The following code creates the GUI
@@ -1106,7 +1132,7 @@ with gr.Blocks(
 ### ⚠️ 使用说明：
 - 总结会调用 config.json 中的 CODEX_BASE_URL、CODEX_API_KEY、CODEX_MODEL
 - 程序会从 PDF 中抽取正文，并将识别到的图、表和关键公式截图直接写入 Word 文档
-- 如果程序运行时间过长或出现错误，请点击 "取消" 按钮，按 F5 刷新页面重新运行
+- 如果浏览器崩溃或页面刷新，再次点击生成会自动取消遗留任务并启动新任务
 - 如遇到 API 频率限制，系统会自动重试（最多5次，间隔递增）
 - 总结完成后可下载 docx 文档
 """)
@@ -1165,7 +1191,7 @@ with gr.Blocks(
 
     state = gr.State({"session_id": None})
 
-    summary_btn.click(
+    summary_event = summary_btn.click(
         summarize_file,
         inputs=[
             file_type,
@@ -1184,11 +1210,15 @@ with gr.Blocks(
             output_title,
             preview_hint,
         ],
-    ).then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
+        concurrency_limit=2,
+    )
+    summary_event.then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
 
     cancellation_btn.click(
         stop_summary_file,
         inputs=[state],
+        queue=False,
+        cancels=[summary_event],
     )
 
 

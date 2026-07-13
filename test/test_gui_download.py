@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 import requests
+import pytest
 
 from paper_agent import sanitize_no_proxy_env
 from paper_agent.gui import (
@@ -11,6 +12,11 @@ from paper_agent.gui import (
     _configured_proxy_candidates,
     _download_proxy_config,
     _looks_like_dns_failure,
+    _start_summary_session,
+    cancellation_event_lock,
+    cancellation_event_map,
+    stop_summary_file,
+    summarize_file,
 )
 
 
@@ -60,6 +66,55 @@ class FakeSession:
             headers={"Content-Range": "bytes 3-5/6", "Content-Length": "3"},
             status_code=206,
         )
+
+
+def _clear_summary_sessions():
+    with cancellation_event_lock:
+        cancellation_event_map.clear()
+
+
+def test_start_summary_session_cancels_orphaned_session():
+    _clear_summary_sessions()
+    _, orphan_event = _start_summary_session({"session_id": None})
+
+    new_state = {"session_id": None}
+    new_session_id, new_event = _start_summary_session(new_state)
+
+    assert orphan_event.is_set()
+    assert not new_event.is_set()
+    assert new_state["session_id"] == new_session_id
+    _clear_summary_sessions()
+
+
+def test_stop_summary_file_from_fresh_page_cancels_orphaned_session():
+    _clear_summary_sessions()
+    _, orphan_event = _start_summary_session({"session_id": None})
+
+    stop_summary_file({"session_id": None})
+
+    assert orphan_event.is_set()
+    _clear_summary_sessions()
+
+
+def test_summarize_file_cleans_session_after_input_error():
+    _clear_summary_sessions()
+    state = {"session_id": None}
+
+    with pytest.raises(Exception, match="No input"):
+        summarize_file(
+            "Link",
+            None,
+            "",
+            "All",
+            "",
+            13,
+            "",
+            state,
+            progress=lambda *args, **kwargs: None,
+        )
+
+    assert state["session_id"] is None
+    assert not cancellation_event_map
 
 
 def test_download_with_limit_retries_and_resumes_partial_stream():
