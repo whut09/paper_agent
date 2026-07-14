@@ -1977,6 +1977,54 @@ def test_right_column_table_caption_does_not_absorb_left_column_body_text():
     assert table_rect.x0 >= 340
 
 
+def test_table_caption_below_body_recovers_table_without_neighboring_figure():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(342, 276, 520, 277)},
+                {"rect": fitz.Rect(342, 350, 520, 351)},
+            ]
+
+    lines = [
+        line("0.8", 310, 286, 326, 296),
+        line("Method Score Cost", 344, 282, 500, 293),
+        line("Teacher 84.2 1.0", 344, 304, 490, 315),
+        line("GTR-Turbo 86.7 0.4", 344, 326, 505, 337),
+        line("Table 2: Main comparison of agent performance.", 365, 364, 520, 376),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 4, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert caption_text.startswith("Table 2")
+    assert table_rect is not None
+    assert table_rect.x0 >= 337
+    assert "GTR-Turbo" in table_text
+    assert "0.8" not in table_text
+
+
+def test_side_by_side_figure_and_table_captions_stay_in_their_columns():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure 4. Training curves on Points24. While GTR benefits", 58, 374.8, 355.5, 383.7),
+        line("the Points24 task. GTR-Turbo significantly outperforms", 365, 385.6, 555, 394.7),
+        line("from external knowledge in the early stage, GTR-Turbo", 58, 385.8, 355.5, 394.7),
+        line("maintains a rational reasoning process throughout training.", 58, 396.6, 355.5, 405.7),
+        line("other methods in success rate and episode return.", 365, 396.6, 553, 405.7),
+    ]
+
+    figure_caption, figure_rect = _caption_text_and_rect(lines, 0, FakePage(), "figure")
+
+    assert "external knowledge" in figure_caption
+    assert "GTR-Turbo significantly" not in figure_caption
+    assert "success rate and episode return" not in figure_caption
+    assert figure_rect.x1 <= 361
+
+
 def test_table_crop_stops_before_unnumbered_section_heading():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)

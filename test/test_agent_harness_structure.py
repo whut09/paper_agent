@@ -16,10 +16,12 @@ from paper_agent.evaluation.guards import GUARD_SPECS
 from paper_agent.evaluation.validators import _parse_verification_result
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from paper_agent.harness import NodeResult, PaperContext, PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.memory import get_self_improving_prompt_patches, record_summary_correction
 from paper_agent.schemas import PaperAsset, VerificationResult
+from paper_agent.paper_summary import _build_repair_plan
 from paper_agent.tools.grounding import _build_grounding_map
 
 
@@ -311,7 +313,7 @@ def test_workflow_blocks_after_revision_limit_and_writes_failure_report():
         result = PaperWorkflow([AlwaysFailVerify(), ReviseReport(), FinalNode()]).run(context)
 
         assert result.gate_decision == "block"
-        assert result.revision_attempts == 2
+        assert result.revision_attempts == 0
         assert result.chunk_notes == []
         assert result.docx_path is None
         assert result.verification_failed_path is not None
@@ -355,3 +357,121 @@ def test_critical_visual_asset_stops_after_repair_limit(tmp_path):
     assert "[[ASSET:1]]" in context.summary
     assert len(context.assets) == 2
     assert context.assets[0].path.name == "bad-figure.png"
+
+
+def test_repair_planner_classifies_missing_critical_asset(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.summary = "Table 2 reports the main comparison."
+    context.verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Asset Guard: referenced critical asset 表2 is missing from asset manifest",
+            }
+        ],
+    )
+
+    plan = _build_repair_plan(context)
+
+    assert plan.missing_asset_keys == [("table", "2")]
+    assert plan.actionable
+    assert plan.has_asset_actions
+
+
+def test_workflow_repairs_missing_critical_asset_and_reverifies(tmp_path):
+    class FakeVerify(PaperWorkflowNode):
+        name = "VerifyClaims"
+        produces = ["verification_report"]
+
+        def run(self, context: PaperWorkflowContext):
+            has_table_2 = any(asset.caption.startswith("Table 2") for asset in context.assets)
+            if has_table_2:
+                context.verification = VerificationResult(True)
+            else:
+                context.verification = VerificationResult(
+                    False,
+                    hard_failures=[
+                        {
+                            "type": "guard_failure",
+                            "reason": "Asset Guard: referenced critical asset 表2 is missing from asset manifest",
+                        }
+                    ],
+                )
+
+    class FinalNode(PaperWorkflowNode):
+        name = "GenerateReport"
+        depends_on = ("ReviseReport",)
+        produces = ["docx"]
+
+        def run(self, context: PaperWorkflowContext):
+            context.chunk_notes.append("generated")
+
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.summary = "Figure 1 gives the overview.\n[[ASSET:1]]\nTable 2 reports the main comparison."
+    context.assets = [PaperAsset("figure", 1, Path("figure1.png"), "Fig. 1")]
+    captured = PaperAsset("table", 5, Path("table2.png"), "Table 2: Main comparison")
+
+    with patch("paper_agent.paper_summary._capture_missing_asset_by_label", return_value=captured) as capture:
+        result = PaperWorkflow([FakeVerify(), ReviseReport(), FinalNode()]).run(context)
+
+    assert capture.call_count == 1
+    assert result.gate_decision == "pass"
+    assert result.chunk_notes == ["generated"]
+    assert result.assets[0].path.name == "figure1.png"
+    assert result.assets[1].path.name == "table2.png"
+    assert "[[ASSET:2]]" in result.summary
+    assert result.repair_history[-1]["changed"] is True
+
+
+def test_missing_asset_capture_failure_is_not_retried_forever(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.output = tmp_path
+    context.paper_name = "paper"
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.summary = "Table 2 reports the main comparison."
+    context.verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": "Asset Guard: referenced critical asset 表2 is missing from asset manifest",
+            }
+        ],
+    )
+
+    with patch("paper_agent.paper_summary._capture_missing_asset_by_label", return_value=None) as capture:
+        first = ReviseReport().run(context)
+        second = ReviseReport().run(context)
+
+    assert first.status == "warning"
+    assert second.status == "failed"
+    assert capture.call_count == 1
+    assert context.repair_history[-1]["changed"] is False
+    assert context.repair_attempts["missing:table:2"] == 1

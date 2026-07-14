@@ -55,6 +55,8 @@ class PaperWorkflowContext:
     gate_decision: str = ""
     gate_history: list[dict[str, Any]] = field(default_factory=list)
     revision_attempts: int = 0
+    repair_attempts: dict[str, int] = field(default_factory=dict)
+    repair_history: list[dict[str, Any]] = field(default_factory=list)
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None

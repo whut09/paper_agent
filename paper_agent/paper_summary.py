@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import html
 import json
 import logging
@@ -203,6 +204,39 @@ class VerificationResult:
     patch_suggestions: list[dict[str, str]] = field(default_factory=list)
     revision_attempted: bool = False
     revision_applied: bool = False
+
+
+@dataclass
+class _RepairPlan:
+    missing_asset_keys: list[tuple[str, str]] = field(default_factory=list)
+    recapture_asset_ids: set[int] = field(default_factory=set)
+    remove_asset_ids: set[int] = field(default_factory=set)
+    rewrite_report: bool = False
+    apply_patches: bool = False
+
+    @property
+    def actionable(self) -> bool:
+        return bool(
+            self.missing_asset_keys
+            or self.recapture_asset_ids
+            or self.remove_asset_ids
+            or self.rewrite_report
+            or self.apply_patches
+        )
+
+    @property
+    def has_asset_actions(self) -> bool:
+        return bool(self.missing_asset_keys or self.recapture_asset_ids or self.remove_asset_ids)
+
+    def action_keys(self) -> list[str]:
+        keys = [f"missing:{kind}:{number}" for kind, number in self.missing_asset_keys]
+        keys.extend(f"recapture:{asset_id}" for asset_id in sorted(self.recapture_asset_ids))
+        keys.extend(f"remove:{asset_id}" for asset_id in sorted(self.remove_asset_ids))
+        if self.rewrite_report:
+            keys.append("rewrite:report")
+        if self.apply_patches:
+            keys.append("patch:claims")
+        return keys
 
 
 @dataclass
@@ -531,9 +565,12 @@ class ReviseReport(_PaperWorkflowNode):
         if context.verification is None:
             raise ValueError("ReviseReport requires a verification report.")
         policy = _GatePolicy()
+        repair_plan = _build_repair_plan(context)
         decision = policy.decide(context.verification, context.revision_attempts)
-        if decision == _GateDecision.BLOCK and _repairable_visual_asset_failure_ids(context):
+        if decision == _GateDecision.BLOCK and repair_plan.has_asset_actions:
             decision = _GateDecision.REVISE
+        elif decision == _GateDecision.REVISE and not repair_plan.actionable:
+            decision = _GateDecision.BLOCK
         context.gate_decision = decision.value
         context.gate_history.append(
             {
@@ -542,11 +579,12 @@ class ReviseReport(_PaperWorkflowNode):
                 "hard_failures": len(context.verification.hard_failures),
                 "soft_warnings": len(context.verification.soft_warnings),
                 "patch_suggestions": len(context.verification.patch_suggestions),
+                "repair_actions": repair_plan.action_keys(),
             }
         )
         _record_harness_learnings(context)
         if decision == _GateDecision.REVISE:
-            return _revise_report_once(context)
+            return _revise_report_once(context, repair_plan)
         if decision == _GateDecision.BLOCK:
             context.verification_failed_path = _write_verification_failed_report(context)
             return _NodeResult(
@@ -700,6 +738,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "source_path": str(context.source_path) if context.source_path else "",
                 "gate_decision": context.gate_decision,
                 "gate_history": list(context.gate_history),
+                "repair_attempts": dict(context.repair_attempts),
+                "repair_history": list(context.repair_history),
                 "nodes": trace,
             },
             ensure_ascii=False,
@@ -717,6 +757,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "run_id": context.run_id,
                 "gate_decision": context.gate_decision,
                 "gate_history": list(context.gate_history),
+                "repair_attempts": dict(context.repair_attempts),
+                "repair_history": list(context.repair_history),
                 "verification": _verification_payload(context.verification),
                 "guards": [_guard_payload(result) for result in context.guard_results],
             },
@@ -1834,6 +1876,17 @@ def _table_rect_for_caption(
     caption_rect: fitz.Rect,
     lines: list[TextLine],
 ) -> tuple[fitz.Rect | None, str]:
+    below_rect, below_text = _table_rect_below_caption(page, caption_rect, lines)
+    if below_rect is not None:
+        return below_rect, below_text
+    return _table_rect_above_caption(page, caption_rect, lines)
+
+
+def _table_rect_below_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine],
+) -> tuple[fitz.Rect | None, str]:
     left, right = _caption_column_bounds(page, caption_rect)
     search_top = caption_rect.y1 + 2
     search_bottom = _next_caption_or_heading_y(lines, caption_rect, left, right) or min(
@@ -1876,13 +1929,87 @@ def _table_rect_for_caption(
 
     if not selected:
         return None, ""
-    rect = _merge_rects([line.rect for line in selected])
+    content_rect = _merge_rects([line.rect for line in selected])
+    rect = fitz.Rect(content_rect)
     rect &= fitz.Rect(left, search_top, right, search_bottom)
     if rect.is_empty or rect.width < 60 or rect.height < 20:
         return None, ""
     rect = _expand_table_rect_to_borders(page, rect)
     rect = _tighten_table_rect_to_borders(page, rect)
+    rect &= fitz.Rect(
+        max(left, content_rect.x0 - 20),
+        search_top,
+        min(right, content_rect.x1 + 20),
+        search_bottom,
+    )
     text = "\n".join(_clean_xml_text(" ".join(line.text for line in group)) for group in row_groups if any(line in selected for line in group))
+    return rect, text[:2500]
+
+
+def _table_rect_above_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine],
+) -> tuple[fitz.Rect | None, str]:
+    left, right = _caption_column_bounds(page, caption_rect)
+    table_left = max(left, caption_rect.x0 - 28)
+    search_bottom = caption_rect.y0 - 2
+    search_top = max(28.0, search_bottom - min(360, page.rect.height * 0.46))
+    candidate_lines = [
+        line
+        for line in lines
+        if line.rect.y1 <= search_bottom
+        and line.rect.y1 > search_top
+        and _line_belongs_to_column(line.rect, table_left, right, min_overlap=0.35)
+    ]
+    row_groups = _group_lines_by_row(candidate_lines)
+    selected_groups: list[list[TextLine]] = []
+    lower_y0: float | None = None
+
+    for group in reversed(row_groups):
+        row_rect = _merge_rects([line.rect for line in group])
+        if row_rect.is_empty:
+            continue
+        row_text = " ".join(line.text for line in group)
+        if not selected_groups:
+            if search_bottom - row_rect.y1 > 48:
+                break
+            if not _row_looks_table_like(row_text, group):
+                continue
+        else:
+            if lower_y0 is not None and lower_y0 - row_rect.y1 > 34:
+                break
+            if _line_looks_section_heading(row_text):
+                break
+            if not (
+                _row_looks_table_like(row_text, group)
+                or _row_looks_table_section_label(row_text, group)
+            ):
+                break
+        selected_groups.append(group)
+        lower_y0 = row_rect.y0
+
+    if not selected_groups:
+        return None, ""
+    selected_groups.reverse()
+    selected = [line for group in selected_groups for line in group]
+    content_rect = _merge_rects([line.rect for line in selected])
+    rect = fitz.Rect(content_rect)
+    rect &= fitz.Rect(table_left, search_top, right, search_bottom)
+    if rect.is_empty or rect.width < 60 or rect.height < 20:
+        return None, ""
+    rect = _expand_table_rect_to_borders(page, rect)
+    rect = _tighten_table_rect_to_borders(page, rect)
+    rect &= fitz.Rect(
+        max(table_left, content_rect.x0 - 20),
+        search_top,
+        min(right, content_rect.x1 + 20),
+        search_bottom,
+    )
+    text = "\n".join(
+        _clean_xml_text(" ".join(line.text for line in group))
+        for group in selected_groups
+    )
     return rect, text[:2500]
 
 
@@ -1916,7 +2043,7 @@ def _next_caption_or_heading_y(
         if _caption_is_table(line.text) or _caption_is_figure(line.text):
             candidates.append(line.rect.y0 - 2)
             continue
-        if _line_looks_section_heading(line.text):
+        if _line_looks_section_heading(line.text) and line.rect.y0 - caption_rect.y1 > 45:
             candidates.append(line.rect.y0 - 2)
     return min(candidates) if candidates else None
 
@@ -2142,6 +2269,8 @@ def _caption_text_and_rect(
         if kind == "table":
             if len(caption_lines) >= 7:
                 break
+            if _figure_caption_continuation_is_body_text(previous.text, next_line.text):
+                break
             if len(caption_lines) >= 2 and not _line_looks_caption_continuation(next_line.text):
                 break
         caption_lines.append(next_line)
@@ -2180,6 +2309,16 @@ def _caption_column_bounds(page: fitz.Page, caption_rect: fitz.Rect) -> tuple[fl
         return max(0, caption_rect.x0 - 24), min(page.rect.width, caption_rect.x1 + 24)
     if caption_rect.width > page.rect.width * 0.55:
         return max(0, page.rect.width * 0.05), min(page.rect.width, page.rect.width * 0.95)
+    mid = page.rect.width / 2
+    margin = max(28.0, page.rect.width * 0.06)
+    if caption_rect.x0 < mid < caption_rect.x1 and caption_rect.x0 > page.rect.width * 0.22:
+        return max(0, page.rect.width * 0.05), min(page.rect.width, page.rect.width * 0.95)
+    if caption_rect.x0 < mid - 20:
+        if caption_rect.x1 <= mid:
+            return _column_bounds(page, caption_rect)
+        return margin, min(page.rect.width - margin, mid + 55)
+    if caption_rect.x0 > mid + 20:
+        return max(margin, mid - 12), page.rect.width - margin
     return _column_bounds(page, caption_rect)
 
 
@@ -4710,31 +4849,122 @@ def _record_correction_once(
         logger.debug("failed to record harness learning: %s", exc)
 
 
-def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
+def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
+    if context.verification is None:
+        return _RepairPlan()
+
+    can_capture_assets = context.pdf_path is not None and context.work_dir is not None
+    available = set(_critical_asset_key_map(context.assets))
+    referenced = _critical_referenced_asset_keys(context.summary)
+    missing_asset_keys = [
+        key
+        for key in sorted(referenced - available, key=_critical_asset_sort_key)
+        if can_capture_assets
+        and context.repair_attempts.get(f"missing:{key[0]}:{key[1]}", 0) < 1
+    ]
+
+    bad_asset_ids = _valid_visual_asset_failure_ids(context)
+    recapture_asset_ids = {
+        asset_id
+        for asset_id in bad_asset_ids
+        if can_capture_assets
+        and _is_critical_asset(context.assets[asset_id - 1])
+        and context.repair_attempts.get(f"recapture:{asset_id}", 0) < 1
+    }
+    remove_asset_ids = {
+        asset_id
+        for asset_id in bad_asset_ids
+        if not _is_critical_asset(context.assets[asset_id - 1])
+        and context.repair_attempts.get(f"remove:{asset_id}", 0) < 1
+    }
+    rewrite_report = (
+        context.revision_attempts < 2
+        and _verification_needs_full_report_rewrite(context.verification)
+        and context.repair_attempts.get("rewrite:report", 0) < 1
+    )
+    apply_patches = (
+        context.revision_attempts < 2
+        and bool(context.verification.patch_suggestions)
+        and not rewrite_report
+        and context.repair_attempts.get("patch:claims", 0) < 2
+    )
+    return _RepairPlan(
+        missing_asset_keys=missing_asset_keys,
+        recapture_asset_ids=recapture_asset_ids,
+        remove_asset_ids=remove_asset_ids,
+        rewrite_report=rewrite_report,
+        apply_patches=apply_patches,
+    )
+
+
+def _repair_state_fingerprint(context: _PaperWorkflowContext) -> str:
+    failures = []
+    if context.verification is not None:
+        failures = sorted(
+            _clean_xml_text(item.get("reason", "") or item.get("message", ""))
+            for item in context.verification.hard_failures
+        )
+    assets = [
+        {
+            "kind": asset.kind,
+            "label": _compact_asset_label(_original_asset_label(asset)),
+            "page": asset.page_number,
+            "rect": tuple(round(value, 2) for value in asset.rect) if asset.rect is not None else None,
+            "path": str(asset.path),
+        }
+        for asset in context.assets
+    ]
+    payload = json.dumps(
+        {"summary": context.summary, "assets": assets, "failures": failures},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _revise_report_once(
+    context: _PaperWorkflowContext,
+    plan: _RepairPlan | None = None,
+) -> _NodeResult:
     if context.verification is None:
         raise ValueError("Revision requires a verification report.")
+    plan = plan or _build_repair_plan(context)
+    if not plan.actionable:
+        raise RuntimeError("Verifier requested revision, but the repair planner found no actionable change.")
+
     context.verification.revision_attempted = True
     context.revision_attempts += 1
-    bad_asset_ids = _visual_asset_failure_ids(context.verification)
-    if bad_asset_ids:
-        repaired_asset_ids = _recapture_critical_visual_assets(context, bad_asset_ids)
-        removable_asset_ids = {
-            asset_id
-            for asset_id in bad_asset_ids - repaired_asset_ids
-            if not _is_critical_asset(context.assets[asset_id - 1])
-        }
-        if removable_asset_ids:
-            revised_summary, revised_assets = _drop_assets_and_rewrite_markers(
-                context.summary,
-                context.assets,
-                removable_asset_ids,
-            )
-            context.assets = revised_assets
-        else:
-            revised_summary = context.summary
-        if repaired_asset_ids:
-            context.verification.revision_applied = True
-    elif _verification_needs_full_report_rewrite(context.verification):
+    before = _repair_state_fingerprint(context)
+    action_keys = plan.action_keys()
+    for action_key in action_keys:
+        context.repair_attempts[action_key] = context.repair_attempts.get(action_key, 0) + 1
+
+    revised_summary = context.summary
+    assets_changed = False
+    captured_keys: list[str] = []
+    for key in plan.missing_asset_keys:
+        captured = _capture_missing_asset_by_label(context, key)
+        if captured is None:
+            logger.warning("Unable to capture missing critical asset %s", _critical_asset_label(key))
+            continue
+        context.assets.append(captured)
+        assets_changed = True
+        captured_keys.append(_critical_asset_label(key))
+        logger.info("Captured missing critical asset %s from page %s", _critical_asset_label(key), captured.page_number)
+
+    if plan.recapture_asset_ids:
+        repaired_asset_ids = _recapture_critical_visual_assets(context, plan.recapture_asset_ids)
+        assets_changed = assets_changed or bool(repaired_asset_ids)
+
+    if plan.remove_asset_ids:
+        revised_summary, context.assets = _drop_assets_and_rewrite_markers(
+            revised_summary,
+            context.assets,
+            plan.remove_asset_ids,
+        )
+        assets_changed = True
+
+    if plan.rewrite_report:
         client, config = _ensure_workflow_codex_client(context)
         revised_summary = _repair_report_format_with_codex(
             client,
@@ -4745,18 +4975,32 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
             context.paper_title,
             context.verification,
         )
-    else:
+    elif plan.apply_patches:
         revised_summary = _apply_verifier_patch_suggestions(
-            context.summary,
+            revised_summary,
             context.verification.patch_suggestions,
         )
-    if revised_summary != context.summary:
+
+    if revised_summary != context.summary or assets_changed:
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
         context.summary = _enforce_core_original_title(context.summary, context.paper_title)
         context.summary = _ensure_chinese_report_title(context.summary)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.verification.revision_applied = True
+
+    after = _repair_state_fingerprint(context)
+    changed = before != after
+    context.repair_history.append(
+        {
+            "attempt": context.revision_attempts,
+            "actions": action_keys,
+            "captured_assets": captured_keys,
+            "changed": changed,
+            "before": before,
+            "after": after,
+        }
+    )
     return _NodeResult(
         status="warning",
         outputs={
@@ -4767,7 +5011,11 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
             f"Verifier requested revision attempt {context.revision_attempts}",
             *_verification_warning_messages(context.verification),
         ],
-        metrics={"revision_attempts": context.revision_attempts},
+        metrics={
+            "revision_attempts": context.revision_attempts,
+            "repair_actions": len(action_keys),
+            "repair_changed": changed,
+        },
     )
 
 
@@ -4776,11 +5024,50 @@ def _is_critical_asset(asset: PaperAsset) -> bool:
     return bool(key and key[1] in {"1", "2"})
 
 
+def _capture_missing_asset_by_label(
+    context: _PaperWorkflowContext,
+    key: tuple[str, str],
+) -> PaperAsset | None:
+    if context.pdf_path is None or context.work_dir is None:
+        return None
+
+    repair_dir = context.work_dir / "repair-assets" / f"{key[0]}-{key[1]}"
+    repair_dir.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(context.pdf_path)
+    try:
+        preferred_pages = [
+            page_index
+            for page_index in (context.pages or [])
+            if 0 <= page_index < doc.page_count
+        ]
+        page_indexes = preferred_pages + [
+            page_index
+            for page_index in range(doc.page_count)
+            if page_index not in preferred_pages
+        ]
+        for page_index in page_indexes:
+            page = doc[page_index]
+            page_no = page_index + 1
+            if key[0] == "figure":
+                candidates = _capture_captioned_figures(page, repair_dir, page_no, 32, set())
+            else:
+                candidates = _capture_captioned_tables(page, repair_dir, page_no, 32, set())
+            replacement = next(
+                (candidate for candidate in candidates if _asset_label_key(candidate) == key),
+                None,
+            )
+            if replacement is not None:
+                return replacement
+    finally:
+        doc.close()
+    return None
+
+
 def _recapture_critical_visual_assets(
     context: _PaperWorkflowContext,
     bad_asset_ids: set[int],
 ) -> set[int]:
-    if context.pdf_path is None or context.work_dir is None or context.revision_attempts > 1:
+    if context.pdf_path is None or context.work_dir is None:
         return set()
     critical_ids = {
         asset_id
@@ -4796,6 +5083,8 @@ def _recapture_critical_visual_assets(
     try:
         for asset_id in sorted(critical_ids):
             original = context.assets[asset_id - 1]
+            repair_dir = context.work_dir / "repair-assets" / f"asset-{asset_id}"
+            repair_dir.mkdir(parents=True, exist_ok=True)
             page_index = original.page_number - 1
             if page_index < 0 or page_index >= doc.page_count:
                 continue
@@ -4803,7 +5092,7 @@ def _recapture_critical_visual_assets(
             if original.kind == "figure":
                 candidates = _capture_captioned_figures(
                     page,
-                    context.work_dir,
+                    repair_dir,
                     original.page_number,
                     32,
                     set(),
@@ -4811,7 +5100,7 @@ def _recapture_critical_visual_assets(
             elif original.kind == "table":
                 candidates = _capture_captioned_tables(
                     page,
-                    context.work_dir,
+                    repair_dir,
                     original.page_number,
                     32,
                     set(),
@@ -4846,15 +5135,6 @@ def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
         for asset_id in _visual_asset_failure_ids(context.verification)
         if 1 <= asset_id <= len(context.assets)
     }
-
-
-def _repairable_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
-    repairable: set[int] = set()
-    for asset_id in _valid_visual_asset_failure_ids(context):
-        asset = context.assets[asset_id - 1]
-        if not _is_critical_asset(asset) or context.revision_attempts < 1:
-            repairable.add(asset_id)
-    return repairable
 
 
 def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:
