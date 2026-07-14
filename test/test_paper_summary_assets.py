@@ -1,5 +1,6 @@
 ﻿from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 import fitz
 from PIL import Image
@@ -67,6 +68,7 @@ from paper_agent.paper_summary import (
     _row_looks_table_like,
     _report_substance_issues,
     _remove_mismatched_asset_markers,
+    _recapture_critical_visual_assets,
     _sync_inline_asset_references,
     _suppress_formula_text_when_assets_present,
     _styles_xml,
@@ -1185,6 +1187,28 @@ def test_figure_caption_does_not_absorb_following_body_text():
     assert rect.y1 < 560
 
 
+def test_figure_caption_keeps_long_caption_until_final_sentence():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure 1. We illustrate the state-transition behavior of OVOD-", 317, 460, 553, 470),
+        line("Agent as it iteratively updates its category hypothesis. Starting", 317, 471, 553, 481),
+        line("from an initial dictionary lookup, the agent applies attribute-aware", 317, 482, 553, 492),
+        line("actions that adjust color, texture, and spatial cues to produce a", 317, 493, 553, 503),
+        line("more accurate and grounded state description. The number of re-", 317, 504, 553, 514),
+        line("quired actions varies across images, from single-step updates to", 317, 515, 553, 525),
+        line("multi-step reasoning.", 317, 526, 410, 536),
+        line("The remainder of this section describes the training objective.", 317, 548, 553, 558),
+    ]
+
+    text, rect = _caption_text_and_rect(lines, 0, FakePage(), "figure")
+
+    assert text.endswith("multi-step reasoning.")
+    assert "remainder of this section" not in text
+    assert rect.y1 == 536
+
+
 def test_fallback_figure_crop_trims_body_text_above_plot():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)
@@ -1630,6 +1654,52 @@ def test_drop_bad_assets_rewrites_remaining_markers():
     assert "figure6.png" == kept_assets[3].path.name
     assert "[[ASSET:5]]" not in rewritten
     assert "表2说明工具集合" in rewritten
+
+
+def test_recapture_critical_visual_asset_preserves_asset_id():
+    with TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        pdf_path = temp_path / "paper.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(pdf_path)
+        doc.close()
+
+        original = PaperAsset(
+            "figure",
+            1,
+            temp_path / "figure1.png",
+            "Figure 1. Truncated caption",
+            rect=fitz.Rect(10, 10, 200, 200),
+        )
+        replacement = PaperAsset(
+            "figure",
+            1,
+            temp_path / "figure1-recaptured.png",
+            "Figure 1. Complete caption.",
+            rect=fitz.Rect(10, 10, 200, 200),
+        )
+        context = PaperWorkflowContext(
+            input_path=str(pdf_path),
+            output_dir=temp_path,
+            pages=None,
+            summary_language="中文",
+            codex_envs={},
+            max_assets=13,
+        )
+        context.pdf_path = pdf_path
+        context.work_dir = temp_path
+        context.assets = [original]
+        context.revision_attempts = 1
+
+        with patch(
+            "paper_agent.paper_summary._capture_captioned_figures",
+            return_value=[replacement],
+        ):
+            repaired_ids = _recapture_critical_visual_assets(context, {1})
+
+        assert repaired_ids == {1}
+        assert context.assets == [replacement]
 
 
 def test_formula_reference_keeps_original_paper_number():

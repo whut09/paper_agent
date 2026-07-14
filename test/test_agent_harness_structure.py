@@ -319,15 +319,17 @@ def test_workflow_blocks_after_revision_limit_and_writes_failure_report():
         assert "Verifier Agent 未通过" in result.verification_failed_path.read_text(encoding="utf-8")
 
 
-def test_visual_asset_repair_can_continue_past_generic_revision_limit():
+def test_critical_visual_asset_stops_after_repair_limit(tmp_path):
     context = PaperWorkflowContext(
         input_path="paper.pdf",
-        output_dir=Path("."),
+        output_dir=tmp_path,
         pages=None,
         summary_language="中文",
         codex_envs={},
         max_assets=0,
     )
+    context.output = tmp_path
+    context.paper_name = "paper"
     context.revision_attempts = 2
     context.summary = "图1说明流程。\n[[ASSET:1]]\n表2仍可用。\n[[ASSET:2]]"
     context.assets = [
@@ -346,10 +348,10 @@ def test_visual_asset_repair_can_continue_past_generic_revision_limit():
 
     result = ReviseReport().run(context)
 
-    assert result.status == "warning"
-    assert context.gate_decision == "revise"
-    assert context.revision_attempts == 3
-    assert "[[ASSET:2]]" not in context.summary
+    assert result.status == "failed"
+    assert context.gate_decision == "block"
+    assert context.revision_attempts == 2
+    assert "[[ASSET:2]]" in context.summary
     assert "[[ASSET:1]]" in context.summary
-    assert len(context.assets) == 1
-    assert context.assets[0].path.name == "table2.png"
+    assert len(context.assets) == 2
+    assert context.assets[0].path.name == "bad-figure.png"

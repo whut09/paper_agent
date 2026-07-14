@@ -532,7 +532,7 @@ class ReviseReport(_PaperWorkflowNode):
             raise ValueError("ReviseReport requires a verification report.")
         policy = _GatePolicy()
         decision = policy.decide(context.verification, context.revision_attempts)
-        if decision == _GateDecision.BLOCK and _valid_visual_asset_failure_ids(context):
+        if decision == _GateDecision.BLOCK and _repairable_visual_asset_failure_ids(context):
             decision = _GateDecision.REVISE
         context.gate_decision = decision.value
         context.gate_history.append(
@@ -2133,7 +2133,7 @@ def _caption_text_and_rect(
         if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Za-z]", next_line.text):
             break
         if kind == "figure":
-            if len(caption_lines) >= 3:
+            if len(caption_lines) >= 8:
                 break
             if _figure_caption_continuation_is_body_text(previous.text, next_line.text):
                 break
@@ -4717,12 +4717,23 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     context.revision_attempts += 1
     bad_asset_ids = _visual_asset_failure_ids(context.verification)
     if bad_asset_ids:
-        revised_summary, revised_assets = _drop_assets_and_rewrite_markers(
-            context.summary,
-            context.assets,
-            bad_asset_ids,
-        )
-        context.assets = revised_assets
+        repaired_asset_ids = _recapture_critical_visual_assets(context, bad_asset_ids)
+        removable_asset_ids = {
+            asset_id
+            for asset_id in bad_asset_ids - repaired_asset_ids
+            if not _is_critical_asset(context.assets[asset_id - 1])
+        }
+        if removable_asset_ids:
+            revised_summary, revised_assets = _drop_assets_and_rewrite_markers(
+                context.summary,
+                context.assets,
+                removable_asset_ids,
+            )
+            context.assets = revised_assets
+        else:
+            revised_summary = context.summary
+        if repaired_asset_ids:
+            context.verification.revision_applied = True
     elif _verification_needs_full_report_rewrite(context.verification):
         client, config = _ensure_workflow_codex_client(context)
         revised_summary = _repair_report_format_with_codex(
@@ -4760,6 +4771,73 @@ def _revise_report_once(context: _PaperWorkflowContext) -> _NodeResult:
     )
 
 
+def _is_critical_asset(asset: PaperAsset) -> bool:
+    key = _asset_label_key(asset)
+    return bool(key and key[1] in {"1", "2"})
+
+
+def _recapture_critical_visual_assets(
+    context: _PaperWorkflowContext,
+    bad_asset_ids: set[int],
+) -> set[int]:
+    if context.pdf_path is None or context.work_dir is None or context.revision_attempts > 1:
+        return set()
+    critical_ids = {
+        asset_id
+        for asset_id in bad_asset_ids
+        if 1 <= asset_id <= len(context.assets)
+        and _is_critical_asset(context.assets[asset_id - 1])
+    }
+    if not critical_ids:
+        return set()
+
+    repaired: set[int] = set()
+    doc = fitz.open(context.pdf_path)
+    try:
+        for asset_id in sorted(critical_ids):
+            original = context.assets[asset_id - 1]
+            page_index = original.page_number - 1
+            if page_index < 0 or page_index >= doc.page_count:
+                continue
+            page = doc[page_index]
+            if original.kind == "figure":
+                candidates = _capture_captioned_figures(
+                    page,
+                    context.work_dir,
+                    original.page_number,
+                    32,
+                    set(),
+                )
+            elif original.kind == "table":
+                candidates = _capture_captioned_tables(
+                    page,
+                    context.work_dir,
+                    original.page_number,
+                    32,
+                    set(),
+                )
+            else:
+                continue
+            original_key = _asset_label_key(original)
+            replacement = next(
+                (candidate for candidate in candidates if _asset_label_key(candidate) == original_key),
+                None,
+            )
+            if replacement is None:
+                logger.warning("Unable to recapture critical asset %s", _critical_asset_label(original_key))
+                continue
+            context.assets[asset_id - 1] = replacement
+            repaired.add(asset_id)
+            logger.info(
+                "Recaptured critical asset %s from page %s",
+                _critical_asset_label(original_key),
+                original.page_number,
+            )
+    finally:
+        doc.close()
+    return repaired
+
+
 def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
     if context.verification is None:
         return set()
@@ -4768,6 +4846,15 @@ def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
         for asset_id in _visual_asset_failure_ids(context.verification)
         if 1 <= asset_id <= len(context.assets)
     }
+
+
+def _repairable_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
+    repairable: set[int] = set()
+    for asset_id in _valid_visual_asset_failure_ids(context):
+        asset = context.assets[asset_id - 1]
+        if not _is_critical_asset(asset) or context.revision_attempts < 1:
+            repairable.add(asset_id)
+    return repairable
 
 
 def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:
