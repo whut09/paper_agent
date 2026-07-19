@@ -284,7 +284,7 @@ jobs:
 
       - name: Publish the release notes
         id: release-drafter
-        uses: release-drafter/release-drafter@139054aeaa9adc52ab36ddf67437541f039b88e2 # v7.1.1
+        uses: release-drafter/release-drafter@eada3c96a64734dd381cfbda23511034e328ddb0 # v7.6.0
         with:
           publish: ${{ needs.build.outputs.is_release != '' }}
           tag: ${{ needs.build.outputs.is_release }}
