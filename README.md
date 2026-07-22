@@ -177,6 +177,7 @@ Verifier Agent 也升级为明确的门禁策略，而不是只返回一串 crit
 - 自动抽取论文正文、版面结构、图表截图、表格、公式和摘要证据。
 - 使用 DAG / graph executor 组织论文理解流程，节点包括 ParsePaper、ExtractSections、SummarizeContribution、ExtractMethods、VerifyClaims 和 GenerateReport。
 - 内置多 Agent 分工：Reader 读论文，Extractor 抽取结构，Synthesizer 写总结，Critic / Verifier 检查可信度。
+- MCP server 额外提供可选的 `search_web` 工具，使用 You.com 搜索论文、作者和相关背景资料，未配置 `YDC_API_KEY` 时不会启用。
 - 构建 Grounding Map，把 intro、method、experiments 和 claims 映射回原文证据。
 - 构建 Paper-to-Knowledge Graph，提取 concept、method、dataset、evaluation 等节点和关系。
 - Verifier Agent 会检查 claim 是否能在原文中找到支撑，方法类 claim 是否落在 method 证据中，贡献类 claim 是否新增了原文没有的内容。

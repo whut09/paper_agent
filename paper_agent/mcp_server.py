@@ -12,6 +12,7 @@ from pathlib import Path
 import contextlib
 import io
 import os
+from paper_agent.youcom_search import youcom_search
 
 
 def create_mcp_app() -> FastMCP:
@@ -67,6 +68,12 @@ def create_mcp_app() -> FastMCP:
     mono pdf file: {doc_mono.absolute()}
     dual pdf file: {doc_dual.absolute()}
     """
+
+    @mcp.tool()
+    def search_web(query: str, count: int = 5) -> str:
+        """Search the live web with You.com and return concise results."""
+
+        return youcom_search(query, count=count)
 
     return mcp
 
