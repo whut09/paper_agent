@@ -1379,6 +1379,25 @@ def test_formula_clip_rect_excludes_same_row_prose_fragments():
     assert rect.x1 >= 544
 
 
+def test_formula_clip_rect_keeps_second_line_of_multiline_equation():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    first_line = line("Theta = 1/N sum Delta", 80, 556, 270, 574)
+    lines = [
+        first_line,
+        line("(10)", 278, 580, 295, 592),
+        line("= 1/N sum grad log p * M", 110, 601, 275, 620),
+        line("This formulation is stable.", 58, 646, 294, 658),
+    ]
+
+    rect = _formula_clip_rect(FakePage(), first_line.rect, lines)
+
+    assert rect.y0 <= 552
+    assert rect.y1 >= 630
+    assert rect.y1 < 646
+
+
 def test_chinese_title_rewrites_mixed_english_placeholder_title():
     summary = (
         "# complex image restoration论文精读\n\n"
@@ -1702,6 +1721,53 @@ def test_recapture_critical_visual_asset_preserves_asset_id():
         assert context.assets == [replacement]
 
 
+def test_recapture_does_not_report_success_for_identical_geometry_and_content():
+    with TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        pdf_path = temp_path / "paper.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.save(pdf_path)
+        doc.close()
+
+        original = PaperAsset(
+            "table",
+            1,
+            temp_path / "table1.png",
+            "Table 1. Results.",
+            text="Method | Score\nRAAS | 60.87",
+            rect=fitz.Rect(10, 10, 200, 200),
+        )
+        identical = PaperAsset(
+            "table",
+            1,
+            temp_path / "repair" / "table1.png",
+            "Table 1. Results.",
+            text="Method | Score\nRAAS | 60.87",
+            rect=fitz.Rect(10, 10, 200, 200),
+        )
+        context = PaperWorkflowContext(
+            input_path=str(pdf_path),
+            output_dir=temp_path,
+            pages=None,
+            summary_language="中文",
+            codex_envs={},
+            max_assets=13,
+        )
+        context.pdf_path = pdf_path
+        context.work_dir = temp_path
+        context.assets = [original]
+
+        with patch(
+            "paper_agent.paper_summary._capture_captioned_tables",
+            return_value=[identical],
+        ):
+            repaired_ids = _recapture_critical_visual_assets(context, {1})
+
+        assert repaired_ids == set()
+        assert context.assets == [original]
+
+
 def test_formula_reference_keeps_original_paper_number():
     text = (
         "公式 13 给出模态贡献的融合方式：C_m = (1−α) I_intra,m + α I_inter,m，"
@@ -2023,6 +2089,67 @@ def test_side_by_side_figure_and_table_captions_stay_in_their_columns():
     assert "GTR-Turbo significantly" not in figure_caption
     assert "success rate and episode return" not in figure_caption
     assert figure_rect.x1 <= 361
+
+
+def test_split_full_width_table_caption_is_reconstructed_before_cropping():
+    class FakeTable:
+        bbox = (64, 106, 552, 335)
+
+        def extract(self):
+            return [["Method", "MATH", "GSM8K"], ["RAAS", "60.87", "95.16"]]
+
+    class FakeTables:
+        tables = [FakeTable()]
+
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def find_tables(self):
+            return FakeTables()
+
+    lines = [
+        line("Main results across agentic systems. Accuracy (%) on benchmarks.", 99, 72.8, 553, 81.8),
+        line("Table 1.", 58, 72.9, 88, 81.8),
+        line("underlined.", 58, 83.8, 99, 92.8),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 1, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert caption_text.startswith("Table 1. Main results")
+    assert caption_rect.x1 >= 553
+    assert table_rect == fitz.Rect(64, 106, 552, 335)
+    assert "RAAS" in table_text
+
+
+def test_table_below_caption_uses_merged_detector_fragments_above_not_formula_below():
+    class FakeTable:
+        def __init__(self, bbox, rows):
+            self.bbox = bbox
+            self._rows = rows
+
+        def extract(self):
+            return self._rows
+
+    class FakeTables:
+        tables = [
+            FakeTable((64, 350, 293, 418), [["Method", "Level 1"], ["GPT-4", "9.85"]]),
+            FakeTable((64, 421, 293, 495), [["AutoAgents", "16.67"], ["RAAS", "29.53"]]),
+        ]
+
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def find_tables(self):
+            return FakeTables()
+
+    caption_rect = fitz.Rect(58, 508, 295, 528)
+
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, [])
+
+    assert table_rect == fitz.Rect(64, 350, 293, 495)
+    assert "GPT-4" in table_text
+    assert "RAAS" in table_text
 
 
 def test_table_crop_stops_before_unnumbered_section_heading():

@@ -1554,7 +1554,7 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
     anchor_mid = (anchor.y0 + anchor.y1) / 2
     for line in lines:
         line_mid = (line.rect.y0 + line.rect.y1) / 2
-        if abs(line_mid - anchor_mid) > 34:
+        if abs(line_mid - anchor_mid) > 58:
             continue
         in_formula_column = not (line.rect.x1 < left or line.rect.x0 > right)
         same_row_formula_fragment = (
@@ -1578,7 +1578,7 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
             x1 = max(x1, line.rect.x1)
     pad_x = 18.0
     pad_top = 4.0
-    pad_bottom = 7.0
+    pad_bottom = 10.0
     return fitz.Rect(
         max(page.rect.x0, left, x0 - pad_x),
         max(0, y0 - pad_top),
@@ -1814,7 +1814,7 @@ def _capture_captioned_figures(
         seen_boxes.add(key)
         figure_index += 1
         path = work_dir / f"page-{page_no:03d}-captioned-figure-{figure_index:02d}.png"
-        _save_clip(page, clip_rect, path, padding=1)
+        _save_clip(page, clip_rect, path, padding=1, scale=3)
         assets.append(PaperAsset("figure", page_no, path, caption_text[:300], rect=visual_rect))
     return assets
 
@@ -1876,10 +1876,67 @@ def _table_rect_for_caption(
     caption_rect: fitz.Rect,
     lines: list[TextLine],
 ) -> tuple[fitz.Rect | None, str]:
+    detected_rect, detected_text = _detected_table_rect_for_caption(page, caption_rect)
+    if detected_rect is not None:
+        return detected_rect, detected_text
     below_rect, below_text = _table_rect_below_caption(page, caption_rect, lines)
     if below_rect is not None:
         return below_rect, below_text
     return _table_rect_above_caption(page, caption_rect, lines)
+
+
+def _detected_table_rect_for_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+) -> tuple[fitz.Rect | None, str]:
+    left, right = _caption_column_bounds(page, caption_rect)
+    candidates: list[tuple[float, fitz.Rect, str]] = []
+    for table_rect, table_text in _detected_table_regions(page):
+        overlap = min(table_rect.x1, right) - max(table_rect.x0, left)
+        if overlap <= 0 or overlap / max(table_rect.width, 1.0) < 0.55:
+            continue
+        if table_rect.y0 >= caption_rect.y1 - 3:
+            gap = max(0.0, table_rect.y0 - caption_rect.y1)
+        elif table_rect.y1 <= caption_rect.y0 + 3:
+            gap = max(0.0, caption_rect.y0 - table_rect.y1)
+        else:
+            continue
+        if gap > 90:
+            continue
+        candidates.append((gap, table_rect, table_text))
+    if not candidates:
+        return None, ""
+    _gap, rect, text = min(candidates, key=lambda item: (item[0], -item[1].width * item[1].height))
+    return rect, text[:2500]
+
+
+def _detected_table_regions(page: fitz.Page) -> list[tuple[fitz.Rect, str]]:
+    try:
+        detected = [
+            (fitz.Rect(table.bbox), _table_to_text(table))
+            for table in page.find_tables().tables
+        ]
+    except Exception:
+        return []
+    regions = [
+        (rect, text)
+        for rect, text in detected
+        if not rect.is_empty and rect.width >= 40 and rect.height >= 20
+    ]
+    regions.sort(key=lambda item: (item[0].y0, item[0].x0))
+    merged: list[tuple[fitz.Rect, str]] = []
+    for rect, text in regions:
+        if merged:
+            previous_rect, previous_text = merged[-1]
+            gap = rect.y0 - previous_rect.y1
+            overlap = min(rect.x1, previous_rect.x1) - max(rect.x0, previous_rect.x0)
+            overlap_ratio = overlap / max(1.0, min(rect.width, previous_rect.width))
+            aligned = abs(rect.x0 - previous_rect.x0) <= 12 and abs(rect.x1 - previous_rect.x1) <= 18
+            if -2 <= gap <= 8 and overlap_ratio >= 0.85 and aligned:
+                merged[-1] = (_merge_rects([previous_rect, rect]), "\n".join(part for part in (previous_text, text) if part))
+                continue
+        merged.append((rect, text))
+    return merged
 
 
 def _table_rect_below_caption(
@@ -2243,41 +2300,90 @@ def _caption_text_and_rect(
     kind: str,
 ) -> tuple[str, fitz.Rect]:
     caption_line = lines[caption_index]
-    left, right = _caption_column_bounds(page, caption_line.rect)
-    caption_lines = [caption_line]
-    previous = caption_line
-    for next_line in lines[caption_index + 1 : caption_index + 14]:
-        if next_line.rect.y0 < previous.rect.y0:
+    seed_indices = _caption_same_row_indices(lines, caption_index)
+    seed_lines = [lines[index] for index in seed_indices]
+    seed_rect = _merge_rects([line.rect for line in seed_lines])
+    left, right = _caption_column_bounds(page, seed_rect)
+    nearby_lines = [
+        line
+        for line in lines
+        if line.rect.y0 >= seed_rect.y0 - 3
+        and line.rect.y0 <= seed_rect.y1 + 210
+        and _line_belongs_to_column(line.rect, left, right, min_overlap=0.35)
+    ]
+    row_groups = _group_lines_by_row(nearby_lines)
+    start_index = next(
+        (
+            index
+            for index, group in enumerate(row_groups)
+            if any(line is caption_line for line in group)
+        ),
+        0,
+    )
+    caption_lines: list[TextLine] = []
+    previous: TextLine | None = None
+    max_rows = 14 if kind == "figure" else 7
+    for group in row_groups[start_index:]:
+        ordered = sorted(group, key=lambda item: item.rect.x0)
+        row_text = _clean_xml_text(" ".join(line.text for line in ordered)).strip()
+        row_rect = _merge_rects([line.rect for line in ordered])
+        row_line = TextLine(row_text, row_rect)
+        if previous is not None and any(_caption_is_figure(line.text) or _caption_is_table(line.text) for line in ordered):
+            break
+        if previous is not None and row_rect.y0 < previous.rect.y0:
             continue
-        if not _line_belongs_to_column(next_line.rect, left, right, min_overlap=0.35):
-            continue
-        gap = next_line.rect.y0 - previous.rect.y1
+        gap = 0.0 if previous is None else row_rect.y0 - previous.rect.y1
         if gap > 16:
             break
-        lowered = next_line.text.lower().strip()
-        if _caption_is_figure(next_line.text) or lowered.startswith(("table", "tab.", "表")):
-            break
-        if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Za-z]", next_line.text):
+        if previous is not None and re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Za-z]", row_text):
             break
         if kind == "figure":
-            if len(caption_lines) >= 8:
+            if len(caption_lines) >= max_rows:
                 break
-            if _figure_caption_continuation_is_body_text(previous.text, next_line.text):
+            if previous is not None and _figure_caption_continuation_is_body_text(previous.text, row_text):
                 break
-            if len(caption_lines) >= 1 and not _line_looks_caption_continuation(next_line.text):
+            if previous is not None and not _line_looks_caption_continuation(row_text):
                 break
         if kind == "table":
-            if len(caption_lines) >= 7:
+            if len(caption_lines) >= max_rows:
                 break
-            if _figure_caption_continuation_is_body_text(previous.text, next_line.text):
+            if previous is not None and _figure_caption_continuation_is_body_text(previous.text, row_text):
                 break
-            if len(caption_lines) >= 2 and not _line_looks_caption_continuation(next_line.text):
+            if len(caption_lines) >= 2 and not _line_looks_caption_continuation(row_text):
                 break
-        caption_lines.append(next_line)
-        previous = next_line
+        caption_lines.extend(ordered)
+        previous = row_line
     caption_rect = _merge_rects([line.rect for line in caption_lines])
-    caption_text = " ".join(line.text for line in caption_lines)
+    caption_text = " ".join(
+        _clean_xml_text(" ".join(line.text for line in sorted(group, key=lambda item: item.rect.x0))).strip()
+        for group in _group_lines_by_row(caption_lines)
+    )
     return _clean_xml_text(caption_text), caption_rect
+
+
+def _caption_same_row_indices(lines: list[TextLine], caption_index: int) -> list[int]:
+    anchor = lines[caption_index]
+    anchor_mid = (anchor.rect.y0 + anchor.rect.y1) / 2
+    selected = {caption_index}
+    group_rect = fitz.Rect(anchor.rect)
+    changed = True
+    while changed:
+        changed = False
+        for index, line in enumerate(lines):
+            if index in selected:
+                continue
+            line_mid = (line.rect.y0 + line.rect.y1) / 2
+            if abs(line_mid - anchor_mid) > 3.5:
+                continue
+            if _caption_is_figure(line.text) or _caption_is_table(line.text):
+                continue
+            horizontal_gap = max(group_rect.x0 - line.rect.x1, line.rect.x0 - group_rect.x1, 0.0)
+            if horizontal_gap > 16:
+                continue
+            selected.add(index)
+            group_rect |= line.rect
+            changed = True
+    return sorted(selected, key=lambda index: lines[index].rect.x0)
 
 
 def _line_looks_caption_continuation(text: str) -> bool:
@@ -5115,6 +5221,9 @@ def _recapture_critical_visual_assets(
             if replacement is None:
                 logger.warning("Unable to recapture critical asset %s", _critical_asset_label(original_key))
                 continue
+            if _asset_capture_signature(replacement) == _asset_capture_signature(original):
+                logger.warning("Recapture produced no geometric change for critical asset %s", _critical_asset_label(original_key))
+                continue
             context.assets[asset_id - 1] = replacement
             repaired.add(asset_id)
             logger.info(
@@ -5125,6 +5234,18 @@ def _recapture_critical_visual_assets(
     finally:
         doc.close()
     return repaired
+
+
+def _asset_capture_signature(asset: PaperAsset) -> tuple:
+    rect = tuple(round(value, 2) for value in asset.rect) if asset.rect is not None else None
+    return (
+        asset.kind,
+        asset.page_number,
+        _asset_label_key(asset),
+        rect,
+        _clean_xml_text(asset.caption),
+        _clean_xml_text(asset.text),
+    )
 
 
 def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
