@@ -38,6 +38,7 @@ class PaperWorkflowContext:
     work_dir: Path | None = None
     text: str = ""
     assets: list[Any] = field(default_factory=list)
+    asset_candidate_pools: list[Any] = field(default_factory=list)
     paper_title: str = ""
     abstract: str = ""
     formulas: list[str] = field(default_factory=list)
@@ -66,6 +67,7 @@ class PaperWorkflowContext:
     grounding_map_path: Path | None = None
     verification_path: Path | None = None
     knowledge_graph_path: Path | None = None
+    asset_candidates_path: Path | None = None
 
     def report(self, value: float, desc: str) -> None:
         if self.progress:

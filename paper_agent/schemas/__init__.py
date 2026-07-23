@@ -8,8 +8,15 @@ _LAZY_EXPORTS = {
     "CodexConfig": "paper_agent.schemas.paper",
     "Claim": "paper_agent.schemas.evidence",
     "ClaimGrounding": "paper_agent.schemas.evidence",
+    "AssetCandidate": "paper_agent.schemas.contracts",
+    "AssetCandidatePool": "paper_agent.schemas.contracts",
+    "BoundingBox": "paper_agent.schemas.contracts",
+    "CandidateScore": "paper_agent.schemas.contracts",
+    "CandidateStrategy": "paper_agent.schemas.contracts",
     "Evidence": "paper_agent.schemas.evidence",
+    "EvidenceBundle": "paper_agent.schemas.contracts",
     "EvidenceMap": "paper_agent.schemas.evidence",
+    "GuardResultContract": "paper_agent.schemas.contracts",
     "GroundingSection": "paper_agent.schemas.claim",
     "KnowledgeGraphEdge": "paper_agent.schemas.report",
     "KnowledgeGraphNode": "paper_agent.schemas.report",
@@ -17,6 +24,8 @@ _LAZY_EXPORTS = {
     "PaperAsset": "paper_agent.schemas.asset",
     "TextLine": "paper_agent.schemas.asset",
     "VerificationResult": "paper_agent.schemas.report",
+    "WorkflowNodeContract": "paper_agent.schemas.contracts",
+    "WorkflowNodeLike": "paper_agent.schemas.contracts",
 }
 
 

@@ -23,6 +23,7 @@ import httpx
 import openai
 from PIL import Image
 
+from paper_agent.assets.candidates import build_asset_candidate_pool, candidate_bboxes_for_asset
 from paper_agent.config import ConfigManager
 from paper_agent.converter_docx import convert_to_pdf, is_convertible
 from paper_agent.agents.contracts import (
@@ -37,6 +38,11 @@ from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
 from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
 from paper_agent.schemas.evidence import Claim as _Claim, ClaimGrounding as _ClaimGrounding, Evidence as _Evidence, EvidenceMap as _EvidenceMap
+from paper_agent.schemas.contracts import (
+    AssetCandidatePool as _AssetCandidatePool,
+    CandidateStrategy as _CandidateStrategy,
+    EvidenceBundle as _EvidenceBundle,
+)
 from paper_agent.skill_prompts import load_paper_skill_reference
 
 logger = logging.getLogger(__name__)
@@ -178,6 +184,7 @@ class PaperAsset:
     text: str = ""
     latex: str = ""
     rect: fitz.Rect | None = None
+    caption_rect: fitz.Rect | None = None
 
 
 @dataclass
@@ -410,8 +417,8 @@ class ParsePaper(_PaperWorkflowNode):
     depends_on = ("PreparePaper",)
     agent_role = _PaperAgentRole.READER
     agent_contract = _READER_AGENT_CONTRACT
-    requires = ["pdf_path", "work_dir", "pages", "max_assets"]
-    produces = ["paper_text", "assets"]
+    requires = ["pdf_path", "work_dir", "pages", "max_assets", "output", "paper_name"]
+    produces = ["paper_text", "assets", "asset_candidates"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         if context.pdf_path is None or context.work_dir is None:
@@ -424,6 +431,10 @@ class ParsePaper(_PaperWorkflowNode):
             context.pages,
             context.max_assets,
         )
+        context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
+        if context.output is not None:
+            context.asset_candidates_path = context.output / f"{context.paper_name}-asset-candidates.json"
+            _write_asset_candidate_sidecar(context)
         if not context.text.strip():
             raise ValueError("未能从文档中抽取到可总结的正文。")
 
@@ -611,7 +622,15 @@ class GenerateReport(_PaperWorkflowNode):
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
     requires = ["verified_report", "asset_manifest"]
-    produces = ["docx", "summary.md", "trace.json", "grounding_map.json", "verification.json", "knowledge_graph.json"]
+    produces = [
+        "docx",
+        "summary.md",
+        "trace.json",
+        "grounding_map.json",
+        "verification.json",
+        "knowledge_graph.json",
+        "asset-candidates.json",
+    ]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         if context.output is None or context.source_path is None:
@@ -624,6 +643,7 @@ class GenerateReport(_PaperWorkflowNode):
         context.grounding_map_path = context.output / f"{context.paper_name}-grounding-map.json"
         context.verification_path = context.output / f"{context.paper_name}-verification.json"
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
+        context.asset_candidates_path = context.output / f"{context.paper_name}-asset-candidates.json"
         context.summary = _ensure_chinese_report_title(context.summary)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.summary = _suppress_formula_text_when_assets_present(context.summary, context.assets)
@@ -724,6 +744,7 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
     context.grounding_map_path = context.grounding_map_path or context.output / f"{context.paper_name}-grounding-map.json"
     context.verification_path = context.verification_path or context.output / f"{context.paper_name}-verification.json"
     context.knowledge_graph_path = context.knowledge_graph_path or context.output / f"{context.paper_name}-knowledge-graph.json"
+    context.asset_candidates_path = context.asset_candidates_path or context.output / f"{context.paper_name}-asset-candidates.json"
 
     trace = []
     for entry in context.agent_trace:
@@ -778,8 +799,27 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         json.dumps(graph_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    _write_asset_candidate_sidecar(context)
     if context.summary and not context.summary_markdown_path.exists():
         context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
+
+
+def _write_asset_candidate_sidecar(context: _PaperWorkflowContext) -> None:
+    if context.output is None or not context.paper_name:
+        return
+    context.asset_candidates_path = context.asset_candidates_path or context.output / f"{context.paper_name}-asset-candidates.json"
+    context.asset_candidates_path.write_text(
+        json.dumps(
+            {
+                "run_id": context.run_id,
+                "paper_name": context.paper_name,
+                "pools": [pool.to_dict() for pool in context.asset_candidate_pools],
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
 
 def _verification_payload(verification: VerificationResult | None) -> dict:
@@ -832,6 +872,7 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "work_dir": context.work_dir,
         "paper_text": context.text,
         "assets": context.assets,
+        "asset_candidates": context.asset_candidate_pools,
         "paper_title": context.paper_title,
         "abstract": context.abstract,
         "formulas": context.formulas,
@@ -851,6 +892,7 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "grounding_map.json": context.grounding_map_path,
         "verification.json": context.verification_path,
         "knowledge_graph.json": context.knowledge_graph_path,
+        "asset-candidates.json": context.asset_candidates_path,
         "trace.json": context.agent_trace,
     }
     value = mapping.get(name)
@@ -898,6 +940,8 @@ def _node_artifacts_snapshot(node: _PaperWorkflowNode, context: _PaperWorkflowCo
         artifacts.append(str(context.verification_path))
     if "knowledge_graph.json" in node.produces and context.knowledge_graph_path:
         artifacts.append(str(context.knowledge_graph_path))
+    if "asset-candidates.json" in node.produces and context.asset_candidates_path:
+        artifacts.append(str(context.asset_candidates_path))
     return artifacts
 
 
@@ -1069,7 +1113,17 @@ def _capture_captioned_tables(
         table_index += 1
         path = work_dir / f"page-{page_no:03d}-captioned-table-{table_index:02d}.png"
         _save_clip(page, clip_rect, path, padding=2, scale=4)
-        assets.append(PaperAsset("table", page_no, path, caption_text[:300], table_text, rect=table_rect))
+        assets.append(
+            PaperAsset(
+                "table",
+                page_no,
+                path,
+                caption_text[:300],
+                table_text,
+                rect=table_rect,
+                caption_rect=caption_rect,
+            )
+        )
     return assets
 
 
@@ -1107,7 +1161,17 @@ def _capture_tables(
         seen_boxes.add(key)
         path = work_dir / f"page-{page_no:03d}-table-{idx:02d}.png"
         _save_clip(page, clip_rect, path, padding=2, scale=4)
-        assets.append(PaperAsset("table", page_no, path, caption or f"Table on page {page_no}", table_text, rect=table_rect))
+        assets.append(
+            PaperAsset(
+                "table",
+                page_no,
+                path,
+                caption or f"Table on page {page_no}",
+                table_text,
+                rect=table_rect,
+                caption_rect=caption_rect,
+            )
+        )
     return assets
 
 
@@ -1221,6 +1285,61 @@ def _deduplicate_assets(assets: list[PaperAsset]) -> list[PaperAsset]:
             seen_original_labels.add(label_key)
 
     return result
+
+
+def _build_asset_candidate_pools(assets: list[PaperAsset]) -> list[_AssetCandidatePool]:
+    """Adapt legacy assets to immutable candidate pools without changing selection.
+
+    The current image is shared by geometry alternatives until the capture layer
+    renders per-candidate files.  This still preserves every strategy and score
+    in a sidecar, while the selected candidate resolves to the same legacy image.
+    """
+
+    pools = []
+    for asset in assets:
+        if asset.rect is None:
+            continue
+        bbox = tuple(float(value) for value in (asset.rect.x0, asset.rect.y0, asset.rect.x1, asset.rect.y1))
+        adjacent = [
+            tuple(float(value) for value in (other.rect.x0, other.rect.y0, other.rect.x1, other.rect.y1))
+            for other in assets
+            if other is not asset and other.page_number == asset.page_number and other.rect is not None
+        ]
+        evidence = _EvidenceBundle(
+            page_number=asset.page_number,
+            source_bbox=bbox,
+            caption_text=asset.caption,
+            object_type=asset.kind,
+            table_or_formula_text=asset.text or asset.latex,
+            image_path=asset.path,
+        )
+        caption_bbox = None
+        if asset.caption_rect is not None:
+            caption_bbox = tuple(
+                float(value)
+                for value in (
+                    asset.caption_rect.x0,
+                    asset.caption_rect.y0,
+                    asset.caption_rect.x1,
+                    asset.caption_rect.y1,
+                )
+            )
+        geometry = candidate_bboxes_for_asset(
+            bbox,
+            caption_bbox=caption_bbox,
+            adjacent_bboxes=adjacent,
+        )
+        pools.append(
+            build_asset_candidate_pool(
+                evidence,
+                ((strategy, candidate_bbox, asset.path) for strategy, candidate_bbox in geometry),
+                border_closed={
+                    _CandidateStrategy.BORDER_ENCLOSED: True if asset.kind == "table" else None,
+                },
+                object_bboxes=adjacent,
+            )
+        )
+    return pools
 
 
 def _asset_is_captioned(asset: PaperAsset) -> bool:
@@ -1815,7 +1934,16 @@ def _capture_captioned_figures(
         figure_index += 1
         path = work_dir / f"page-{page_no:03d}-captioned-figure-{figure_index:02d}.png"
         _save_clip(page, clip_rect, path, padding=1, scale=3)
-        assets.append(PaperAsset("figure", page_no, path, caption_text[:300], rect=visual_rect))
+        assets.append(
+            PaperAsset(
+                "figure",
+                page_no,
+                path,
+                caption_text[:300],
+                rect=visual_rect,
+                caption_rect=caption_rect,
+            )
+        )
     return assets
 
 
@@ -1852,7 +1980,16 @@ def _capture_image_blocks(
         figure_index += 1
         path = work_dir / f"page-{page_no:03d}-figure-{figure_index:02d}.png"
         _save_clip(page, clip_rect, path, padding=2)
-        assets.append(PaperAsset("figure", page_no, path, caption or f"Figure on page {page_no}", rect=rect))
+        assets.append(
+            PaperAsset(
+                "figure",
+                page_no,
+                path,
+                caption or f"Figure on page {page_no}",
+                rect=rect,
+                caption_rect=caption_rect,
+            )
+        )
     return assets
 
 
@@ -5130,6 +5267,8 @@ def _revise_report_once(
         context.summary = _ensure_chinese_report_title(context.summary)
         context.summary = _ensure_asset_markers(context.summary, context.assets)
         context.verification.revision_applied = True
+    if assets_changed:
+        context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
 
     after = _repair_state_fingerprint(context)
     changed = before != after
