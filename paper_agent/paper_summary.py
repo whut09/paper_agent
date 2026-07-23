@@ -55,6 +55,10 @@ from paper_agent.schemas.findings import (
     findings_from_verification_payload as _findings_from_verification_payload,
     infer_reason_code as _infer_reason_code,
 )
+from paper_agent.evaluation.visual_validation import (
+    VisualMeasurements as _VisualMeasurements,
+    decide_visual_layers as _decide_visual_layers,
+)
 from paper_agent.skill_prompts import load_paper_skill_reference
 
 logger = logging.getLogger(__name__)
@@ -583,6 +587,7 @@ class VerifyClaims(_PaperWorkflowNode):
             context.correction_memories,
             context.prompt_patches,
             guard_names=context.repair_recheck_guards or None,
+            source_pdf=context.pdf_path,
         )
         context.repair_recheck_guards.clear()
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
@@ -4628,6 +4633,7 @@ def _verify_summary_claims(
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
     guard_names: set[str] | None = None,
+    source_pdf: Path | None = None,
 ) -> tuple[str, VerificationResult, list[GuardResult]]:
     client = _coerce_codex_client(client)
     summary = _postprocess_summary(summary)
@@ -4661,6 +4667,7 @@ def _verify_summary_claims(
         client,
         model,
         guard_names=guard_names,
+        source_pdf=source_pdf,
     )
     guard_errors = _blocking_guard_errors(guard_results)
     if _summary_is_degraded_fallback(summary):
@@ -5031,11 +5038,12 @@ def _run_harness_guards(
     client: openai.OpenAI | None = None,
     model: str = "",
     guard_names: set[str] | None = None,
+    source_pdf: Path | None = None,
 ) -> list[GuardResult]:
     results = [
         _evidence_guard(grounded_map),
         _asset_guard(summary, assets),
-        _visual_asset_guard(summary, assets, client, model),
+        _visual_asset_guard(summary, assets, client, model, source_pdf=source_pdf),
         _coverage_guard(summary, grounded_map),
         _format_guard(summary),
         _citation_guard(summary, paper_title),
@@ -6344,6 +6352,8 @@ def _visual_asset_guard(
     assets: list[PaperAsset],
     client: openai.OpenAI | None = None,
     model: str = "",
+    *,
+    source_pdf: Path | None = None,
 ) -> GuardResult:
     if not _visual_asset_guard_enabled():
         return _guard_result("Visual Asset Guard", metrics={"skipped": "disabled"})
@@ -6354,56 +6364,140 @@ def _visual_asset_guard(
         return _guard_result("Visual Asset Guard", metrics={"checked": 0})
 
     findings: list[_Finding] = []
+    arbitration: list[tuple[int, PaperAsset, _VisualMeasurements]] = []
+    pending_text_issues: dict[int, list[dict[str, object]]] = {}
+    outcomes: dict[str, int] = {"pass": 0, "warn": 0, "block": 0, "arbitrate": 0}
+    measurement_payloads: dict[str, dict[str, object]] = {}
+    selected_by_id = {asset_id: asset for asset_id, asset in selected}
     for asset_id, asset in local_selected:
-        for issue in _local_visual_asset_issues(asset_id, asset):
+        measurements = _visual_asset_measurements(asset_id, asset, summary, assets, source_pdf)
+        deterministic_issues = _local_visual_asset_issues(asset_id, asset)
+        text_issues = _ocr_text_consistency_issues(asset_id, asset, measurements)
+        measurement_payloads[str(asset_id)] = measurements.to_dict()
+        for issue in deterministic_issues:
+            findings.append(_visual_issue_to_finding(asset_id, issue))
+        decision = _decide_visual_layers(
+            measurements,
+            deterministic_errors=[
+                issue for issue in deterministic_issues if str(issue.get("severity", "warning")) == "error"
+            ],
+            text_warnings=text_issues,
+        )
+        outcomes[decision.outcome] += 1
+        if decision.outcome == "arbitrate" and asset_id in selected_by_id:
+            arbitration.append((asset_id, asset, measurements))
+            pending_text_issues[asset_id] = text_issues
+        elif decision.outcome == "warn" and not deterministic_issues and not text_issues:
             findings.append(
                 _finding_from_legacy(
                     {
-                        **issue,
                         "asset_id": asset_id,
-                        "stage": "local_guard",
+                        "reason_code": "visual_crop_invalid",
+                        "severity": "warning",
+                        "confidence": decision.confidence,
+                        "provenance": ["visual_guard:layering"],
+                        "reason": f"asset {asset_id} visual checks require review: {decision.reason}",
                     },
-                    stage="local_guard",
-                    severity=str(issue.get("severity", "warning")),
-                    confidence=_safe_finding_confidence(
-                        issue.get("confidence"),
-                        0.92 if issue.get("severity") == "error" else 0.65,
-                    ),
-                    provenance=(str(issue.get("provenance", "local:visual-heuristic")),),
+                    stage="visual_guard",
                 )
             )
+        elif decision.outcome == "block" and not deterministic_issues:
+            reason_code = "type_mismatch" if not measurements.caption_identity else "visual_crop_invalid"
+            findings.append(
+                _finding_from_legacy(
+                    {
+                        "asset_id": asset_id,
+                        "reason_code": reason_code,
+                        "severity": "error",
+                        "confidence": decision.confidence,
+                        "provenance": ["visual_guard:deterministic"],
+                        "reason": f"asset {asset_id} deterministic visual check failed: {decision.reason}",
+                    },
+                    stage="visual_guard",
+                )
+            )
+        else:
+            for issue in text_issues:
+                findings.append(_visual_issue_to_finding(asset_id, issue))
 
     if client is None or not model:
+        for asset_id, _asset, measurements in arbitration:
+            for issue in pending_text_issues.get(asset_id, []):
+                findings.append(_visual_issue_to_finding(asset_id, issue))
+            findings.append(
+                _finding_from_legacy(
+                    {
+                        "asset_id": asset_id,
+                        "reason_code": "visual_crop_invalid",
+                        "severity": "warning",
+                        "confidence": 0.55,
+                        "provenance": ["visual_guard:layering"],
+                        "reason": f"asset {asset_id} remains ambiguous after deterministic and text checks",
+                    },
+                    stage="visual_guard",
+                )
+            )
         return _guard_result(
             "Visual Asset Guard",
             metrics={
                 "checked": 0,
                 "selected": len(selected),
                 "local_checked": len(local_selected),
+                "deterministic_checked": len(local_selected),
+                "text_checked": len(local_selected),
+                "arbitration_candidates": len(arbitration),
+                "outcomes": outcomes,
+                "measurements": measurement_payloads,
                 "model_skipped": "no_client",
+            },
+            findings=findings,
+        )
+
+    if not arbitration:
+        return _guard_result(
+            "Visual Asset Guard",
+            metrics={
+                "checked": 0,
+                "selected": len(selected),
+                "local_checked": len(local_selected),
+                "deterministic_checked": len(local_selected),
+                "text_checked": len(local_selected),
+                "arbitration_candidates": 0,
+                "outcomes": outcomes,
+                "measurements": measurement_payloads,
+                "model_skipped": "no_ambiguity",
             },
             findings=findings,
         )
 
     checked = 0
 
-    def check_one(item: tuple[int, PaperAsset]) -> tuple[int, PaperAsset, list[dict[str, object]] | None, Exception | None]:
-        asset_id, asset = item
+    def check_one(item: tuple[int, PaperAsset, _VisualMeasurements]) -> tuple[int, PaperAsset, list[dict[str, object]] | None, Exception | None]:
+        asset_id, asset, measurements = item
         if not asset.path.exists():
             return asset_id, asset, None, FileNotFoundError(str(asset.path))
         try:
-            return asset_id, asset, _check_asset_with_visual_model(asset_id, asset, client, model), None
+            return asset_id, asset, _check_asset_with_visual_model(
+                asset_id,
+                asset,
+                client,
+                model,
+                source_pdf=source_pdf,
+                measurements=measurements,
+            ), None
         except openai.BadRequestError as exc:
             return asset_id, asset, None, exc
         except Exception as exc:
             return asset_id, asset, None, exc
 
-    max_workers = min(_visual_guard_concurrency(), len(selected))
+    max_workers = min(_visual_guard_concurrency(), len(arbitration))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(check_one, item): item for item in selected}
+        future_map = {executor.submit(check_one, item): item for item in arbitration}
         for future in as_completed(future_map):
             asset_id, _asset, issues, exc = future.result()
             if isinstance(exc, openai.BadRequestError):
+                for issue in pending_text_issues.get(asset_id, []):
+                    findings.append(_visual_issue_to_finding(asset_id, issue))
                 findings.append(
                     _finding_from_legacy(
                         {
@@ -6419,6 +6513,8 @@ def _visual_asset_guard(
                 )
                 continue
             if exc is not None:
+                for issue in pending_text_issues.get(asset_id, []):
+                    findings.append(_visual_issue_to_finding(asset_id, issue))
                 findings.append(
                     _finding_from_legacy(
                         {
@@ -6436,6 +6532,9 @@ def _visual_asset_guard(
             if issues is None:
                 continue
             checked += 1
+            if issues:
+                for pending_issue in pending_text_issues.get(asset_id, []):
+                    findings.append(_visual_issue_to_finding(asset_id, pending_issue))
             for issue in issues:
                 severity = str(issue.get("severity", "warning")).lower()
                 issue_type = str(issue.get("type", "visual_issue")).strip() or "visual_issue"
@@ -6456,9 +6555,158 @@ def _visual_asset_guard(
                 )
     return _guard_result(
         "Visual Asset Guard",
-        metrics={"checked": checked, "selected": len(selected), "local_checked": len(local_selected)},
+        metrics={
+            "checked": checked,
+            "selected": len(selected),
+            "local_checked": len(local_selected),
+            "deterministic_checked": len(local_selected),
+            "text_checked": len(local_selected),
+            "arbitration_candidates": len(arbitration),
+            "outcomes": outcomes,
+            "measurements": measurement_payloads,
+        },
         findings=findings,
     )
+
+
+def _visual_issue_to_finding(asset_id: int, issue: dict[str, object]) -> _Finding:
+    severity = str(issue.get("severity", "warning"))
+    return _finding_from_legacy(
+        {
+            **issue,
+            "asset_id": asset_id,
+            "stage": "local_guard",
+            "reason": str(issue.get("message") or issue.get("reason") or "visual asset check failed"),
+        },
+        stage="local_guard",
+        severity=severity,
+        confidence=_safe_finding_confidence(
+            issue.get("confidence"),
+            0.92 if severity == "error" else 0.65,
+        ),
+        provenance=(str(issue.get("provenance", "local:visual-heuristic")),),
+    )
+
+
+def _visual_asset_measurements(
+    asset_id: int,
+    asset: PaperAsset,
+    summary: str,
+    assets: list[PaperAsset],
+    source_pdf: Path | None,
+) -> _VisualMeasurements:
+    width, height = _image_pixel_size(asset.path)
+    marker_present = bool(re.search(rf"\[\[ASSET:{asset_id}\]\]", summary))
+    caption_identity = _visual_caption_identity(asset)
+    bbox_valid = bool(asset.rect is not None and asset.rect.width > 0 and asset.rect.height > 0)
+    bbox_within_page: bool | None = None
+    if bbox_valid and source_pdf is not None:
+        try:
+            doc = fitz.open(source_pdf)
+            try:
+                if 1 <= asset.page_number <= doc.page_count:
+                    page_rect = doc[asset.page_number - 1].rect
+                    bbox_within_page = page_rect.contains(asset.rect)
+            finally:
+                doc.close()
+        except Exception:
+            bbox_within_page = None
+    text = _clean_xml_text(asset.text or "")
+    numeric_pattern = r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?:/\d+)?%?(?![A-Za-z0-9])"
+    numeric_values = len(re.findall(numeric_pattern, text))
+    rows = [line for line in text.splitlines() if line.strip()]
+    body_rows = sum(1 for row in rows if len(re.findall(numeric_pattern, row)) >= 2)
+    overlapping_objects = 0
+    if asset.rect is not None:
+        for other in assets:
+            if other is asset or other.page_number != asset.page_number or other.rect is None:
+                continue
+            intersection = asset.rect & other.rect
+            if not intersection.is_empty and intersection.get_area() / max(asset.rect.get_area(), 1.0) > 0.1:
+                overlapping_objects += 1
+    return _VisualMeasurements(
+        asset_id=asset_id,
+        kind=asset.kind,
+        width=width,
+        height=height,
+        marker_present=marker_present,
+        caption_identity=caption_identity,
+        bbox_valid=bbox_valid,
+        bbox_within_page=bbox_within_page,
+        table_border_closed=_table_border_closed(source_pdf, asset),
+        numeric_values=numeric_values,
+        body_rows=body_rows,
+        text_only=_image_looks_text_only(asset.path) if asset.path.exists() else False,
+        overlapping_objects=overlapping_objects,
+        page_number=asset.page_number,
+    )
+
+
+def _visual_caption_identity(asset: PaperAsset) -> bool:
+    if asset.kind == "table":
+        return bool(re.match(r"(?i)^\s*(?:table|tab\.)\s*\d+\b", asset.caption)) or asset.caption.strip().startswith("表")
+    if asset.kind == "figure":
+        return bool(re.match(r"(?i)^\s*(?:figure|fig\.?)\s*\d+\b", asset.caption)) or asset.caption.strip().startswith("图")
+    if asset.kind == "formula":
+        return bool(re.search(r"(?i)(?:equation|formula|eq\.?|\(\s*\d+\s*\))", asset.caption))
+    return False
+
+
+def _ocr_text_consistency_issues(
+    asset_id: int,
+    asset: PaperAsset,
+    measurements: _VisualMeasurements,
+) -> list[dict[str, object]]:
+    """Use embedded PDF text as the cheap OCR/text consistency tier."""
+
+    if asset.kind == "table" and not measurements.body_evidence_valid:
+        return [
+            {
+                "severity": "warning",
+                "reason_code": "table_body_missing",
+                "confidence": 0.68,
+                "provenance": "local:text-consistency",
+                "message": f"asset {asset_id} table text has insufficient numeric/body-row evidence",
+            }
+        ]
+    if asset.kind == "formula" and asset.text and not _line_has_formula_syntax(asset.text):
+        return [
+            {
+                "severity": "warning",
+                "reason_code": "formula_contamination",
+                "confidence": 0.68,
+                "provenance": "local:text-consistency",
+                "message": f"asset {asset_id} formula text is inconsistent with a formula crop",
+            }
+        ]
+    return []
+
+
+def _table_border_closed(source_pdf: Path | None, asset: PaperAsset) -> bool | None:
+    if source_pdf is None or asset.rect is None or asset.kind != "table":
+        return None
+    try:
+        doc = fitz.open(source_pdf)
+        try:
+            if not 1 <= asset.page_number <= doc.page_count:
+                return None
+            page = doc[asset.page_number - 1]
+            horizontal = []
+            for drawing in page.get_drawings():
+                raw = drawing.get("rect")
+                if not raw:
+                    continue
+                rect = fitz.Rect(raw)
+                if rect.height <= 2.5 and rect.width >= asset.rect.width * 0.55:
+                    if rect.x1 >= asset.rect.x0 and rect.x0 <= asset.rect.x1:
+                        horizontal.append(rect)
+            top = any(abs(line.y0 - asset.rect.y0) < 18 for line in horizontal)
+            bottom = any(abs(line.y1 - asset.rect.y1) < 18 for line in horizontal)
+            return top and bottom
+        finally:
+            doc.close()
+    except Exception:
+        return None
 
 
 def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[str, object]]:
@@ -6658,15 +6906,36 @@ def _check_asset_with_visual_model(
     asset: PaperAsset,
     client: openai.OpenAI,
     model: str,
+    *,
+    source_pdf: Path | None = None,
+    measurements: _VisualMeasurements | None = None,
 ) -> list[dict[str, object]]:
     data_url = _image_file_to_data_url(asset.path)
     width, height = _image_pixel_size(asset.path)
+    page_data_url = _pdf_page_to_data_url(source_pdf, asset.page_number) or data_url
+    measurements = measurements or _VisualMeasurements(
+        asset_id=asset_id,
+        kind=asset.kind,
+        width=width,
+        height=height,
+        marker_present=True,
+        caption_identity=True,
+        bbox_valid=asset.rect is not None,
+        bbox_within_page=None,
+        table_border_closed=None,
+        numeric_values=0,
+        body_rows=0,
+        text_only=False,
+        page_number=asset.page_number,
+    )
     prompt = (
-        "你是论文 Word 报告的截图质检员。请只检查这张截图是否适合插入报告，不评价论文内容。\n"
+        "你是论文 Word 报告的最终视觉仲裁员。请只检查候选截图是否适合插入报告，不评价论文内容。\n"
         f"截图编号: ASSET:{asset_id}\n"
         f"声明类型: {asset.kind}\n"
         f"像素尺寸: {width}x{height}\n"
         f"原始 caption/说明: {_clean_xml_text(asset.caption)[:500]}\n\n"
+        "机器测量结果：\n"
+        f"{json.dumps(measurements.to_dict(), ensure_ascii=False, sort_keys=True)}\n\n"
         "严重错误判定为 severity=error：\n"
         "1. 截图把两个独立对象混在一起，例如一张图和一个表格同时进入同一截图；\n"
         "2. 图、表或公式主体被明显截断，标题/caption 与主体不匹配，或主体缺失；\n"
@@ -6674,9 +6943,40 @@ def _check_asset_with_visual_model(
         "4. 声明类型与画面不符，例如声明为 table 但主要是 figure；\n"
         "5. 图表小到无法阅读或画面明显空白。\n"
         "轻微留白、少量 caption、正常表题/图题不算错误。\n\n"
-        "只输出 JSON，不要输出 Markdown："
-        "{\"passed\": true/false, \"issues\": [{\"severity\": \"error|warning\", \"type\": \"...\", \"reason\": \"...\"}]}"
+        "第一张图片是原始页面，第二张图片是候选截图。不要因为原始页面存在其他对象就判定候选错误。\n"
+        "只输出符合 schema 的 JSON，不要输出 Markdown 或解释文字。"
     )
+    response_schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "visual_asset_guard_result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "passed": {"type": "boolean"},
+                    "issues": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "severity": {"type": "string", "enum": ["error", "warning"]},
+                                "type": {"type": "string"},
+                                "reason": {"type": "string"},
+                                "reason_code": {"type": "string"},
+                                "confidence": {"type": "number"},
+                                "provenance": {"type": "string"},
+                            },
+                            "required": ["severity", "type", "reason", "confidence", "provenance"],
+                        },
+                    },
+                },
+                "required": ["passed", "issues"],
+            },
+        },
+    }
     request = {
         "model": model,
         "messages": [
@@ -6688,26 +6988,54 @@ def _check_asset_with_visual_model(
                 "role": "user",
                 "content": [
                     {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": page_data_url}},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
         ],
         "temperature": 0.0,
         "max_tokens": 600,
+        "response_format": response_schema,
     }
     try:
         response = client.chat.completions.create(**request)
     except openai.BadRequestError:
-        request.pop("max_tokens", None)
-        response = client.chat.completions.create(**request)
+        request["response_format"] = {"type": "json_object"}
+        try:
+            response = client.chat.completions.create(**request)
+        except openai.BadRequestError:
+            request.pop("response_format", None)
+            request.pop("max_tokens", None)
+            response = client.chat.completions.create(**request)
     content = response.choices[0].message.content or ""
     payload = _parse_visual_asset_guard_response(str(content))
     return payload.get("issues", [])
 
 
+def _pdf_page_to_data_url(source_pdf: Path | None, page_number: int) -> str | None:
+    if source_pdf is None:
+        return None
+    try:
+        doc = fitz.open(source_pdf)
+        try:
+            if not 1 <= page_number <= doc.page_count:
+                return None
+            pixmap = doc[page_number - 1].get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            encoded = base64.b64encode(pixmap.tobytes("png")).decode("ascii")
+            return f"data:image/png;base64,{encoded}"
+        finally:
+            doc.close()
+    except Exception:
+        return None
+
+
 def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
     try:
-        payload = json.loads(_extract_json_object(text))
+        payload = json.loads(str(text).strip())
+        if not isinstance(payload, dict):
+            raise ValueError("visual guard response must be a JSON object")
+        if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("issues"), list):
+            raise ValueError("visual guard response does not match the required schema")
     except Exception:
         return {
             "passed": True,
@@ -6747,6 +7075,17 @@ def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
                 ),
                 "confidence": max(0.0, min(1.0, confidence)),
                 "provenance": str(issue.get("provenance") or "vision_model"),
+            }
+        )
+    if payload.get("passed") is False and not normalized_issues:
+        normalized_issues.append(
+            {
+                "severity": "warning",
+                "type": "invalid_visual_guard_json",
+                "reason": "visual guard returned passed=false without a structured issue",
+                "reason_code": "verifier_invalid_json",
+                "confidence": 0.85,
+                "provenance": "vision_model:schema",
             }
         )
     return {"passed": bool(payload.get("passed", not normalized_issues)), "issues": normalized_issues}

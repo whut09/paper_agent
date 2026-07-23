@@ -91,7 +91,7 @@ NODE_CONTRACTS = {
             ),
             ("verification_report", "verified_report", "guard_results", "knowledge_graph"),
             ("verification.json", "grounding-map.json", "knowledge-graph.json"),
-            context_reads=("abstract", "assets", "correction_memories", "grounding_map", "paper_title", "prompt_patches", "repair_recheck_guards", "summary", "text"),
+            context_reads=("abstract", "assets", "correction_memories", "grounding_map", "paper_title", "pdf_path", "prompt_patches", "repair_recheck_guards", "summary", "text"),
             context_writes=("guard_results", "knowledge_graph", "summary", "verification"),
         ),
         WorkflowNodeContract(
