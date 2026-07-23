@@ -37,6 +37,11 @@ from paper_agent.harness.context import PaperWorkflowContext as _PaperWorkflowCo
 from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
 from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
+from paper_agent.harness.repair import (
+    RepairAction as _RepairAction,
+    RepairStateMachine as _RepairStateMachine,
+    RepairStep as _RepairStep,
+)
 from paper_agent.schemas.evidence import Claim as _Claim, ClaimGrounding as _ClaimGrounding, Evidence as _Evidence, EvidenceMap as _EvidenceMap
 from paper_agent.schemas.contracts import (
     AssetCandidatePool as _AssetCandidatePool,
@@ -228,6 +233,7 @@ class _RepairPlan:
     remove_asset_ids: set[int] = field(default_factory=set)
     rewrite_report: bool = False
     apply_patches: bool = False
+    steps: list[_RepairStep] = field(default_factory=list)
 
     @property
     def actionable(self) -> bool:
@@ -237,11 +243,17 @@ class _RepairPlan:
             or self.remove_asset_ids
             or self.rewrite_report
             or self.apply_patches
+            or self.steps
         )
 
     @property
     def has_asset_actions(self) -> bool:
-        return bool(self.missing_asset_keys or self.recapture_asset_ids or self.remove_asset_ids)
+        return bool(
+            self.missing_asset_keys
+            or self.recapture_asset_ids
+            or self.remove_asset_ids
+            or any(step.asset_id is not None or step.action == _RepairAction.CAPTURE_MISSING for step in self.steps)
+        )
 
     def action_keys(self) -> list[str]:
         keys = [f"missing:{kind}:{number}" for kind, number in self.missing_asset_keys]
@@ -251,7 +263,8 @@ class _RepairPlan:
             keys.append("rewrite:report")
         if self.apply_patches:
             keys.append("patch:claims")
-        return keys
+        keys.extend(step.attempt_key for step in self.steps)
+        return list(dict.fromkeys(keys))
 
 
 @dataclass
@@ -569,7 +582,9 @@ class VerifyClaims(_PaperWorkflowNode):
             context.assets,
             context.correction_memories,
             context.prompt_patches,
+            guard_names=context.repair_recheck_guards or None,
         )
+        context.repair_recheck_guards.clear()
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
 
 
@@ -587,7 +602,11 @@ class ReviseReport(_PaperWorkflowNode):
         policy = _GatePolicy()
         repair_plan = _build_repair_plan(context)
         decision = policy.decide(context.verification, context.revision_attempts)
-        if decision == _GateDecision.BLOCK and repair_plan.has_asset_actions:
+        if (
+            decision == _GateDecision.BLOCK
+            and context.revision_attempts < policy.max_revision_attempts
+            and repair_plan.has_asset_actions
+        ):
             decision = _GateDecision.REVISE
         elif decision == _GateDecision.REVISE and not repair_plan.actionable:
             decision = _GateDecision.BLOCK
@@ -776,6 +795,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "gate_history": list(context.gate_history),
                 "repair_attempts": dict(context.repair_attempts),
                 "repair_history": list(context.repair_history),
+                "repair_cost_used": context.repair_cost_used,
+                "repair_budget": context.repair_budget,
                 "nodes": trace,
             },
             ensure_ascii=False,
@@ -795,6 +816,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "gate_history": list(context.gate_history),
                 "repair_attempts": dict(context.repair_attempts),
                 "repair_history": list(context.repair_history),
+                "repair_cost_used": context.repair_cost_used,
+                "repair_budget": context.repair_budget,
                 "verification": _verification_payload(context.verification),
                 "guards": [_guard_payload(result) for result in context.guard_results],
             },
@@ -4604,6 +4627,7 @@ def _verify_summary_claims(
     assets: list[PaperAsset],
     correction_memories: list[CorrectionMemory] | None = None,
     prompt_patches: list[PromptPatch] | None = None,
+    guard_names: set[str] | None = None,
 ) -> tuple[str, VerificationResult, list[GuardResult]]:
     client = _coerce_codex_client(client)
     summary = _postprocess_summary(summary)
@@ -4636,6 +4660,7 @@ def _verify_summary_claims(
         correction_memories or [],
         client,
         model,
+        guard_names=guard_names,
     )
     guard_errors = _blocking_guard_errors(guard_results)
     if _summary_is_degraded_fallback(summary):
@@ -5005,8 +5030,9 @@ def _run_harness_guards(
     memories: list[CorrectionMemory],
     client: openai.OpenAI | None = None,
     model: str = "",
+    guard_names: set[str] | None = None,
 ) -> list[GuardResult]:
-    return [
+    results = [
         _evidence_guard(grounded_map),
         _asset_guard(summary, assets),
         _visual_asset_guard(summary, assets, client, model),
@@ -5016,6 +5042,9 @@ def _run_harness_guards(
         _loop_guard(),
         _memory_guard(memories),
     ]
+    if not guard_names:
+        return results
+    return [result for result in results if result.name in guard_names]
 
 
 def _blocking_guard_errors(results: list[GuardResult]) -> list[str]:
@@ -5186,33 +5215,110 @@ def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
     if context.verification is None:
         return _RepairPlan()
 
+    findings = list(context.verification.findings)
+    legacy_failures = context.verification.hard_failures or [
+        {"reason": error} for error in context.verification.errors
+    ]
+    findings.extend(
+        _finding_from_legacy(
+            failure,
+            stage="repair",
+            severity="error",
+            confidence=0.95,
+            provenance=("repair:legacy-verification",),
+        )
+        for failure in legacy_failures
+    )
+    findings = _aggregate_findings(findings)
+    state_machine = _RepairStateMachine(
+        max_actions_per_asset=context.repair_max_actions_per_asset,
+        max_global_cost=context.repair_budget,
+    )
+    steps = state_machine.plan(
+        findings,
+        attempted=context.repair_attempts,
+        global_cost_used=context.repair_cost_used,
+    )
+    if not context.verification.patch_suggestions:
+        steps = [step for step in steps if step.reason_code != "unsupported_core_claim"]
+
     can_capture_assets = context.pdf_path is not None and context.work_dir is not None
     available = set(_critical_asset_key_map(context.assets))
     referenced = _critical_referenced_asset_keys(context.summary)
-    missing_asset_keys = [
+    uncaptured_asset_keys = [
         key
         for key in sorted(referenced - available, key=_critical_asset_sort_key)
         if can_capture_assets
         and context.repair_attempts.get(f"missing:{key[0]}:{key[1]}", 0) < 1
     ]
-
-    bad_asset_ids = _valid_visual_asset_failure_ids(context)
+    missing_asset_keys = (
+        uncaptured_asset_keys
+        if any(step.action == _RepairAction.CAPTURE_MISSING for step in steps)
+        else []
+    )
+    recapture_actions = {
+        _RepairAction.EXPAND_BORDER,
+        _RepairAction.SPLIT_AT_BORDER,
+        _RepairAction.RECAPTURE_ASSET,
+        _RepairAction.EXTEND_CAPTION,
+        _RepairAction.SPLIT_OBJECTS,
+        _RepairAction.SELECT_ALTERNATE,
+        _RepairAction.TIGHTEN_FORMULA,
+        _RepairAction.VISUAL_ARBITRATION,
+    }
     recapture_asset_ids = {
+        step.asset_id
+        for step in steps
+        if step.asset_id is not None
+        and step.action in recapture_actions
+        and can_capture_assets
+        and 1 <= step.asset_id <= len(context.assets)
+    }
+    # Keep the legacy visual-crop route for old verification payloads whose
+    # reason code predates typed findings.  New typed findings are handled by
+    # the state-machine steps above and never fall through to blind expansion.
+    bad_asset_ids = _valid_visual_asset_failure_ids(context)
+    planned_asset_ids = {step.asset_id for step in steps if step.asset_id is not None}
+    recapture_asset_ids.update(
         asset_id
         for asset_id in bad_asset_ids
-        if can_capture_assets
-        and _is_critical_asset(context.assets[asset_id - 1])
+        if asset_id not in planned_asset_ids
+        and can_capture_assets
         and context.repair_attempts.get(f"recapture:{asset_id}", 0) < 1
-    }
+        and _is_critical_asset(context.assets[asset_id - 1])
+    )
     remove_asset_ids = {
+        step.asset_id
+        for step in steps
+        if step.asset_id is not None
+        and step.action == _RepairAction.DISCARD_CANDIDATE
+        and 1 <= step.asset_id <= len(context.assets)
+    }
+    remove_asset_ids.update(
         asset_id
         for asset_id in bad_asset_ids
-        if not _is_critical_asset(context.assets[asset_id - 1])
+        if asset_id not in planned_asset_ids
+        and not _is_critical_asset(context.assets[asset_id - 1])
         and context.repair_attempts.get(f"remove:{asset_id}", 0) < 1
-    }
+    )
     rewrite_report = (
         context.revision_attempts < 2
-        and _verification_needs_full_report_rewrite(context.verification)
+        and (
+            (
+                any(
+                    step.action == _RepairAction.REWRITE_REPORT
+                    and step.reason_code
+                    in {
+                        "caption_truncated",
+                        "weak_evidence",
+                        "legacy_error",
+                    }
+                    for step in steps
+                )
+                and not context.verification.patch_suggestions
+            )
+            or _verification_needs_full_report_rewrite(context.verification)
+        )
         and context.repair_attempts.get("rewrite:report", 0) < 1
     )
     apply_patches = (
@@ -5227,6 +5333,7 @@ def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
         remove_asset_ids=remove_asset_ids,
         rewrite_report=rewrite_report,
         apply_patches=apply_patches,
+        steps=steps,
     )
 
 
@@ -5255,6 +5362,38 @@ def _repair_state_fingerprint(context: _PaperWorkflowContext) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _repair_step_signature(context: _PaperWorkflowContext, step: _RepairStep) -> str:
+    """Return the smallest relevant signature for a targeted repair step."""
+
+    if step.action == _RepairAction.DISCARD_CANDIDATE:
+        return _RepairStateMachine.signature(
+            {"discarded_asset": step.asset_id, "remaining": len(context.assets)}
+        )
+    if step.asset_id is not None and 1 <= step.asset_id <= len(context.assets):
+        return _RepairStateMachine.signature(context.assets[step.asset_id - 1])
+    if step.action in {
+        _RepairAction.REWRITE_REPORT,
+        _RepairAction.RETRY_VERIFIER,
+        _RepairAction.USE_DETERMINISTIC,
+    }:
+        return _RepairStateMachine.signature(context.summary)
+    return _repair_state_fingerprint(context)
+
+
+def _missing_key_for_repair_step(
+    step: _RepairStep,
+    keys: list[tuple[str, str]],
+    summary: str,
+) -> tuple[str, str] | None:
+    if step.target.startswith("missing:"):
+        _prefix, kind, number = step.target.split(":", 2)
+        candidate = (kind, number)
+        if candidate in keys:
+            return candidate
+    referenced = _critical_referenced_asset_keys(summary)
+    return next((key for key in keys if key in referenced), keys[0] if keys else None)
+
+
 def _revise_report_once(
     context: _PaperWorkflowContext,
     plan: _RepairPlan | None = None,
@@ -5268,32 +5407,81 @@ def _revise_report_once(
     context.verification.revision_attempted = True
     context.revision_attempts += 1
     before = _repair_state_fingerprint(context)
+    if plan.has_asset_actions:
+        context.repair_recheck_guards.update({"Asset Guard", "Visual Asset Guard"})
+    if plan.rewrite_report or plan.apply_patches:
+        context.repair_recheck_guards.update({"Evidence Guard", "Format Guard", "Coverage Guard"})
     action_keys = plan.action_keys()
     for action_key in action_keys:
         context.repair_attempts[action_key] = context.repair_attempts.get(action_key, 0) + 1
+    context.repair_cost_used += sum(step.cost for step in plan.steps)
 
     revised_summary = context.summary
     assets_changed = False
     captured_keys: list[str] = []
-    for key in plan.missing_asset_keys:
-        captured = _capture_missing_asset_by_label(context, key)
-        if captured is None:
-            logger.warning("Unable to capture missing critical asset %s", _critical_asset_label(key))
-            continue
-        context.assets.append(captured)
-        assets_changed = True
-        captured_keys.append(_critical_asset_label(key))
-        logger.info("Captured missing critical asset %s from page %s", _critical_asset_label(key), captured.page_number)
+    step_before: dict[str, str] = {
+        step.attempt_key: _repair_step_signature(context, step)
+        for step in plan.steps
+    }
+    executed_recaptures: set[int] = set()
+    executed_removals: set[int] = set()
 
-    if plan.recapture_asset_ids:
-        repaired_asset_ids = _recapture_critical_visual_assets(context, plan.recapture_asset_ids)
-        assets_changed = assets_changed or bool(repaired_asset_ids)
+    for step in plan.steps:
+        if step.action == _RepairAction.SCORE_CANDIDATES:
+            # Candidate pools are deterministic and local; this step is the
+            # classification evidence used by the next mutation step.
+            context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
+        elif step.action == _RepairAction.CAPTURE_MISSING:
+            missing_key = _missing_key_for_repair_step(step, plan.missing_asset_keys, context.summary)
+            if missing_key is None and step.asset_id is not None:
+                repaired = _recapture_critical_visual_assets(
+                    context,
+                    {step.asset_id},
+                    action=step.action,
+                )
+                assets_changed = assets_changed or bool(repaired)
+                executed_recaptures.add(step.asset_id)
+                continue
+            if missing_key is None:
+                continue
+            captured = _capture_missing_asset_by_label(context, missing_key)
+            if captured is None:
+                logger.warning("Unable to capture missing critical asset %s", _critical_asset_label(missing_key))
+                continue
+            context.assets.append(captured)
+            assets_changed = True
+            captured_keys.append(_critical_asset_label(missing_key))
+            logger.info("Captured missing critical asset %s from page %s", _critical_asset_label(missing_key), captured.page_number)
+        elif step.action in {
+            _RepairAction.EXPAND_BORDER,
+            _RepairAction.SPLIT_AT_BORDER,
+            _RepairAction.RECAPTURE_ASSET,
+            _RepairAction.EXTEND_CAPTION,
+            _RepairAction.SPLIT_OBJECTS,
+            _RepairAction.SELECT_ALTERNATE,
+            _RepairAction.TIGHTEN_FORMULA,
+            _RepairAction.VISUAL_ARBITRATION,
+        } and step.asset_id is not None:
+            repaired = _recapture_critical_visual_assets(
+                context,
+                {step.asset_id},
+                action=step.action,
+            )
+            assets_changed = assets_changed or bool(repaired)
+            executed_recaptures.add(step.asset_id)
+        elif step.action == _RepairAction.DISCARD_CANDIDATE and step.asset_id is not None:
+            executed_removals.add(step.asset_id)
 
-    if plan.remove_asset_ids:
+    legacy_recaptures = plan.recapture_asset_ids - executed_recaptures
+    if legacy_recaptures:
+        repaired = _recapture_critical_visual_assets(context, legacy_recaptures)
+        assets_changed = assets_changed or bool(repaired)
+    all_removals = plan.remove_asset_ids | executed_removals
+    if all_removals:
         revised_summary, context.assets = _drop_assets_and_rewrite_markers(
             revised_summary,
             context.assets,
-            plan.remove_asset_ids,
+            all_removals,
         )
         assets_changed = True
 
@@ -5302,7 +5490,7 @@ def _revise_report_once(
         revised_summary = _repair_report_format_with_codex(
             client,
             config.model,
-            context.summary,
+            revised_summary,
             context.assets,
             context.abstract,
             context.paper_title,
@@ -5326,6 +5514,14 @@ def _revise_report_once(
 
     after = _repair_state_fingerprint(context)
     changed = before != after
+    transitions: list[dict[str, object]] = []
+    for step in plan.steps:
+        transition = _RepairStateMachine.transition(
+            step,
+            before_signature=step_before.get(step.attempt_key, before),
+            after_signature=_repair_step_signature(context, step),
+        )
+        transitions.append(transition.to_dict())
     context.repair_history.append(
         {
             "attempt": context.revision_attempts,
@@ -5334,6 +5530,9 @@ def _revise_report_once(
             "changed": changed,
             "before": before,
             "after": after,
+            "cost": sum(step.cost for step in plan.steps),
+            "cost_used": context.repair_cost_used,
+            "transitions": transitions,
         }
     )
     return _NodeResult(
@@ -5350,6 +5549,8 @@ def _revise_report_once(
             "revision_attempts": context.revision_attempts,
             "repair_actions": len(action_keys),
             "repair_changed": changed,
+            "repair_cost_used": context.repair_cost_used,
+            "repair_transitions": len(transitions),
         },
     )
 
@@ -5401,6 +5602,8 @@ def _capture_missing_asset_by_label(
 def _recapture_critical_visual_assets(
     context: _PaperWorkflowContext,
     bad_asset_ids: set[int],
+    *,
+    action: _RepairAction | None = None,
 ) -> set[int]:
     if context.pdf_path is None or context.work_dir is None:
         return set()
@@ -5408,7 +5611,6 @@ def _recapture_critical_visual_assets(
         asset_id
         for asset_id in bad_asset_ids
         if 1 <= asset_id <= len(context.assets)
-        and _is_critical_asset(context.assets[asset_id - 1])
     }
     if not critical_ids:
         return set()
@@ -5444,29 +5646,50 @@ def _recapture_critical_visual_assets(
             else:
                 continue
             original_key = _asset_label_key(original)
+            display_label = _critical_asset_label(original_key) if original_key else (original.caption or f"asset {asset_id}")
             replacement = next(
                 (candidate for candidate in candidates if _asset_label_key(candidate) == original_key),
                 None,
             )
             if replacement is None:
-                logger.warning("Unable to recapture critical asset %s", _critical_asset_label(original_key))
+                logger.warning("Unable to recapture asset %s", display_label)
                 continue
             if _asset_capture_signature(replacement) == _asset_capture_signature(original):
-                replacement = _adaptive_visual_recapture(
-                    page,
-                    original,
-                    repair_dir,
-                    asset_id,
-                    failure_reasons.get(asset_id, []),
-                )
+                # Mixed objects must be split or rejected.  They are never
+                # repaired by blindly enlarging the crop.
+                if action == _RepairAction.SPLIT_OBJECTS:
+                    replacement = _split_mixed_visual_asset(
+                        page,
+                        original,
+                        repair_dir,
+                        asset_id,
+                    )
+                elif action == _RepairAction.SELECT_ALTERNATE:
+                    replacement = next(
+                        (
+                            candidate
+                            for candidate in candidates
+                            if _asset_capture_signature(candidate)
+                            != _asset_capture_signature(original)
+                        ),
+                        None,
+                    )
+                else:
+                    replacement = _adaptive_visual_recapture(
+                        page,
+                        original,
+                        repair_dir,
+                        asset_id,
+                        failure_reasons.get(asset_id, []),
+                    )
                 if replacement is None or _asset_capture_signature(replacement) == _asset_capture_signature(original):
-                    logger.warning("Recapture produced no geometric change for critical asset %s", _critical_asset_label(original_key))
+                    logger.warning("Recapture produced no geometric change for asset %s", display_label)
                     continue
             context.assets[asset_id - 1] = replacement
             repaired.add(asset_id)
             logger.info(
                 "Recaptured critical asset %s from page %s",
-                _critical_asset_label(original_key),
+                display_label,
                 original.page_number,
             )
     finally:
@@ -5501,6 +5724,55 @@ def _adaptive_visual_recapture(
     if not incomplete_crop:
         return None
     return _expand_truncated_table_asset(page, original, repair_dir, asset_id)
+
+
+def _split_mixed_visual_asset(
+    page: fitz.Page,
+    original: PaperAsset,
+    repair_dir: Path,
+    asset_id: int,
+) -> PaperAsset | None:
+    """Split a mixed crop at the first independently detectable object boundary."""
+
+    if original.rect is None:
+        return None
+    rect = fitz.Rect(original.rect)
+    boundaries: list[float] = []
+    try:
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 1 or not block.get("bbox"):
+                continue
+            image_rect = fitz.Rect(block["bbox"])
+            if image_rect.y0 > rect.y0 + rect.height * 0.25 and image_rect.intersects(rect):
+                boundaries.append(image_rect.y0 - 2)
+    except Exception:
+        pass
+    lines = _page_text_lines(page)
+    for line in lines:
+        if line.rect.y0 <= rect.y0 + rect.height * 0.25:
+            continue
+        if _caption_is_figure(line.text) or _caption_is_table(line.text):
+            if line.rect.y0 < rect.y1:
+                boundaries.append(line.rect.y0 - 2)
+    split_y = min(boundaries) if boundaries else None
+    if split_y is None or split_y <= rect.y0 + 20 or split_y >= rect.y1 - 8:
+        return None
+    split = fitz.Rect(rect.x0, rect.y0, rect.x1, split_y)
+    if split.height < rect.height * 0.35:
+        return None
+    path = repair_dir / f"asset-{asset_id:02d}-split.png"
+    _save_clip(page, split, path, padding=2, scale=4)
+    text = _clean_xml_text(page.get_textbox(split)).strip()
+    return PaperAsset(
+        original.kind,
+        original.page_number,
+        path,
+        original.caption,
+        text or original.text,
+        latex=original.latex,
+        rect=split,
+        caption_rect=original.caption_rect,
+    )
 
 
 def _expand_truncated_table_asset(

@@ -91,7 +91,7 @@ NODE_CONTRACTS = {
             ),
             ("verification_report", "verified_report", "guard_results", "knowledge_graph"),
             ("verification.json", "grounding-map.json", "knowledge-graph.json"),
-            context_reads=("abstract", "assets", "correction_memories", "grounding_map", "paper_title", "prompt_patches", "summary", "text"),
+            context_reads=("abstract", "assets", "correction_memories", "grounding_map", "paper_title", "prompt_patches", "repair_recheck_guards", "summary", "text"),
             context_writes=("guard_results", "knowledge_graph", "summary", "verification"),
         ),
         WorkflowNodeContract(
@@ -102,6 +102,8 @@ NODE_CONTRACTS = {
                 "assets",
                 "revision_attempts",
                 "repair_attempts",
+                "repair_budget",
+                "repair_cost_used",
             ),
             ("gate_decision", "verified_report", "repair_history"),
             ("verification-failed.md", "trace.json", "verification.json"),

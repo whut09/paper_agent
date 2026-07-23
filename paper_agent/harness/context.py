@@ -58,6 +58,10 @@ class PaperWorkflowContext:
     revision_attempts: int = 0
     repair_attempts: dict[str, int] = field(default_factory=dict)
     repair_history: list[dict[str, Any]] = field(default_factory=list)
+    repair_cost_used: float = 0.0
+    repair_budget: float = 8.0
+    repair_max_actions_per_asset: int = 2
+    repair_recheck_guards: set[str] = field(default_factory=set)
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None
