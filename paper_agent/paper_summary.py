@@ -1946,7 +1946,7 @@ def _table_rect_below_caption(
 ) -> tuple[fitz.Rect | None, str]:
     left, right = _caption_column_bounds(page, caption_rect)
     search_top = caption_rect.y1 + 2
-    search_bottom = _next_caption_or_heading_y(lines, caption_rect, left, right) or min(
+    search_bottom = _next_caption_y(lines, caption_rect, left, right) or min(
         page.rect.height - 28,
         search_top + min(360, page.rect.height * 0.46),
     )
@@ -1961,19 +1961,23 @@ def _table_rect_below_caption(
     selected: list[TextLine] = []
     previous_y1: float | None = None
 
-    for group in row_groups:
+    for group_index, group in enumerate(row_groups):
         row_rect = _merge_rects([line.rect for line in group])
         if row_rect.is_empty:
             continue
         row_text = " ".join(line.text for line in group)
-        if selected and _line_looks_section_heading(row_text):
-            break
         if selected and previous_y1 is not None and row_rect.y0 - previous_y1 > 44:
             break
-        if selected and _row_looks_table_section_label(row_text, group):
+        if (
+            selected
+            and _row_looks_table_section_label(row_text, group)
+            and _table_section_label_has_following_data(row_groups, group_index)
+        ):
             selected.extend(group)
             previous_y1 = row_rect.y1
             continue
+        if selected and _line_looks_section_heading(row_text):
+            break
         if _row_is_prose_after_table(row_text, group, bool(selected)):
             if selected:
                 break
@@ -2001,6 +2005,38 @@ def _table_rect_below_caption(
     )
     text = "\n".join(_clean_xml_text(" ".join(line.text for line in group)) for group in row_groups if any(line in selected for line in group))
     return rect, text[:2500]
+
+
+def _next_caption_y(
+    lines: list[TextLine],
+    caption_rect: fitz.Rect,
+    left: float,
+    right: float,
+) -> float | None:
+    candidates = [
+        line.rect.y0 - 2
+        for line in lines
+        if line.rect.y0 > caption_rect.y1 + 3
+        and line.rect.y0 - caption_rect.y1 <= 390
+        and _horizontal_overlap_fraction(line.rect, left, right) > 0
+        and (_caption_is_table(line.text) or _caption_is_figure(line.text))
+    ]
+    return min(candidates) if candidates else None
+
+
+def _table_section_label_has_following_data(
+    row_groups: list[list[TextLine]],
+    group_index: int,
+) -> bool:
+    label_rect = _merge_rects([line.rect for line in row_groups[group_index]])
+    for next_group in row_groups[group_index + 1 : group_index + 4]:
+        next_rect = _merge_rects([line.rect for line in next_group])
+        if next_rect.y0 - label_rect.y1 > 30:
+            break
+        next_text = " ".join(line.text for line in next_group)
+        if _row_looks_table_like(next_text, next_group) and re.search(r"\d", next_text):
+            return True
+    return False
 
 
 def _table_rect_above_caption(
@@ -5185,6 +5221,7 @@ def _recapture_critical_visual_assets(
         return set()
 
     repaired: set[int] = set()
+    failure_reasons = _visual_asset_failure_reasons(context.verification)
     doc = fitz.open(context.pdf_path)
     try:
         for asset_id in sorted(critical_ids):
@@ -5222,8 +5259,16 @@ def _recapture_critical_visual_assets(
                 logger.warning("Unable to recapture critical asset %s", _critical_asset_label(original_key))
                 continue
             if _asset_capture_signature(replacement) == _asset_capture_signature(original):
-                logger.warning("Recapture produced no geometric change for critical asset %s", _critical_asset_label(original_key))
-                continue
+                replacement = _adaptive_visual_recapture(
+                    page,
+                    original,
+                    repair_dir,
+                    asset_id,
+                    failure_reasons.get(asset_id, []),
+                )
+                if replacement is None or _asset_capture_signature(replacement) == _asset_capture_signature(original):
+                    logger.warning("Recapture produced no geometric change for critical asset %s", _critical_asset_label(original_key))
+                    continue
             context.assets[asset_id - 1] = replacement
             repaired.add(asset_id)
             logger.info(
@@ -5234,6 +5279,139 @@ def _recapture_critical_visual_assets(
     finally:
         doc.close()
     return repaired
+
+
+def _adaptive_visual_recapture(
+    page: fitz.Page,
+    original: PaperAsset,
+    repair_dir: Path,
+    asset_id: int,
+    reasons: list[str],
+) -> PaperAsset | None:
+    if original.kind != "table" or original.rect is None:
+        return None
+    lowered = " ".join(reasons).lower()
+    incomplete_crop = any(
+        token in lowered
+        for token in (
+            "truncated",
+            "cropped",
+            "cut off",
+            "incomplete",
+            "too shallow",
+            "missing_table_body",
+            "missing table body",
+            "lacks numeric body rows",
+            "caption/header",
+        )
+    )
+    if not incomplete_crop:
+        return None
+    return _expand_truncated_table_asset(page, original, repair_dir, asset_id)
+
+
+def _expand_truncated_table_asset(
+    page: fitz.Page,
+    original: PaperAsset,
+    repair_dir: Path,
+    asset_id: int,
+) -> PaperAsset | None:
+    if original.rect is None:
+        return None
+    rect = fitz.Rect(original.rect)
+    lines = _page_text_lines(page)
+    left, right = _caption_column_bounds(page, rect)
+    stop_y = _next_table_repair_boundary_y(lines, rect, left, right) or min(
+        page.rect.y1 - 20,
+        rect.y1 + min(360, page.rect.height * 0.46),
+    )
+    compatible_borders: list[fitz.Rect] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    for drawing in drawings:
+        raw_rect = drawing.get("rect")
+        if not raw_rect:
+            continue
+        border = fitz.Rect(raw_rect)
+        if border.width <= 0 or border.height > 2.5:
+            continue
+        if border.y0 < rect.y0 - 18 or border.y1 >= stop_y:
+            continue
+        if border.width < max(80.0, rect.width * 0.6):
+            continue
+        if _horizontal_overlap_fraction(border, left, right) < 0.55:
+            continue
+        compatible_borders.append(border)
+    lower_borders = [border for border in compatible_borders if border.y1 > rect.y1 + 4]
+    if not lower_borders:
+        return None
+    bottom_border = max(lower_borders, key=lambda border: border.y1)
+    expanded = fitz.Rect(
+        max(page.rect.x0, min(rect.x0, bottom_border.x0)),
+        max(page.rect.y0, rect.y0),
+        min(page.rect.x1, max(rect.x1, bottom_border.x1)),
+        min(page.rect.y1, bottom_border.y1 + 0.5),
+    )
+    if expanded.height <= rect.height + 4:
+        return None
+    caption = original.caption
+    caption_rect: fitz.Rect | None = None
+    original_key = _asset_label_key(original)
+    for line_index, line in enumerate(lines):
+        if not _caption_is_table(line.text):
+            continue
+        candidate_caption, candidate_rect = _caption_text_and_rect(
+            lines,
+            line_index,
+            page,
+            "table",
+        )
+        candidate = PaperAsset(
+            "table",
+            original.page_number,
+            Path(),
+            candidate_caption,
+        )
+        if _asset_label_key(candidate) == original_key:
+            caption = candidate_caption
+            caption_rect = candidate_rect
+            break
+    clip_rect = _merge_rects([expanded, caption_rect]) if caption_rect else expanded
+    path = repair_dir / f"asset-{asset_id:02d}-expanded-table.png"
+    _save_clip(page, clip_rect, path, padding=2, scale=4)
+    text = _clean_xml_text(page.get_textbox(expanded)).strip()
+    return PaperAsset(
+        "table",
+        original.page_number,
+        path,
+        caption,
+        text or original.text,
+        rect=expanded,
+    )
+
+
+def _next_table_repair_boundary_y(
+    lines: list[TextLine],
+    table_rect: fitz.Rect,
+    left: float,
+    right: float,
+) -> float | None:
+    candidates: list[float] = []
+    for line in lines:
+        if line.rect.y0 <= table_rect.y1 + 3:
+            continue
+        if line.rect.y0 - table_rect.y1 > 390:
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0:
+            continue
+        if _caption_is_table(line.text) or _caption_is_figure(line.text):
+            candidates.append(line.rect.y0 - 2)
+            continue
+        if _line_looks_section_heading(line.text) and line.rect.y0 - table_rect.y1 > 80:
+            candidates.append(line.rect.y0 - 2)
+    return min(candidates) if candidates else None
 
 
 def _asset_capture_signature(asset: PaperAsset) -> tuple:
@@ -5256,6 +5434,22 @@ def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
         for asset_id in _visual_asset_failure_ids(context.verification)
         if 1 <= asset_id <= len(context.assets)
     }
+
+
+def _visual_asset_failure_reasons(
+    verification: VerificationResult | None,
+) -> dict[int, list[str]]:
+    if verification is None:
+        return {}
+    reasons: dict[int, list[str]] = {}
+    failures = verification.hard_failures or [{"reason": error} for error in verification.errors]
+    for failure in failures:
+        reason = _clean_xml_text(failure.get("reason", "") or failure.get("message", ""))
+        if "Visual Asset Guard" not in reason:
+            continue
+        for match in re.findall(r"\basset\s+(\d+)\b", reason):
+            reasons.setdefault(int(match), []).append(reason)
+    return reasons
 
 
 def _visual_asset_failure_ids(verification: VerificationResult) -> set[int]:

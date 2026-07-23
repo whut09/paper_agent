@@ -16,6 +16,7 @@ from paper_agent.paper_summary import (
     _asset_display_label,
     _asset_context,
     _apply_verifier_patch_suggestions,
+    _adaptive_visual_recapture,
     _attach_claims_to_grounding_map,
     _build_prompt_patches,
     _build_grounding_map,
@@ -2150,6 +2151,106 @@ def test_table_below_caption_uses_merged_detector_fragments_above_not_formula_be
     assert table_rect == fitz.Rect(64, 350, 293, 495)
     assert "GPT-4" in table_text
     assert "RAAS" in table_text
+
+
+def test_table_crop_keeps_title_case_group_labels_and_following_rows():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def find_tables(self):
+            raise RuntimeError("detector unavailable")
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(72, 121, 279, 121)},
+                {"rect": fitz.Rect(72, 137, 279, 137)},
+                {"rect": fitz.Rect(72, 183, 279, 183)},
+                {"rect": fitz.Rect(72, 209, 279, 209)},
+            ]
+
+    lines = [
+        line("Table 2. Generalizability to other domains.", 58, 73, 295, 82),
+        line("Domain", 72, 126, 100, 134),
+        line("Benchmark", 148, 126, 188, 134),
+        line("Base", 205, 126, 221, 134),
+        line("Ours", 233, 126, 250, 134),
+        line("Gain", 262, 126, 279, 134),
+        line("ChartQA", 148, 141, 177, 149),
+        line("87.3", 206, 141, 220, 149),
+        line("91.2", 234, 141, 249, 149),
+        line("+3.9", 263, 141, 278, 149),
+        line("Chart Reasoning", 72, 156, 126, 164),
+        line("ChartQAPro", 148, 162, 188, 170),
+        line("41.3", 206, 162, 220, 170),
+        line("46.3", 234, 162, 249, 170),
+        line("+5.0", 263, 162, 278, 170),
+        line("Design2Code", 148, 188, 191, 196),
+        line("29.1", 206, 188, 220, 196),
+        line("34.3", 234, 188, 249, 196),
+        line("+5.2", 263, 188, 278, 196),
+        line("Multimodal Coding", 72, 193, 136, 201),
+        line("UIFlow2Code", 148, 198, 193, 206),
+        line("75.9", 206, 198, 220, 206),
+        line("81.5", 234, 198, 249, 206),
+        line("+5.6", 263, 198, 278, 206),
+        line("Table 3. Next table.", 58, 214, 295, 223),
+    ]
+
+    caption_text, caption_rect = _caption_text_and_rect(lines, 0, FakePage(), "table")
+    table_rect, table_text = _table_rect_for_caption(FakePage(), caption_rect, lines)
+
+    assert caption_text.startswith("Table 2")
+    assert table_rect is not None
+    assert table_rect.y1 >= 209
+    assert "ChartQAPro" in table_text
+    assert "UIFlow2Code" in table_text
+
+
+def test_adaptive_recapture_expands_truncated_table_to_lower_border():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_drawings(self):
+            return [
+                {"rect": fitz.Rect(72, 121, 279, 121)},
+                {"rect": fitz.Rect(72, 137, 279, 137)},
+                {"rect": fitz.Rect(72, 183, 279, 183)},
+                {"rect": fitz.Rect(72, 209, 279, 209)},
+            ]
+
+        def get_textbox(self, rect):
+            return "Domain Benchmark Base Ours Gain\nChartQA 87.3 91.2 +3.9\nUIFlow2Code 75.9 81.5 +5.6"
+
+    original = PaperAsset(
+        "table",
+        8,
+        Path("table2.png"),
+        "Table 2. Generalizability.",
+        text="Domain Benchmark Base Ours Gain\nChartQA 87.3 91.2 +3.9",
+        rect=fitz.Rect(72, 121, 279, 154),
+    )
+    lines = [
+        line("Table 2. Generalizability.", 58, 73, 295, 82),
+        line("Chart Reasoning", 72, 156, 126, 164),
+        line("Table 3. Next table.", 58, 214, 295, 223),
+    ]
+
+    with TemporaryDirectory() as temp_dir, patch(
+        "paper_agent.paper_summary._page_text_lines",
+        return_value=lines,
+    ), patch("paper_agent.paper_summary._save_clip"):
+        replacement = _adaptive_visual_recapture(
+            FakePage(),
+            original,
+            Path(temp_dir),
+            7,
+            ["Visual Asset Guard: asset 7 truncated_table"],
+        )
+
+    assert replacement is not None
+    assert replacement.rect is not None
+    assert replacement.rect.y1 >= 209
+    assert replacement.path.name == "asset-07-expanded-table.png"
 
 
 def test_table_crop_stops_before_unnumbered_section_heading():
