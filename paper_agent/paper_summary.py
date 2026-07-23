@@ -5993,7 +5993,11 @@ def _table_asset_text_looks_incomplete(asset: PaperAsset, width: int, height: in
     if not text.strip():
         return width >= 700 and height < 420
     lines = [line.strip() for line in text.splitlines() if line.strip()]
-    numeric_rows = [line for line in lines if len(re.findall(r"\d+(?:\.\d+)?", line)) >= 2]
+    numeric_value_pattern = r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?:/\d+)?%?(?![A-Za-z0-9])"
+    numeric_values = re.findall(numeric_value_pattern, text)
+    if len(numeric_values) >= 4:
+        return False
+    numeric_rows = [line for line in lines if len(re.findall(numeric_value_pattern, line)) >= 2]
     header_like_rows = [
         line
         for line in lines

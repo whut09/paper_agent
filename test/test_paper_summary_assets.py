@@ -1494,6 +1494,26 @@ def test_local_visual_asset_guard_blocks_header_only_table():
     assert any("caption/header" in issue["message"] for issue in issues)
 
 
+def test_local_visual_asset_guard_accepts_flattened_table_with_numeric_body():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "page-007-captioned-table-02.png"
+        Image.new("RGB", (887, 391), "white").save(table)
+        asset = PaperAsset(
+            "table",
+            7,
+            table,
+            "Table 2. Success rate for grasp timing control.",
+            text=(
+                "LINGO Ours(SR) | 0.0 0.0 0.0 84.7 78.0 76.0 | "
+                "0.0 0.0 0.0 88.0 75.3 37.3"
+            ),
+        )
+
+        issues = _local_visual_asset_issues(7, asset)
+
+    assert not any("caption/header" in issue["message"] for issue in issues)
+
+
 def test_local_visual_asset_guard_blocks_formula_with_surrounding_prose():
     with TemporaryDirectory() as tmp:
         formula = Path(tmp) / "bad-formula.png"
