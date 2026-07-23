@@ -13,6 +13,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, TYPE_CHECKING
 
+from paper_agent.schemas.findings import Finding
+
 BoundingBox = tuple[float, float, float, float]
 
 
@@ -165,6 +167,7 @@ class GuardResultContract:
     errors: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     metrics: tuple[tuple[str, str], ...] = ()
+    findings: tuple[Finding, ...] = ()
 
 
 _CAPTION_PATTERNS = {

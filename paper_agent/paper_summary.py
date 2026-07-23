@@ -43,6 +43,13 @@ from paper_agent.schemas.contracts import (
     CandidateStrategy as _CandidateStrategy,
     EvidenceBundle as _EvidenceBundle,
 )
+from paper_agent.schemas.findings import (
+    Finding as _Finding,
+    aggregate_findings as _aggregate_findings,
+    finding_from_legacy as _finding_from_legacy,
+    findings_from_verification_payload as _findings_from_verification_payload,
+    infer_reason_code as _infer_reason_code,
+)
 from paper_agent.skill_prompts import load_paper_skill_reference
 
 logger = logging.getLogger(__name__)
@@ -211,6 +218,7 @@ class VerificationResult:
     patch_suggestions: list[dict[str, str]] = field(default_factory=list)
     revision_attempted: bool = False
     revision_applied: bool = False
+    findings: list[_Finding] = field(default_factory=list)
 
 
 @dataclass
@@ -337,6 +345,7 @@ class GuardResult:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    findings: list[_Finding] = field(default_factory=list)
 
 
 GUARD_SPECS = {
@@ -703,6 +712,12 @@ def _normalize_node_result(
         "guard_warning_count",
         len([guard for guard in context.guard_results if guard.status == "warning"]),
     )
+    result.metrics.setdefault(
+        "finding_count",
+        len(context.verification.findings)
+        if context.verification is not None
+        else sum(len(guard.findings) for guard in context.guard_results),
+    )
     if context.verification is not None:
         result.metrics.setdefault("hard_failure_count", len(context.verification.hard_failures))
         result.metrics.setdefault("soft_warning_count", len(context.verification.soft_warnings))
@@ -832,6 +847,7 @@ def _verification_payload(verification: VerificationResult | None) -> dict:
             "patch_suggestions": [],
             "revision_attempted": False,
             "revision_applied": False,
+            "findings": [],
         }
     return {
         "passed": verification.passed,
@@ -841,6 +857,7 @@ def _verification_payload(verification: VerificationResult | None) -> dict:
         "patch_suggestions": list(verification.patch_suggestions),
         "revision_attempted": verification.revision_attempted,
         "revision_applied": verification.revision_applied,
+        "findings": [finding.to_dict() for finding in verification.findings],
     }
 
 
@@ -851,6 +868,7 @@ def _guard_payload(result: GuardResult) -> dict:
         "errors": list(result.errors),
         "warnings": list(result.warnings),
         "metrics": dict(result.metrics),
+        "findings": [finding.to_dict() for finding in result.findings],
         "spec": GUARD_SPECS[result.name].__dict__ if result.name in GUARD_SPECS else {},
     }
 
@@ -914,6 +932,7 @@ def _summarize_node_output(value: object) -> object:
             "soft_warnings": value.soft_warnings[:5],
             "patch_suggestions": value.patch_suggestions[:5],
             "revision_applied": value.revision_applied,
+            "finding_count": len(value.findings),
         }
     if isinstance(value, list):
         return {"count": len(value)}
@@ -4638,6 +4657,16 @@ def _verify_summary_claims(
                     for warning in guard_errors
                 ],
             ],
+            findings=[
+                _finding_from_legacy(
+                    error,
+                    stage="visual_guard",
+                    severity="warning",
+                    confidence=0.8,
+                    provenance=("degraded_guard",),
+                )
+                for error in guard_errors
+            ],
         )
         return summary, verification, guard_results
     if not claims and not guard_errors:
@@ -4651,6 +4680,12 @@ def _verify_summary_claims(
                     "reason": "本地 Guard 已通过，但未从报告中抽取到结构化 claim，已跳过 LLM claim verifier。",
                 }
             ],
+            findings=[
+                finding
+                for guard in guard_results
+                for finding in guard.findings
+                if finding.severity != "error"
+            ],
         )
         return summary, verification, guard_results
     verification = _run_verification_agent(
@@ -4661,8 +4696,11 @@ def _verify_summary_claims(
         correction_memories or [],
         prompt_patches,
     )
+    verification.findings = _aggregate_findings(
+        [*verification.findings, *[finding for guard in guard_results for finding in guard.findings]]
+    )
     if guard_errors:
-        _add_guard_failures_to_verification(verification, guard_errors)
+        _add_guard_failures_to_verification(verification, guard_errors, guard_results)
         verification.passed = False
     return summary, verification, guard_results
 
@@ -4989,17 +5027,33 @@ def _blocking_guard_errors(results: list[GuardResult]) -> list[str]:
     return errors
 
 
-def _add_guard_failures_to_verification(verification: VerificationResult, guard_errors: list[str]) -> None:
+def _add_guard_failures_to_verification(
+    verification: VerificationResult,
+    guard_errors: list[str],
+    guard_results: list[GuardResult] | None = None,
+) -> None:
+    typed_guard_findings = [
+        finding
+        for guard in (guard_results or [])
+        if GUARD_SPECS.get(guard.name) and GUARD_SPECS[guard.name].blocking
+        for finding in guard.findings
+        if finding.severity == "error"
+    ]
     for error in guard_errors:
         if error not in verification.errors:
             verification.errors.append(error)
-        verification.hard_failures.append(
-            {
-                "type": "guard_failure",
-                "claim": "",
-                "reason": error,
-            }
-        )
+        if not any(finding.human_message == error for finding in typed_guard_findings):
+            typed_guard_findings.append(
+                _finding_from_legacy(
+                    error,
+                    stage="guard",
+                    severity="error",
+                    confidence=0.95,
+                    provenance=("guard:aggregate",),
+                )
+            )
+        verification.hard_failures.append({"type": "guard_failure", "claim": "", "reason": error})
+    verification.findings = _aggregate_findings([*verification.findings, *typed_guard_findings])
 
 
 def _verification_failure_details(verification: VerificationResult) -> str:
@@ -5807,11 +5861,53 @@ def _guard_result(
     errors: list[str] | None = None,
     warnings: list[str] | None = None,
     metrics: dict | None = None,
+    findings: list[_Finding] | None = None,
 ) -> GuardResult:
     errors = errors or []
     warnings = warnings or []
-    status = "failed" if errors else "warning" if warnings else "passed"
-    return GuardResult(name=name, status=status, errors=errors, warnings=warnings, metrics=metrics or {})
+    typed = list(findings or [])
+    represented = {finding.human_message for finding in typed}
+    typed.extend(
+        _finding_from_legacy(
+            error,
+            stage=name,
+            severity="error",
+            confidence=0.95,
+            provenance=(f"guard:{name}",),
+        )
+        for error in errors
+        if error not in represented
+    )
+    typed.extend(
+        _finding_from_legacy(
+            warning,
+            stage=name,
+            severity="warning",
+            confidence=0.65,
+            provenance=(f"guard:{name}",),
+        )
+        for warning in warnings
+        if warning not in represented
+    )
+    aggregated = _aggregate_findings(typed)
+    legacy_errors = [finding.legacy_message() for finding in aggregated if finding.severity == "error"]
+    legacy_warnings = [finding.legacy_message() for finding in aggregated if finding.severity != "error"]
+    status = "failed" if legacy_errors else "warning" if legacy_warnings else "passed"
+    return GuardResult(
+        name=name,
+        status=status,
+        errors=legacy_errors,
+        warnings=legacy_warnings,
+        metrics=metrics or {},
+        findings=aggregated,
+    )
+
+
+def _safe_finding_confidence(value: object, default: float) -> float:
+    try:
+        return max(0.0, min(1.0, float(value))) if value is not None else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _evidence_guard(grounded_map: dict[str, list[dict[str, str]]]) -> GuardResult:
@@ -5985,33 +6081,41 @@ def _visual_asset_guard(
     if not local_selected and not selected:
         return _guard_result("Visual Asset Guard", metrics={"checked": 0})
 
-    errors: list[str] = []
-    warnings: list[str] = []
+    findings: list[_Finding] = []
     for asset_id, asset in local_selected:
         for issue in _local_visual_asset_issues(asset_id, asset):
-            severity = issue.get("severity", "warning")
-            message = issue.get("message", "")
-            if severity == "error":
-                errors.append(message)
-            elif message:
-                warnings.append(message)
+            findings.append(
+                _finding_from_legacy(
+                    {
+                        **issue,
+                        "asset_id": asset_id,
+                        "stage": "local_guard",
+                    },
+                    stage="local_guard",
+                    severity=str(issue.get("severity", "warning")),
+                    confidence=_safe_finding_confidence(
+                        issue.get("confidence"),
+                        0.92 if issue.get("severity") == "error" else 0.65,
+                    ),
+                    provenance=(str(issue.get("provenance", "local:visual-heuristic")),),
+                )
+            )
 
     if client is None or not model:
         return _guard_result(
             "Visual Asset Guard",
-            errors=errors,
-            warnings=warnings,
             metrics={
                 "checked": 0,
                 "selected": len(selected),
                 "local_checked": len(local_selected),
                 "model_skipped": "no_client",
             },
+            findings=findings,
         )
 
     checked = 0
 
-    def check_one(item: tuple[int, PaperAsset]) -> tuple[int, PaperAsset, list[dict[str, str]] | None, Exception | None]:
+    def check_one(item: tuple[int, PaperAsset]) -> tuple[int, PaperAsset, list[dict[str, object]] | None, Exception | None]:
         asset_id, asset = item
         if not asset.path.exists():
             return asset_id, asset, None, FileNotFoundError(str(asset.path))
@@ -6028,10 +6132,34 @@ def _visual_asset_guard(
         for future in as_completed(future_map):
             asset_id, _asset, issues, exc = future.result()
             if isinstance(exc, openai.BadRequestError):
-                warnings.append(f"视觉模型未接受图片输入，已跳过视觉截图检查：{_clean_xml_text(str(exc))[:180]}")
+                findings.append(
+                    _finding_from_legacy(
+                        {
+                            "asset_id": asset_id,
+                            "reason_code": "verifier_transport_failure",
+                            "severity": "warning",
+                            "confidence": 0.98,
+                            "provenance": ["vision_model:request"],
+                            "reason": f"视觉模型未接受图片输入，已跳过视觉截图检查：{_clean_xml_text(str(exc))[:180]}",
+                        },
+                        stage="transport",
+                    )
+                )
                 continue
             if exc is not None:
-                warnings.append(f"asset {asset_id} visual check failed: {_clean_xml_text(str(exc))[:180]}")
+                findings.append(
+                    _finding_from_legacy(
+                        {
+                            "asset_id": asset_id,
+                            "reason_code": "verifier_transport_failure",
+                            "severity": "warning",
+                            "confidence": 0.98,
+                            "provenance": ["vision_model:transport"],
+                            "reason": f"asset {asset_id} visual check failed: {_clean_xml_text(str(exc))[:180]}",
+                        },
+                        stage="transport",
+                    )
+                )
                 continue
             if issues is None:
                 continue
@@ -6041,23 +6169,39 @@ def _visual_asset_guard(
                 issue_type = str(issue.get("type", "visual_issue")).strip() or "visual_issue"
                 reason = _clean_xml_text(str(issue.get("reason", ""))).strip()
                 message = f"asset {asset_id} {issue_type}: {reason}" if reason else f"asset {asset_id} {issue_type}"
-                if severity == "error":
-                    errors.append(message)
-                else:
-                    warnings.append(message)
+                findings.append(
+                    _finding_from_legacy(
+                        {
+                            "asset_id": asset_id,
+                            "severity": severity,
+                            "confidence": issue.get("confidence", 0.9 if severity == "error" else 0.65),
+                            "provenance": issue.get("provenance", "vision_model"),
+                            "reason_code": _infer_reason_code(issue_type, message),
+                            "reason": message,
+                        },
+                        stage="visual_guard",
+                    )
+                )
     return _guard_result(
         "Visual Asset Guard",
-        errors=errors,
-        warnings=warnings,
         metrics={"checked": checked, "selected": len(selected), "local_checked": len(local_selected)},
+        findings=findings,
     )
 
 
-def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[str, str]]:
+def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[str, object]]:
     if not asset.path.exists():
-        return [{"severity": "warning", "message": f"asset {asset_id} image file is missing: {asset.path}"}]
+        return [
+            {
+                "severity": "warning",
+                "reason_code": "missing_asset_file",
+                "confidence": 0.99,
+                "provenance": "local:file-existence",
+                "message": f"asset {asset_id} image file is missing: {asset.path}",
+            }
+        ]
     width, height = _image_pixel_size(asset.path)
-    issues: list[dict[str, str]] = []
+    issues: list[dict[str, object]] = []
     if asset.kind == "figure":
         if width >= 600 and height < 120:
             issues.append(
@@ -6101,6 +6245,10 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
                 "message": f"asset {asset_id} formula crop contains surrounding prose fragments; recapture a tighter formula-only screenshot before inserting into Word",
             }
         )
+    for issue in issues:
+        issue.setdefault("reason_code", _infer_reason_code(str(issue.get("type", "")), str(issue.get("message", ""))))
+        issue.setdefault("confidence", 0.92 if issue.get("severity") == "error" else 0.65)
+        issue.setdefault("provenance", "local:visual-heuristic")
     return issues
 
 
@@ -6238,7 +6386,7 @@ def _check_asset_with_visual_model(
     asset: PaperAsset,
     client: openai.OpenAI,
     model: str,
-) -> list[dict[str, str]]:
+) -> list[dict[str, object]]:
     data_url = _image_file_to_data_url(asset.path)
     width, height = _image_pixel_size(asset.path)
     prompt = (
@@ -6285,7 +6433,7 @@ def _check_asset_with_visual_model(
     return payload.get("issues", [])
 
 
-def _parse_visual_asset_guard_response(text: str) -> dict:
+def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
     try:
         payload = json.loads(_extract_json_object(text))
     except Exception:
@@ -6296,6 +6444,9 @@ def _parse_visual_asset_guard_response(text: str) -> dict:
                     "severity": "warning",
                     "type": "invalid_visual_guard_json",
                     "reason": _clean_xml_text(text)[:180] or "visual guard returned invalid JSON",
+                    "reason_code": "verifier_invalid_json",
+                    "confidence": 0.99,
+                    "provenance": "vision_model:parser",
                 }
             ],
         }
@@ -6309,11 +6460,21 @@ def _parse_visual_asset_guard_response(text: str) -> dict:
         severity = str(issue.get("severity", "warning")).lower()
         if severity not in {"error", "warning"}:
             severity = "warning"
+        try:
+            confidence = float(issue.get("confidence", 0.9 if severity == "error" else 0.65))
+        except (TypeError, ValueError):
+            confidence = 0.65
         normalized_issues.append(
             {
                 "severity": severity,
                 "type": str(issue.get("type", "visual_issue")),
                 "reason": str(issue.get("reason", "")),
+                "reason_code": _infer_reason_code(
+                    str(issue.get("reason_code") or issue.get("type", "visual_issue")),
+                    str(issue.get("reason", "")),
+                ),
+                "confidence": max(0.0, min(1.0, confidence)),
+                "provenance": str(issue.get("provenance") or "vision_model"),
             }
         )
     return {"passed": bool(payload.get("passed", not normalized_issues)), "issues": normalized_issues}
@@ -6628,6 +6789,7 @@ def _run_verification_agent(
             max_attempts=1,
         )
     except RuntimeError as exc:
+        transport_message = f"Verifier Agent 超时，已降级为本地 Guard 校验并允许生成 Word：{_clean_xml_text(str(exc))[:260]}"
         return VerificationResult(
             True,
             [],
@@ -6635,8 +6797,20 @@ def _run_verification_agent(
                 {
                     "type": "verifier_timeout_warning",
                     "claim": "",
-                    "reason": f"Verifier Agent 超时，已降级为本地 Guard 校验并允许生成 Word：{_clean_xml_text(str(exc))[:260]}",
+                    "reason": transport_message,
                 }
+            ],
+            findings=[
+                _finding_from_legacy(
+                    {
+                        "reason_code": "verifier_transport_failure",
+                        "severity": "warning",
+                        "confidence": 0.99,
+                        "provenance": ["verifier:transport"],
+                        "reason": transport_message,
+                    },
+                    stage="transport",
+                )
             ],
         )
     verification = _parse_verification_result(output)
@@ -6685,6 +6859,21 @@ def _verification_format_warning(verification: VerificationResult) -> Verificati
                 "reason": message,
             }
         ],
+        findings=_aggregate_findings(
+            [
+                *verification.findings,
+                _finding_from_legacy(
+                    {
+                        "reason_code": "verifier_invalid_json",
+                        "severity": "warning",
+                        "confidence": 0.99,
+                        "provenance": ["verifier:format-adapter"],
+                        "reason": message,
+                    },
+                    stage="verifier",
+                ),
+            ]
+        ),
     )
 
 
@@ -7114,7 +7303,35 @@ def _parse_verification_result(output: str) -> VerificationResult:
     try:
         payload = json.loads(_extract_json_object(output))
     except Exception as exc:
-        return VerificationResult(False, [f"Verifier Agent 输出不是合法 JSON：{exc}"])
+        message = f"Verifier Agent 输出不是合法 JSON：{exc}"
+        return VerificationResult(
+            False,
+            [message],
+            findings=[
+                _finding_from_legacy(
+                    {
+                        "reason_code": "verifier_invalid_json",
+                        "severity": "warning",
+                        "confidence": 0.99,
+                        "provenance": ["verifier:parser"],
+                        "reason": message,
+                    },
+                    stage="verifier",
+                )
+            ],
+        )
+    if not isinstance(payload, dict):
+        message = "Verifier Agent 输出不是合法 JSON：顶层 JSON 必须是对象"
+        return VerificationResult(
+            False,
+            [message],
+            findings=[
+                _finding_from_legacy(
+                    {"reason_code": "verifier_invalid_json", "reason": message, "severity": "warning", "confidence": 0.99},
+                    stage="verifier",
+                )
+            ],
+        )
     hard_failures = _normalize_verification_items(payload.get("hard_failures") or [])
     soft_warnings = _normalize_verification_items(payload.get("soft_warnings") or [])
     patch_suggestions = _normalize_verification_items(payload.get("patch_suggestions") or [])
@@ -7153,12 +7370,27 @@ def _parse_verification_result(output: str) -> VerificationResult:
             reason = failure.get("reason", "") or failure.get("message", "")
             if reason and reason not in cleaned_errors:
                 cleaned_errors.append(reason)
+    findings = _findings_from_verification_payload(payload)
+    if not findings and cleaned_errors:
+        findings = _aggregate_findings(
+            [
+                _finding_from_legacy(
+                    error,
+                    stage="verifier",
+                    severity="error",
+                    confidence=0.8,
+                    provenance=("verifier:legacy",),
+                )
+                for error in cleaned_errors
+            ]
+        )
     return VerificationResult(
         passed,
         cleaned_errors,
         hard_failures=hard_failures,
         soft_warnings=soft_warnings,
         patch_suggestions=patch_suggestions,
+        findings=findings,
     )
 
 

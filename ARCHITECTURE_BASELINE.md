@@ -91,3 +91,24 @@ The new typed contracts are in `paper_agent/schemas/contracts.py`, deterministic
 candidate generation is in `paper_agent/assets/candidates.py`, and ParsePaper
 now writes `*-asset-candidates.json` through an immutable candidate-pool sidecar.
 The old selected `PaperAsset` list and DOCX asset order remain unchanged.
+
+## Prompt 2 Finding Contract
+
+`paper_agent/schemas/findings.py` defines the immutable `Finding` shape.  Every
+finding carries `finding_id`, `stage`, `severity`, `confidence`, optional
+`asset_id`/`claim_id`, `evidence_refs`, `reason_code`, `human_message`,
+`suggested_actions`, and `provenance`.
+
+The required visual and verifier reason codes are:
+`table_body_missing`, `table_truncated`, `caption_truncated`, `mixed_objects`,
+`type_mismatch`, `formula_contamination`, `missing_critical_asset`,
+`verifier_transport_failure`, and `verifier_invalid_json`.  Legacy strings are
+still rendered through `GuardResult.errors/warnings` and
+`VerificationResult.errors/hard_failures/soft_warnings`.
+
+`aggregate_findings()` combines independent signals by reason and target.  A
+low-confidence local finding remains a warning; two distinct provenance values
+can promote it to an error.  Transport and invalid-JSON findings are always
+warnings, regardless of upstream severity, and therefore cannot be mistaken
+for document-content defects.  `migrate_verification_payload()` adds typed
+findings to both old direct verification JSON and sidecar-wrapped payloads.
