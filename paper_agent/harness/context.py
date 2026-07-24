@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -72,14 +74,42 @@ class PaperWorkflowContext:
     verification_path: Path | None = None
     knowledge_graph_path: Path | None = None
     asset_candidates_path: Path | None = None
+    checkpoint_root: Path | None = None
+    checkpoint_keys: dict[str, str] = field(default_factory=dict)
+    restored_nodes: set[str] = field(default_factory=set)
+    invalidated_nodes: set[str] = field(default_factory=set)
+    workflow_timeout_seconds: float = 0.0
+    workflow_started_at: float | None = None
+    node_cancellation_events: dict[str, threading.Event] = field(default_factory=dict)
+    node_deadlines: dict[str, float] = field(default_factory=dict)
+    node_attempts: dict[str, int] = field(default_factory=dict)
+    prompt_version: str = ""
+    code_version: str = ""
+    _checkpoint_required_inputs: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
 
     def report(self, value: float, desc: str) -> None:
         if self.progress:
             self.progress(value, desc)
 
-    def check_cancelled(self) -> None:
+    def check_cancelled(self, node_name: str | None = None) -> None:
         if self.cancellation_event and self.cancellation_event.is_set():
             raise asyncio.CancelledError
+        current = node_name or getattr(self, "current_node", "")
+        if current:
+            event = self.node_cancellation_events.get(current)
+            if event and event.is_set():
+                raise asyncio.CancelledError
+            deadline = self.node_deadlines.get(current)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"workflow node {current} exceeded its timeout")
+        if self.workflow_timeout_seconds and self.workflow_started_at:
+            if time.monotonic() - self.workflow_started_at >= self.workflow_timeout_seconds:
+                raise TimeoutError("workflow exceeded its total time budget")
+
+    def cancel_node(self, node_name: str) -> None:
+        event = self.node_cancellation_events.get(node_name)
+        if event:
+            event.set()
 
     def close(self) -> None:
         if self.client is not None:

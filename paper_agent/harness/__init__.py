@@ -3,6 +3,16 @@
 from paper_agent.agents.contracts import PaperAgentRole
 from paper_agent.harness.context import PaperContext, PaperWorkflowContext, ProgressCallback
 from paper_agent.harness.executor import PaperWorkflow
+from paper_agent.harness.checkpoints import CheckpointStore, CheckpointValidationError
+from paper_agent.harness.errors import (
+    NodeTimeoutError,
+    NonRecoverableWorkflowError,
+    PaperAgentHarnessError,
+    RecoverableWorkflowError,
+    VerificationBlockedError,
+    WorkflowTimeoutError,
+    classify_error,
+)
 from paper_agent.harness.node import HarnessNode, NodeResult, PaperWorkflowNode
 from paper_agent.harness.repair import (
     RepairAction,
@@ -20,6 +30,15 @@ __all__ = [
     "PaperWorkflow",
     "PaperWorkflowContext",
     "PaperWorkflowNode",
+    "CheckpointStore",
+    "CheckpointValidationError",
+    "NodeTimeoutError",
+    "NonRecoverableWorkflowError",
+    "PaperAgentHarnessError",
+    "RecoverableWorkflowError",
+    "VerificationBlockedError",
+    "WorkflowTimeoutError",
+    "classify_error",
     "ProgressCallback",
     "RepairAction",
     "RepairState",

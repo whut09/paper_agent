@@ -39,6 +39,10 @@ class PaperWorkflowNode:
     agent_contract: AgentContract | None = None
     requires: list[str] = []
     produces: list[str] = []
+    max_attempts: int = 2
+    retry_base_delay: float = 0.25
+    timeout_seconds: float | None = None
+    parallel_safe: bool = False
 
     @property
     def role(self) -> str:

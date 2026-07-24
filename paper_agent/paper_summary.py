@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
@@ -68,6 +69,20 @@ DEFAULT_FIGURE_ASSET_LIMIT = 5
 DEFAULT_TABLE_ASSET_LIMIT = 4
 DEFAULT_FORMULA_ASSET_LIMIT = 4
 DOCX_FONT = "Microsoft YaHei"
+
+
+def _atomic_write_text(path: Path, content: str, *, encoding: str = "utf-8") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 DEEP_PAPER_NOTE_SYSTEM_PROMPT = """你是 DeepPaperNote 风格的科研论文精读笔记助手。
@@ -696,7 +711,7 @@ class GenerateReport(_PaperWorkflowNode):
                 context.summary,
                 context.assets,
             )
-        context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
+        _atomic_write_text(context.summary_markdown_path, context.summary.strip() + "\n")
         _write_harness_sidecars(context)
         context.report(1.0, "论文总结完成")
 
@@ -790,7 +805,8 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         item = dict(entry)
         item["run_id"] = context.run_id
         trace.append(item)
-    context.trace_path.write_text(
+    _atomic_write_text(
+        context.trace_path,
         json.dumps(
             {
                 "run_id": context.run_id,
@@ -809,11 +825,12 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         ),
         encoding="utf-8",
     )
-    context.grounding_map_path.write_text(
+    _atomic_write_text(
+        context.grounding_map_path,
         json.dumps({"run_id": context.run_id, "grounding_map": context.grounding_map}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
-    context.verification_path.write_text(
+    _atomic_write_text(
+        context.verification_path,
         json.dumps(
             {
                 "run_id": context.run_id,
@@ -838,20 +855,21 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
             "agent_trace": trace,
         },
     }
-    context.knowledge_graph_path.write_text(
+    _atomic_write_text(
+        context.knowledge_graph_path,
         json.dumps(graph_payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
     )
     _write_asset_candidate_sidecar(context)
     if context.summary and not context.summary_markdown_path.exists():
-        context.summary_markdown_path.write_text(context.summary.strip() + "\n", encoding="utf-8")
+        _atomic_write_text(context.summary_markdown_path, context.summary.strip() + "\n")
 
 
 def _write_asset_candidate_sidecar(context: _PaperWorkflowContext) -> None:
     if context.output is None or not context.paper_name:
         return
     context.asset_candidates_path = context.asset_candidates_path or context.output / f"{context.paper_name}-asset-candidates.json"
-    context.asset_candidates_path.write_text(
+    _atomic_write_text(
+        context.asset_candidates_path,
         json.dumps(
             {
                 "run_id": context.run_id,
@@ -861,7 +879,6 @@ def _write_asset_candidate_sidecar(context: _PaperWorkflowContext) -> None:
             ensure_ascii=False,
             indent=2,
         ),
-        encoding="utf-8",
     )
 
 
@@ -1054,58 +1071,42 @@ def _extract_text_and_assets(
     work_dir.mkdir(parents=True, exist_ok=True)
     doc = fitz.open(pdf_path)
     selected_pages = pages if pages is not None else list(range(doc.page_count))
+    selected_pages = [page for page in selected_pages if 0 <= page < doc.page_count]
     max_assets = max(0, int(max_assets or 0))
     kind_limits = _asset_kind_limits(max_assets)
     candidate_limit = max(max_assets * 2, sum(kind_limits.values()) * 3, 12)
     text_parts: list[str] = []
     assets: list[PaperAsset] = []
-    seen_boxes: set[tuple[int, int, int, int, int]] = set()
     body_pages: list[int] = []
     body_bottom_by_page: dict[int, float] = {}
+    page_workers = max(1, min(4, len(selected_pages)))
+    with ThreadPoolExecutor(max_workers=page_workers, thread_name_prefix="paper-page") as executor:
+        page_results = list(
+            executor.map(
+                lambda page_index: _extract_page_payload(
+                    pdf_path,
+                    work_dir,
+                    page_index,
+                    kind_limits,
+                    candidate_limit,
+                ),
+                selected_pages,
+            )
+        )
 
-    for page_index in selected_pages:
-        if page_index < 0 or page_index >= doc.page_count:
-            continue
-        page = doc[page_index]
+    for page_index, page_text, page_assets, stop_y in page_results:
         page_no = page_index + 1
-        stop_y = _body_stop_y(page)
-        text_clip = fitz.Rect(0, 0, page.rect.width, stop_y) if stop_y is not None else page.rect
-        page_text = _clean_xml_text(page.get_text("text", clip=text_clip, sort=True))
         if page_text.strip():
             body_pages.append(page_index)
         if stop_y is not None:
             body_bottom_by_page[page_no] = stop_y
         text_parts.append(f"\n\n[Page {page_no}]\n{page_text}")
-
-        if kind_limits.get("table", 0) > 0:
-            table_assets = _capture_captioned_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
-            table_assets = _filter_assets_before_y(table_assets, stop_y)
-            assets.extend(table_assets)
-
-        if kind_limits.get("figure", 0) > 0:
-            figure_assets = _capture_captioned_figures(page, work_dir, page_no, candidate_limit, seen_boxes)
-            figure_assets = _filter_assets_before_y(figure_assets, stop_y)
-            assets.extend(figure_assets)
-
-        if kind_limits.get("table", 0) > 0:
-            table_assets = _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes)
-            table_assets = _filter_assets_before_y(table_assets, stop_y)
-            assets.extend(table_assets)
-
-        if kind_limits.get("figure", 0) > 0:
-            figure_assets = _capture_image_blocks(page, work_dir, page_no, candidate_limit, seen_boxes)
-            figure_assets = _filter_assets_before_y(figure_assets, stop_y)
-            assets.extend(figure_assets)
-
+        assets.extend(page_assets)
         if stop_y is not None:
             break
 
     assets = _deduplicate_assets(assets)
-    assets = _limit_assets_by_kind(
-        assets,
-        {**kind_limits, "formula": 0},
-        max_assets,
-    )
+    assets = _limit_assets_by_kind(assets, {**kind_limits, "formula": 0}, max_assets)
     formula_limit = min(kind_limits.get("formula", 0), max_assets - len(assets))
     if formula_limit > 0:
         formula_seen_boxes = {
@@ -1128,6 +1129,45 @@ def _extract_text_and_assets(
     assets = _limit_assets_by_kind(assets, kind_limits, max_assets)
     doc.close()
     return "\n".join(text_parts), assets
+
+
+def _extract_page_payload(
+    pdf_path: Path,
+    work_dir: Path,
+    page_index: int,
+    kind_limits: dict[str, int],
+    candidate_limit: int,
+) -> tuple[int, str, list[PaperAsset], float | None]:
+    """Parse one page with its own MuPDF handle; output order is restored by the caller."""
+
+    page_doc = fitz.open(pdf_path)
+    try:
+        page = page_doc[page_index]
+        page_no = page_index + 1
+        stop_y = _body_stop_y(page)
+        text_clip = fitz.Rect(0, 0, page.rect.width, stop_y) if stop_y is not None else page.rect
+        page_text = _clean_xml_text(page.get_text("text", clip=text_clip, sort=True))
+        seen_boxes: set[tuple[int, int, int, int, int]] = set()
+        page_assets: list[PaperAsset] = []
+        if kind_limits.get("table", 0) > 0:
+            page_assets.extend(_filter_assets_before_y(
+                _capture_captioned_tables(page, work_dir, page_no, candidate_limit, seen_boxes), stop_y
+            ))
+        if kind_limits.get("figure", 0) > 0:
+            page_assets.extend(_filter_assets_before_y(
+                _capture_captioned_figures(page, work_dir, page_no, candidate_limit, seen_boxes), stop_y
+            ))
+        if kind_limits.get("table", 0) > 0:
+            page_assets.extend(_filter_assets_before_y(
+                _capture_tables(page, work_dir, page_no, candidate_limit, seen_boxes), stop_y
+            ))
+        if kind_limits.get("figure", 0) > 0:
+            page_assets.extend(_filter_assets_before_y(
+                _capture_image_blocks(page, work_dir, page_no, candidate_limit, seen_boxes), stop_y
+            ))
+        return page_index, page_text, page_assets, stop_y
+    finally:
+        page_doc.close()
 
 
 def _capture_captioned_tables(
@@ -1342,51 +1382,56 @@ def _build_asset_candidate_pools(assets: list[PaperAsset]) -> list[_AssetCandida
     in a sidecar, while the selected candidate resolves to the same legacy image.
     """
 
-    pools = []
-    for asset in assets:
-        if asset.rect is None:
-            continue
-        bbox = tuple(float(value) for value in (asset.rect.x0, asset.rect.y0, asset.rect.x1, asset.rect.y1))
-        adjacent = [
-            tuple(float(value) for value in (other.rect.x0, other.rect.y0, other.rect.x1, other.rect.y1))
-            for other in assets
-            if other is not asset and other.page_number == asset.page_number and other.rect is not None
-        ]
-        evidence = _EvidenceBundle(
-            page_number=asset.page_number,
-            source_bbox=bbox,
-            caption_text=asset.caption,
-            object_type=asset.kind,
-            table_or_formula_text=asset.text or asset.latex,
-            image_path=asset.path,
-        )
-        caption_bbox = None
-        if asset.caption_rect is not None:
-            caption_bbox = tuple(
-                float(value)
-                for value in (
-                    asset.caption_rect.x0,
-                    asset.caption_rect.y0,
-                    asset.caption_rect.x1,
-                    asset.caption_rect.y1,
-                )
-            )
-        geometry = candidate_bboxes_for_asset(
-            bbox,
-            caption_bbox=caption_bbox,
-            adjacent_bboxes=adjacent,
-        )
-        pools.append(
-            build_asset_candidate_pool(
-                evidence,
-                ((strategy, candidate_bbox, asset.path) for strategy, candidate_bbox in geometry),
-                border_closed={
-                    _CandidateStrategy.BORDER_ENCLOSED: True if asset.kind == "table" else None,
-                },
-                object_bboxes=adjacent,
+    indexed_assets = [(index, asset) for index, asset in enumerate(assets) if asset.rect is not None]
+    if not indexed_assets:
+        return []
+    workers = max(1, min(4, len(indexed_assets)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="paper-candidate") as executor:
+        pools = list(executor.map(lambda item: _build_asset_candidate_pool(item[1], assets), indexed_assets))
+    return [pool for pool in pools if pool is not None]
+
+
+def _build_asset_candidate_pool(asset: PaperAsset, assets: list[PaperAsset]) -> _AssetCandidatePool | None:
+    if asset.rect is None:
+        return None
+    bbox = tuple(float(value) for value in (asset.rect.x0, asset.rect.y0, asset.rect.x1, asset.rect.y1))
+    adjacent = [
+        tuple(float(value) for value in (other.rect.x0, other.rect.y0, other.rect.x1, other.rect.y1))
+        for other in assets
+        if other is not asset and other.page_number == asset.page_number and other.rect is not None
+    ]
+    evidence = _EvidenceBundle(
+        page_number=asset.page_number,
+        source_bbox=bbox,
+        caption_text=asset.caption,
+        object_type=asset.kind,
+        table_or_formula_text=asset.text or asset.latex,
+        image_path=asset.path,
+    )
+    caption_bbox = None
+    if asset.caption_rect is not None:
+        caption_bbox = tuple(
+            float(value)
+            for value in (
+                asset.caption_rect.x0,
+                asset.caption_rect.y0,
+                asset.caption_rect.x1,
+                asset.caption_rect.y1,
             )
         )
-    return pools
+    geometry = candidate_bboxes_for_asset(
+        bbox,
+        caption_bbox=caption_bbox,
+        adjacent_bboxes=adjacent,
+    )
+    return build_asset_candidate_pool(
+        evidence,
+        ((strategy, candidate_bbox, asset.path) for strategy, candidate_bbox in geometry),
+        border_closed={
+            _CandidateStrategy.BORDER_ENCLOSED: True if asset.kind == "table" else None,
+        },
+        object_bboxes=adjacent,
+    )
 
 
 def _asset_is_captioned(asset: PaperAsset) -> bool:
@@ -3531,7 +3576,7 @@ def _write_all_correction_memories(
     path = _correction_memory_path(memory_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     content = "\n".join(json.dumps(memory.__dict__, ensure_ascii=False) for memory in memories)
-    path.write_text((content + "\n") if content else "", encoding="utf-8")
+    _atomic_write_text(path, (content + "\n") if content else "")
     return path
 
 
@@ -4111,9 +4156,9 @@ def _write_chunk_notes_cache(cache_path: Path | None, notes: list[str], total: i
     if cache_path is None:
         return
     try:
-        cache_path.write_text(
+        _atomic_write_text(
+            cache_path,
             json.dumps({"total": total, "notes": notes}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
     except OSError:
         return
@@ -4201,9 +4246,9 @@ def _write_partial_integration_cache(
         key = _partial_integration_key(record.get("name"), record.get("start"), record.get("end"))
         deduped[key] = record
     try:
-        cache_path.write_text(
+        _atomic_write_text(
+            cache_path,
             json.dumps({"total": total, "partials": list(deduped.values())}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
         )
     except OSError:
         return
@@ -6100,7 +6145,7 @@ def _write_verification_failed_report(context: _PaperWorkflowContext) -> Path:
                 "```",
             ]
         )
-    path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    _atomic_write_text(path, "\n".join(lines).strip() + "\n")
     return path
 
 
@@ -9467,19 +9512,27 @@ def _write_docx(
     document_xml = _document_xml(paper_filename, summary, assets, media_files)
     rels_xml = _document_rels(media_files)
 
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as docx:
-        docx.writestr("[Content_Types].xml", _content_types())
-        docx.writestr("_rels/.rels", _package_rels())
-        docx.writestr("docProps/core.xml", _core_props())
-        docx.writestr("docProps/app.xml", _app_props())
-        docx.writestr("word/document.xml", document_xml)
-        docx.writestr("word/styles.xml", _styles_xml())
-        docx.writestr("word/settings.xml", _settings_xml())
-        docx.writestr("word/fontTable.xml", _font_table_xml())
-        docx.writestr("word/_rels/document.xml.rels", rels_xml)
-        for source, media_name, _rel_id in media_files:
-            if source.exists():
-                docx.write(source, f"word/media/{media_name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".docx", dir=str(path.parent))
+    os.close(fd)
+    try:
+        with zipfile.ZipFile(temp_name, "w", zipfile.ZIP_DEFLATED) as docx:
+            docx.writestr("[Content_Types].xml", _content_types())
+            docx.writestr("_rels/.rels", _package_rels())
+            docx.writestr("docProps/core.xml", _core_props())
+            docx.writestr("docProps/app.xml", _app_props())
+            docx.writestr("word/document.xml", document_xml)
+            docx.writestr("word/styles.xml", _styles_xml())
+            docx.writestr("word/settings.xml", _settings_xml())
+            docx.writestr("word/fontTable.xml", _font_table_xml())
+            docx.writestr("word/_rels/document.xml.rels", rels_xml)
+            for source, media_name, _rel_id in media_files:
+                if source.exists():
+                    docx.write(source, f"word/media/{media_name}")
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
 
 
 def _next_available_report_path(path: Path) -> Path:
