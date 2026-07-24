@@ -349,6 +349,8 @@ copy config.json config.local.json
 
 页面解析、资产候选生成和分段笔记只并行执行互相独立的任务；最终报告整合仍按原顺序执行，并受工作流总时间预算约束。工作流状态由 harness 持有，GUI 不保存节点状态。
 
+`GenerateReport` 后会执行 `RenderQA`。程序先检查 DOCX 包结构、图片尺寸、caption 邻接、未替换 marker 和关键图表覆盖；平台存在 LibreOffice 或 Windows Word COM 时，还会渲染 PDF/页面图片，检查页数、裁切和页面溢出。结果写入 `*-qa.json`，并与 `trace.json`、`verification.json`、失败报告一起显示在 GUI 诊断区。内容缺陷会阻止 Word 下载；渲染器不可用或渲染超时属于 warning，Word 仍可下载，但界面会明确提示。渲染超时可通过 `PAPER_AGENT_RENDER_QA_TIMEOUT_SECONDS` 调整，默认 `120` 秒。
+
 如果分段阶段部分 chunk 超时，PaperAgent 会跳过超时 chunk 并继续使用已完成的中文分段笔记。最终整合超时后会尝试一次轻量快速整合；如果快速整合也超时，程序会停止生成 Word，避免输出不可读文档。
 
 为避免生成不可读报告，Word 写入前会做质量自检：如果报告主体疑似直接复制英文原文、包含内部兜底文本，或快速整合也超时，程序会停止生成 Word 并返回明确错误，避免输出不可交付的文档。

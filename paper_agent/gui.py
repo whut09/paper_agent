@@ -21,8 +21,10 @@ from logging.handlers import RotatingFileHandler
 
 from paper_agent import __version__, sanitize_no_proxy_env
 from paper_agent.config import ConfigManager
+from paper_agent.harness.errors import is_recoverable_error
 from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
-from paper_agent.harness.workflow import summarize_paper
+from paper_agent.harness.workflow import summarize_paper_detailed
+from paper_agent.schemas.qa import SummaryRunResult
 
 logger = logging.getLogger(__name__)
 sanitize_no_proxy_env()
@@ -905,6 +907,42 @@ def stop_summary_file(state: dict) -> None:
     state["session_id"] = None
 
 
+def _format_summary_diagnostics(result: SummaryRunResult) -> str:
+    labels = {
+        "success": "通过",
+        "warning": "警告",
+        "blocked": "已阻断",
+        "timeout": "网络/服务超时",
+        "failed": "失败",
+    }
+    reasons = ", ".join(result.reason_codes) or "无"
+    warning = "\n\n**注意：RenderQA 存在 warning，请先查看 qa.json。**" if result.warning else ""
+    return (
+        f"### 运行诊断：{labels.get(result.status, result.status)}\n\n"
+        f"- 当前阶段：`{result.current_stage or '未进入工作流'}`\n"
+        f"- 进度：`{result.progress * 100:.0f}%` {result.progress_message}\n"
+        f"- 已执行修复次数：`{result.repair_count}`\n"
+        f"- 当前 reason code：`{reasons}`\n"
+        f"- 结果：{result.message}{warning}"
+    )
+
+
+def _summary_callback_response(result: SummaryRunResult, file_path: str | Path | None):
+    preview_path = str(file_path) if file_path and str(file_path).lower().endswith(".pdf") else None
+    download_path = str(result.docx_path) if result.downloadable and result.docx_path else None
+    diagnostic_paths = [str(path) for path in result.diagnostic_paths]
+    title = "## 论文总结已生成" if download_path else "## 论文总结诊断"
+    return (
+        gr.update(value=download_path, visible=bool(download_path)),
+        gr.update(value=preview_path, visible=bool(preview_path)),
+        gr.update(value=download_path, visible=bool(download_path)),
+        gr.update(value=title, visible=True),
+        gr.update(visible=not bool(preview_path)),
+        gr.update(value=_format_summary_diagnostics(result), visible=True),
+        gr.update(value=diagnostic_paths or None, visible=bool(diagnostic_paths)),
+    )
+
+
 def summarize_file(
     file_type,
     file_input,
@@ -917,6 +955,8 @@ def summarize_file(
     progress=gr.Progress(),
 ):
     session_id, cancellation_event = _start_summary_session(state)
+    file_path = None
+    summary_result: SummaryRunResult | None = None
     try:
         if flag_demo and not verify_recaptcha(recaptcha_response):
             raise gr.Error("reCAPTCHA fail")
@@ -983,7 +1023,7 @@ def summarize_file(
         def progress_bar(value: float, desc: str):
             progress(value, desc=desc)
 
-        docx_path = summarize_paper(
+        summary_result = summarize_paper_detailed(
             file_path,
             output,
             pages=selected_page,
@@ -999,32 +1039,46 @@ def summarize_file(
             progress=progress_bar,
             cancellation_event=cancellation_event,
         )
+        if summary_result.traceback_text:
+            logger.error("Summary workflow failed for session %s\n%s", session_id, summary_result.traceback_text)
     except CancelledError:
         logger.info("Summary cancelled for session %s", session_id)
         raise gr.Error("Summary cancelled")
     except gr.Error as exc:
         logger.warning("Summary request rejected for session %s: %s", session_id, exc)
+        normalized_error = str(exc).strip("'\"")
+        if normalized_error not in {"No input", "reCAPTCHA fail"}:
+            reason_code = "network_timeout" if is_recoverable_error(exc) else "download_failure"
+            summary_result = SummaryRunResult(
+                status="timeout" if reason_code == "network_timeout" else "failed",
+                message=str(exc),
+                current_stage="Download",
+                reason_codes=[reason_code],
+                downloadable=False,
+            )
+            return _summary_callback_response(summary_result, file_path)
         raise gr.Error(f"{exc}\n详细日志：{GUI_LOG_PATH.resolve()}") from exc
     except Exception as exc:
         logger.exception("Summary failed for session %s", session_id)
-        raise gr.Error(
-            f"总结失败：{type(exc).__name__}: {exc}\n详细日志：{GUI_LOG_PATH.resolve()}"
-        ) from exc
+        reason_code = "network_timeout" if is_recoverable_error(exc) else "workflow_failure"
+        summary_result = SummaryRunResult(
+            status="timeout" if reason_code == "network_timeout" else "failed",
+            message=f"{type(exc).__name__}: {exc}",
+            current_stage="Download" if file_path is None else "Workflow",
+            reason_codes=[reason_code],
+            downloadable=False,
+        )
+        return _summary_callback_response(summary_result, file_path)
     finally:
         with cancellation_event_lock:
             cancellation_event_map.pop(session_id, None)
         if state.get("session_id") == session_id:
             state["session_id"] = None
 
-    preview_path = str(file_path) if str(file_path).lower().endswith(".pdf") else None
-    return (
-        str(docx_path),
-        gr.update(value=preview_path, visible=bool(preview_path)),
-        gr.update(visible=True),
-        gr.update(visible=True),
-        gr.update(visible=not bool(preview_path)),
+    return _summary_callback_response(
+        summary_result or SummaryRunResult(status="failed", message="未知错误"),
+        file_path,
     )
-
 
 # Global setup
 custom_blue = gr.themes.Color(
@@ -1157,6 +1211,12 @@ with gr.Blocks(
 
             output_title = gr.Markdown("## 已生成论文总结", visible=False)
             output_file_mono = gr.File(label="下载 Word 总结文档", visible=False)
+            diagnostic_status = gr.Markdown(visible=False)
+            diagnostic_files = gr.File(
+                label="诊断文件（trace / verification / qa / failure report）",
+                file_count="multiple",
+                visible=False,
+            )
             recaptcha_response = gr.Textbox(
                 label="reCAPTCHA响应", elem_id="verify", visible=False
             )
@@ -1245,6 +1305,8 @@ with gr.Blocks(
             output_file_mono,
             output_title,
             preview_hint,
+            diagnostic_status,
+            diagnostic_files,
         ],
         concurrency_limit=2,
     )

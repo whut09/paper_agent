@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed, wait
 from dataclasses import dataclass, field
@@ -60,6 +61,8 @@ from paper_agent.evaluation.visual_validation import (
     VisualMeasurements as _VisualMeasurements,
     decide_visual_layers as _decide_visual_layers,
 )
+from paper_agent.evaluation.render_qa import run_render_qa as _run_render_qa, write_render_qa_sidecar as _write_render_qa_sidecar
+from paper_agent.schemas.qa import RenderQAResult as _RenderQAResult, SummaryRunResult as _SummaryRunResult
 from paper_agent.skill_prompts import load_paper_skill_reference
 
 logger = logging.getLogger(__name__)
@@ -713,7 +716,61 @@ class GenerateReport(_PaperWorkflowNode):
             )
         _atomic_write_text(context.summary_markdown_path, context.summary.strip() + "\n")
         _write_harness_sidecars(context)
-        context.report(1.0, "论文总结完成")
+        context.report(0.93, "Word 文档已生成，准备渲染质量检查...")
+
+
+class RenderQA(_PaperWorkflowNode):
+    name = "RenderQA"
+    depends_on = ("GenerateReport",)
+    agent_role = _PaperAgentRole.CRITIC
+    agent_contract = _VERIFIER_AGENT_CONTRACT
+    requires = ["docx", "assets", "output", "paper_name"]
+    produces = ["render_qa", "qa.json", "trace.json"]
+
+    def run(self, context: _PaperWorkflowContext) -> _NodeResult:
+        if context.docx_path is None or context.output is None:
+            raise ValueError("RenderQA requires a generated DOCX and output directory.")
+        context.check_cancelled()
+        context.report(0.95, "渲染 Word 并检查分页、图片和 caption...")
+        render_dir = (context.work_dir or context.output / f"{context.paper_name}-summary-assets") / "render-qa"
+        context.qa_result = _run_render_qa(
+            context.docx_path,
+            context.assets,
+            render_dir,
+            timeout_seconds=_render_qa_timeout_seconds(),
+        )
+        context.qa_path = context.output / f"{context.paper_name}-qa.json"
+        _write_render_qa_sidecar(context.qa_path, context.qa_result, run_id=context.run_id)
+        context.download_ready = context.qa_result.downloadable
+        context.current_reason_code = context.qa_result.reason_codes[0] if context.qa_result.reason_codes else ""
+        context.report(1.0, "渲染质量检查完成")
+        artifacts = [str(context.qa_path)]
+        if context.qa_result.rendered_pdf_path:
+            artifacts.append(str(context.qa_result.rendered_pdf_path))
+        artifacts.extend(str(page.image_path) for page in context.qa_result.pages if page.image_path)
+        metrics = {
+            "qa_status": context.qa_result.status,
+            "page_count": context.qa_result.page_count or 0,
+            "qa_finding_count": len(context.qa_result.findings),
+            "qa_asset_count": len(context.qa_result.assets),
+            "renderer": context.qa_result.renderer,
+        }
+        if context.qa_result.status == "block":
+            return _NodeResult(
+                status="failed",
+                outputs={"render_qa": context.qa_result.to_dict(), "qa.json": str(context.qa_path)},
+                artifacts=artifacts,
+                errors=[item.message for item in context.qa_result.findings if item.severity == "block"],
+                warnings=[item.message for item in context.qa_result.findings if item.severity == "warning"],
+                metrics=metrics,
+            )
+        return _NodeResult(
+            status="warning" if context.qa_result.status == "warning" else "success",
+            outputs={"render_qa": context.qa_result.to_dict(), "qa.json": str(context.qa_path)},
+            artifacts=artifacts,
+            warnings=[item.message for item in context.qa_result.findings],
+            metrics=metrics,
+        )
 
 
 def _ensure_workflow_codex_client(context: _PaperWorkflowContext) -> tuple[openai.OpenAI, CodexConfig]:
@@ -812,12 +869,18 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "run_id": context.run_id,
                 "paper_name": context.paper_name,
                 "source_path": str(context.source_path) if context.source_path else "",
+                "current_stage": context.current_stage,
+                "progress": context.current_progress,
+                "progress_message": context.progress_message,
+                "current_reason_code": context.current_reason_code,
                 "gate_decision": context.gate_decision,
                 "gate_history": list(context.gate_history),
                 "repair_attempts": dict(context.repair_attempts),
                 "repair_history": list(context.repair_history),
                 "repair_cost_used": context.repair_cost_used,
                 "repair_budget": context.repair_budget,
+                "qa_path": str(context.qa_path) if context.qa_path else "",
+                "download_ready": context.download_ready,
                 "nodes": trace,
             },
             ensure_ascii=False,
@@ -956,6 +1019,8 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "verification.json": context.verification_path,
         "knowledge_graph.json": context.knowledge_graph_path,
         "asset-candidates.json": context.asset_candidates_path,
+        "render_qa": context.qa_result,
+        "qa.json": context.qa_path,
         "trace.json": context.agent_trace,
     }
     value = mapping.get(name)
@@ -978,6 +1043,13 @@ def _summarize_node_output(value: object) -> object:
             "patch_suggestions": value.patch_suggestions[:5],
             "revision_applied": value.revision_applied,
             "finding_count": len(value.findings),
+        }
+    if isinstance(value, _RenderQAResult):
+        return {
+            "status": value.status,
+            "renderer": value.renderer,
+            "page_count": value.page_count,
+            "reason_codes": value.reason_codes,
         }
     if isinstance(value, list):
         return {"count": len(value)}
@@ -1006,6 +1078,8 @@ def _node_artifacts_snapshot(node: _PaperWorkflowNode, context: _PaperWorkflowCo
         artifacts.append(str(context.knowledge_graph_path))
     if "asset-candidates.json" in node.produces and context.asset_candidates_path:
         artifacts.append(str(context.asset_candidates_path))
+    if "qa.json" in node.produces and context.qa_path:
+        artifacts.append(str(context.qa_path))
     return artifacts
 
 
@@ -1022,6 +1096,38 @@ def summarize_paper(
     workflow: _PaperWorkflow | None = None,
 ) -> str:
     """Summarize a paper and write a Word .docx file with captured figures/tables."""
+    result = summarize_paper_detailed(
+        input_path,
+        output_dir,
+        pages=pages,
+        summary_language=summary_language,
+        codex_envs=codex_envs,
+        max_assets=max_assets,
+        progress=progress,
+        cancellation_event=cancellation_event,
+        workflow=workflow,
+    )
+    if result.downloadable and result.docx_path is not None:
+        return str(result.docx_path)
+    if result.exception is not None:
+        raise RuntimeError(result.message) from result.exception
+    raise RuntimeError(result.message)
+
+
+def summarize_paper_detailed(
+    input_path: str,
+    output_dir: str | Path,
+    *,
+    pages: list[int] | None = None,
+    summary_language: str = "中文",
+    codex_envs: dict[str, str] | None = None,
+    max_assets: int = DEFAULT_MAX_ASSETS,
+    progress: _ProgressCallback | None = None,
+    cancellation_event: asyncio.Event | None = None,
+    workflow: _PaperWorkflow | None = None,
+) -> _SummaryRunResult:
+    """Run the workflow and return user-safe diagnostics instead of losing context on failure."""
+
     context = _PaperWorkflowContext(
         input_path=input_path,
         output_dir=output_dir,
@@ -1032,19 +1138,90 @@ def summarize_paper(
         progress=progress,
         cancellation_event=cancellation_event,
     )
-    result = (workflow or _PaperWorkflow.default()).run(context)
-    if result.docx_path is None:
-        if result.verification_failed_path is not None:
-            details = ""
-            if result.verification is not None:
-                details = _verification_failure_details(result.verification)
-            report_hint = f"\n失败详情已写入：{result.verification_failed_path}"
-            message = "Verifier Agent 未通过，已停止生成 Word 报告。"
-            if details:
-                message = f"{message}\n{details}"
-            raise RuntimeError(f"{message}{report_hint}")
-        raise RuntimeError("Paper workflow finished without generating a report.")
-    return str(result.docx_path)
+    try:
+        (workflow or _PaperWorkflow.default()).run(context)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return _summary_run_result(context, exc, traceback.format_exc())
+    return _summary_run_result(context)
+
+
+def _summary_run_result(
+    context: _PaperWorkflowContext,
+    exc: BaseException | None = None,
+    traceback_text: str = "",
+) -> _SummaryRunResult:
+    qa_result = context.qa_result if isinstance(context.qa_result, _RenderQAResult) else None
+    reason_codes: list[str] = []
+    if qa_result is not None:
+        reason_codes.extend(qa_result.reason_codes)
+    if context.verification is not None:
+        reason_codes.extend(finding.reason_code for finding in context.verification.findings)
+        for failure in context.verification.hard_failures:
+            reason = str(failure.get("reason_code") or failure.get("type") or "")
+            if reason:
+                reason_codes.append(_infer_reason_code(reason, str(failure.get("reason") or "")))
+    if exc is not None:
+        lowered = str(exc).lower()
+        if any(token in lowered for token in ("timeout", "timed out", "connection", "transport", "429", "502", "503", "504")):
+            reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "network_timeout")
+        else:
+            reason_codes.append("workflow_failure")
+    reason_codes = list(dict.fromkeys(code for code in reason_codes if code))
+
+    status = "success"
+    warning = False
+    downloadable = bool(context.docx_path)
+    message = "论文总结和渲染质量检查已通过。"
+    if exc is not None:
+        status = "timeout" if "network_timeout" in reason_codes or "verifier_transport_failure" in reason_codes else "failed"
+        downloadable = False
+        message = f"总结失败：{type(exc).__name__}: {exc}"
+    elif context.verification_failed_path is not None:
+        details = _verification_failure_details(context.verification) if context.verification is not None else ""
+        report_hint = f"\n失败详情已写入：{context.verification_failed_path}"
+        message = "Verifier Agent 未通过，已停止生成 Word 报告。"
+        if details:
+            message = f"{message}\n{details}"
+        message = f"{message}{report_hint}"
+        status = "blocked"
+        downloadable = False
+    elif context.docx_path is None:
+        status = "failed"
+        downloadable = False
+        message = "Paper workflow finished without generating a report."
+    elif qa_result is not None and qa_result.status == "block":
+        status = "blocked"
+        downloadable = False
+        message = f"RenderQA 未通过，Word 已隔离且不会提供下载。详情：{context.qa_path}"
+    elif qa_result is not None and qa_result.status == "warning":
+        status = "warning"
+        warning = True
+        downloadable = True
+        message = f"Word 已生成，但 RenderQA 有 warning。请查看：{context.qa_path}"
+    elif qa_result is None and context.docx_path is not None:
+        # Compatibility workflows may provide their own report node.
+        downloadable = True
+
+    return _SummaryRunResult(
+        status=status,
+        message=message,
+        current_stage=context.current_stage,
+        progress=context.current_progress,
+        progress_message=context.progress_message,
+        repair_count=len(context.repair_history),
+        reason_codes=reason_codes,
+        docx_path=context.docx_path,
+        trace_path=context.trace_path,
+        verification_path=context.verification_path,
+        qa_path=context.qa_path,
+        failure_report_path=context.verification_failed_path,
+        downloadable=downloadable,
+        warning=warning,
+        traceback_text=traceback_text,
+        exception=exc,
+    )
 
 
 def _ensure_pdf(source_path: Path, output_dir: Path) -> Path:
@@ -8166,6 +8343,15 @@ def _codex_timeout_seconds() -> float:
     except ValueError:
         value = 90.0
     return max(30.0, min(value, 600.0))
+
+
+def _render_qa_timeout_seconds() -> float:
+    raw_value = _first_value({}, "PAPER_AGENT_RENDER_QA_TIMEOUT_SECONDS")
+    try:
+        value = float(raw_value) if raw_value else 120.0
+    except ValueError:
+        value = 120.0
+    return max(15.0, min(value, 300.0))
 
 
 def _codex_chat_attempts() -> int:

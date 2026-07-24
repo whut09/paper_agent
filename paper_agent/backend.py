@@ -11,7 +11,7 @@ from string import Template
 from paper_agent.doclayout import ModelInstance
 from paper_agent.config import ConfigManager
 from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
-from paper_agent.harness.workflow import summarize_paper
+from paper_agent.harness.workflow import summarize_paper_detailed
 from paper_agent.memory.correction_memory import record_summary_correction
 from paper_agent.memory.prompt_patch import get_self_improving_prompt_patches
 
@@ -80,7 +80,7 @@ def summarize_task(
         input_path = tmp_path / filename
         input_path.write_bytes(stream)
         output_dir = tmp_path / "output"
-        docx_path = summarize_paper(
+        result = summarize_paper_detailed(
             str(input_path),
             output_dir,
             pages=args.get("pages"),
@@ -89,7 +89,18 @@ def summarize_task(
             max_assets=int(args.get("max_assets", DEFAULT_MAX_ASSETS)),
             progress=progress_bar,
         )
-        return Path(docx_path).read_bytes()
+        sidecars = {
+            path.name: path.read_bytes()
+            for path in result.diagnostic_paths
+            if path.exists()
+        }
+        diagnostics = result.to_dict()
+        diagnostics["diagnostic_files"] = sorted(sidecars)
+        return {
+            "docx": result.docx_path.read_bytes() if result.downloadable and result.docx_path else None,
+            "diagnostics": diagnostics,
+            "sidecars": sidecars,
+        }
 
 
 @flask_app.route("/v1/translate", methods=["POST"])
@@ -150,6 +161,9 @@ def get_summarize_task(id: str):
     result: AsyncResult = celery_app.AsyncResult(id)
     if str(result.state) == "PROGRESS":
         return {"state": str(result.state), "info": result.info}
+    payload = result.get() if result.ready() and result.successful() else None
+    if isinstance(payload, dict):
+        return {"state": str(result.state), "diagnostics": payload.get("diagnostics", {})}
     return {"state": str(result.state)}
 
 
@@ -186,13 +200,30 @@ def get_summarize_result(id: str):
         return {"error": "task not finished"}, 400
     if not result.successful():
         return {"error": "task failed"}, 400
-    docx = result.get()
+    payload = result.get()
+    docx = payload.get("docx") if isinstance(payload, dict) else payload
+    if not docx:
+        diagnostics = payload.get("diagnostics", {}) if isinstance(payload, dict) else {}
+        return {"error": "RenderQA did not approve this document for download", "diagnostics": diagnostics}, 409
     return send_file(
         io.BytesIO(docx),
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         as_attachment=True,
         download_name="paper-summary.docx",
     )
+
+
+@flask_app.route("/v1/summarize/<id>/diagnostics/<name>")
+def get_summarize_diagnostic(id: str, name: str):
+    result = celery_app.AsyncResult(id)
+    if not result.ready() or not result.successful():
+        return {"error": "task not finished"}, 400
+    payload = result.get()
+    sidecars = payload.get("sidecars", {}) if isinstance(payload, dict) else {}
+    content = sidecars.get(Path(name).name)
+    if content is None:
+        return {"error": "diagnostic not found"}, 404
+    return send_file(io.BytesIO(content), mimetype="application/json", download_name=Path(name).name)
 
 
 if __name__ == "__main__":

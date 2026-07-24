@@ -84,6 +84,7 @@ class PaperWorkflow:
             GenerateReport,
             ParsePaper,
             PreparePaper,
+            RenderQA,
             ReviseReport,
             SummarizeContribution,
             VerifyClaims,
@@ -99,6 +100,7 @@ class PaperWorkflow:
                 VerifyClaims(),
                 ReviseReport(),
                 GenerateReport(),
+                RenderQA(),
             ]
         )
 
@@ -240,6 +242,7 @@ class PaperWorkflow:
                 for name in ready:
                     context.check_cancelled()
                     node = self.nodes[name]
+                    context.current_stage = name
                     dependencies = {dep: context.checkpoint_keys[dep] for dep in node.depends_on if dep in context.checkpoint_keys}
                     key = node_key(context, name, dependencies, tuple(node.requires))
                     context.checkpoint_keys[name] = key
@@ -253,7 +256,7 @@ class PaperWorkflow:
                         result.metrics["retry_count"] = max(0, context.node_attempts.get(node.name, 1) - 1)
                         context.node_results[node.name] = result
                         context.agent_trace.append(_node_trace_entry(context, node, result))
-                        if context.output and context.paper_name and (context.verification or context.guard_results):
+                        if context.output and context.paper_name:
                             _write_harness_sidecars(context)
                         raise
                     elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()

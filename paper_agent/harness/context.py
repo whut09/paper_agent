@@ -74,6 +74,13 @@ class PaperWorkflowContext:
     verification_path: Path | None = None
     knowledge_graph_path: Path | None = None
     asset_candidates_path: Path | None = None
+    qa_result: Any | None = None
+    qa_path: Path | None = None
+    download_ready: bool = False
+    current_stage: str = ""
+    current_progress: float = 0.0
+    progress_message: str = ""
+    current_reason_code: str = ""
     checkpoint_root: Path | None = None
     checkpoint_keys: dict[str, str] = field(default_factory=dict)
     restored_nodes: set[str] = field(default_factory=set)
@@ -88,6 +95,8 @@ class PaperWorkflowContext:
     _checkpoint_required_inputs: dict[str, tuple[str, ...]] = field(default_factory=dict, repr=False)
 
     def report(self, value: float, desc: str) -> None:
+        self.current_progress = max(0.0, min(float(value), 1.0))
+        self.progress_message = desc
         if self.progress:
             self.progress(value, desc)
 

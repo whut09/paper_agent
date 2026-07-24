@@ -126,6 +126,15 @@ NODE_CONTRACTS = {
             context_reads=("assets", "docx_path", "output", "paper_name", "source_path", "summary", "summary_markdown_path"),
             context_writes=("asset_candidates_path", "docx_path", "grounding_map_path", "knowledge_graph_path", "summary", "summary_markdown_path", "trace_path", "verification_path"),
         ),
+        WorkflowNodeContract(
+            "RenderQA",
+            ("docx", "assets", "output", "paper_name"),
+            ("render_qa",),
+            ("qa.json", "trace.json"),
+            independently_resumable=True,
+            context_reads=("assets", "docx_path", "output", "paper_name", "qa_path", "qa_result", "run_id", "work_dir"),
+            context_writes=("current_reason_code", "download_ready", "qa_path", "qa_result"),
+        ),
     )
 }
 
