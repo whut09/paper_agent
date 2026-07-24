@@ -235,6 +235,16 @@ def parse_args(args: Optional[List[str]]) -> argparse.Namespace:
         eval_parser.add_argument("command", choices=["eval"])
         eval_parser.add_argument("--cases", default="evaluation/golden_cases")
         return eval_parser.parse_args(args=raw_args)
+    if raw_args and raw_args[0] == "acceptance":
+        acceptance_parser = argparse.ArgumentParser(description="Run the PaperAgent migration acceptance suite.")
+        acceptance_parser.add_argument("command", choices=["acceptance"])
+        acceptance_parser.add_argument("--suite", default="evaluation/representative_papers.json")
+        acceptance_parser.add_argument("--artifacts", default="paper_agent_files")
+        acceptance_parser.add_argument("--output", default="paper_agent_files/migration-acceptance.json")
+        acceptance_parser.add_argument("--config", type=str, help="config file used by --execute")
+        acceptance_parser.add_argument("--execute", action="store_true")
+        acceptance_parser.add_argument("--limit", type=int, default=None)
+        return acceptance_parser.parse_args(args=raw_args)
     if raw_args and raw_args[0] == "memory":
         memory_parser = argparse.ArgumentParser(description="Manage PaperAgent correction memory.")
         memory_parser.add_argument("command", choices=["memory"])
@@ -328,6 +338,23 @@ def main(args: Optional[List[str]] = None) -> int:
         from paper_agent.evaluation.runner import main as eval_main
 
         return eval_main(["--cases", parsed_args.cases])
+
+    if getattr(parsed_args, "command", "") == "acceptance":
+        from paper_agent.evaluation.acceptance import main as acceptance_main
+
+        acceptance_args = [
+            "--suite",
+            parsed_args.suite,
+            "--artifacts",
+            parsed_args.artifacts,
+            "--output",
+            parsed_args.output,
+        ]
+        if parsed_args.execute:
+            acceptance_args.append("--execute")
+        if parsed_args.limit is not None:
+            acceptance_args.extend(["--limit", str(parsed_args.limit)])
+        return acceptance_main(acceptance_args)
 
     if getattr(parsed_args, "command", "") == "memory":
         return _memory_cli(parsed_args)

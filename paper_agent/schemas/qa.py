@@ -15,9 +15,12 @@ class RenderQAFinding:
     page_number: int | None = None
     asset_id: int | None = None
     measurements: dict[str, Any] = field(default_factory=dict)
+    suggested_actions: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["suggested_actions"] = list(self.suggested_actions)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -103,10 +106,12 @@ class SummaryRunResult:
     progress_message: str = ""
     repair_count: int = 0
     reason_codes: list[str] = field(default_factory=list)
+    next_actions: list[str] = field(default_factory=list)
     docx_path: Path | None = None
     trace_path: Path | None = None
     verification_path: Path | None = None
     qa_path: Path | None = None
+    acceptance_path: Path | None = None
     failure_report_path: Path | None = None
     downloadable: bool = False
     warning: bool = False
@@ -115,7 +120,7 @@ class SummaryRunResult:
 
     @property
     def diagnostic_paths(self) -> list[Path]:
-        paths = [self.trace_path, self.verification_path, self.qa_path, self.failure_report_path]
+        paths = [self.trace_path, self.verification_path, self.qa_path, self.acceptance_path, self.failure_report_path]
         return [path for path in paths if path is not None and path.exists()]
 
     def to_dict(self) -> dict[str, Any]:
@@ -127,10 +132,12 @@ class SummaryRunResult:
             "progress_message": self.progress_message,
             "repair_count": self.repair_count,
             "reason_codes": list(self.reason_codes),
+            "next_actions": list(self.next_actions),
             "docx_path": str(self.docx_path) if self.docx_path else "",
             "trace_path": str(self.trace_path) if self.trace_path else "",
             "verification_path": str(self.verification_path) if self.verification_path else "",
             "qa_path": str(self.qa_path) if self.qa_path else "",
+            "acceptance_path": str(self.acceptance_path) if self.acceptance_path else "",
             "failure_report_path": str(self.failure_report_path) if self.failure_report_path else "",
             "downloadable": self.downloadable,
             "warning": self.warning,

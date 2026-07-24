@@ -17,7 +17,7 @@ NODE_CONTRACTS = {
             ("input_path", "output_dir"),
             ("output", "source_path", "pdf_path", "paper_name", "work_dir"),
             context_reads=("input_path", "output_dir"),
-            context_writes=("output", "source_path", "pdf_path", "paper_name", "work_dir"),
+            context_writes=("legacy_asset_manifest", "legacy_summary", "output", "source_path", "pdf_path", "paper_name", "work_dir"),
         ),
         WorkflowNodeContract(
             "ParsePaper",
@@ -130,7 +130,7 @@ NODE_CONTRACTS = {
             "RenderQA",
             ("docx", "assets", "output", "paper_name"),
             ("render_qa",),
-            ("qa.json", "trace.json"),
+            ("qa.json", "acceptance.json", "trace.json"),
             independently_resumable=True,
             context_reads=("assets", "docx_path", "output", "paper_name", "qa_path", "qa_result", "run_id", "work_dir"),
             context_writes=("current_reason_code", "download_ready", "qa_path", "qa_result"),

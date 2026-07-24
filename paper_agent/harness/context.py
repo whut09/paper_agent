@@ -74,6 +74,10 @@ class PaperWorkflowContext:
     verification_path: Path | None = None
     knowledge_graph_path: Path | None = None
     asset_candidates_path: Path | None = None
+    acceptance_path: Path | None = None
+    acceptance_result: Any | None = None
+    legacy_asset_manifest: list[dict[str, Any]] = field(default_factory=list)
+    legacy_summary: str = ""
     qa_result: Any | None = None
     qa_path: Path | None = None
     download_ready: bool = False
@@ -81,6 +85,7 @@ class PaperWorkflowContext:
     current_progress: float = 0.0
     progress_message: str = ""
     current_reason_code: str = ""
+    model_call_count: int = 0
     checkpoint_root: Path | None = None
     checkpoint_keys: dict[str, str] = field(default_factory=dict)
     restored_nodes: set[str] = field(default_factory=set)

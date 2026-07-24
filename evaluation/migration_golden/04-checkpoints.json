@@ -1,0 +1,15 @@
+{
+  "phase": "checkpoints",
+  "legacy_trace": {
+    "run_id": "legacy-run",
+    "repair_history": [],
+    "nodes": [{"node": "ParsePaper", "status": "success", "llm_required": false, "metrics": {"elapsed_seconds": 1.5}}]
+  },
+  "current_trace": {
+    "run_id": "current-run",
+    "repair_history": [],
+    "model_call_count": 0,
+    "nodes": [{"node": "ParsePaper", "status": "success", "llm_required": false, "metrics": {"elapsed_seconds": 1.5, "retry_count": 0}}]
+  },
+  "expected": {"legacy_fields_retained": ["run_id", "repair_history", "nodes"]}
+}

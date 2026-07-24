@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import traceback
 import zipfile
@@ -61,12 +62,23 @@ from paper_agent.evaluation.visual_validation import (
     VisualMeasurements as _VisualMeasurements,
     decide_visual_layers as _decide_visual_layers,
 )
+from paper_agent.evaluation.acceptance import (
+    build_acceptance_result as _build_acceptance_result,
+    compare_asset_manifests as _compare_asset_manifests,
+    legacy_manifest_from_assets as _legacy_manifest_from_assets,
+    selected_manifest_from_pools as _selected_manifest_from_pools,
+    selected_manifest_from_sidecar as _selected_manifest_from_sidecar,
+    suggested_actions as _suggested_actions,
+    write_acceptance_sidecar as _write_acceptance_sidecar,
+)
 from paper_agent.evaluation.render_qa import run_render_qa as _run_render_qa, write_render_qa_sidecar as _write_render_qa_sidecar
 from paper_agent.schemas.qa import RenderQAResult as _RenderQAResult, SummaryRunResult as _SummaryRunResult
 from paper_agent.skill_prompts import load_paper_skill_reference
 
 logger = logging.getLogger(__name__)
 _TEXTELLER_FAILED = False
+_MODEL_CALL_COUNTS: dict[int, int] = {}
+_MODEL_CALL_COUNTS_LOCK = threading.Lock()
 DEFAULT_MAX_ASSETS = 13
 DEFAULT_FIGURE_ASSET_LIMIT = 5
 DEFAULT_TABLE_ASSET_LIMIT = 4
@@ -449,6 +461,21 @@ class PreparePaper(_PaperWorkflowNode):
         work_dir = output / f"{paper_name}-summary-assets"
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        previous_summary = output / f"{paper_name}-summary.md"
+        if previous_summary.exists():
+            try:
+                context.legacy_summary = previous_summary.read_text(encoding="utf-8")
+            except OSError:
+                context.legacy_summary = ""
+        previous_candidates = output / f"{paper_name}-asset-candidates.json"
+        if previous_candidates.exists():
+            try:
+                payload = json.loads(previous_candidates.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    context.legacy_asset_manifest = _selected_manifest_from_sidecar(payload)
+            except (OSError, ValueError):
+                context.legacy_asset_manifest = []
+
         context.output = output
         context.source_path = source_path
         context.pdf_path = pdf_path
@@ -725,7 +752,7 @@ class RenderQA(_PaperWorkflowNode):
     agent_role = _PaperAgentRole.CRITIC
     agent_contract = _VERIFIER_AGENT_CONTRACT
     requires = ["docx", "assets", "output", "paper_name"]
-    produces = ["render_qa", "qa.json", "trace.json"]
+    produces = ["render_qa", "qa.json", "acceptance.json", "trace.json"]
 
     def run(self, context: _PaperWorkflowContext) -> _NodeResult:
         if context.docx_path is None or context.output is None:
@@ -856,6 +883,7 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
     context.verification_path = context.verification_path or context.output / f"{context.paper_name}-verification.json"
     context.knowledge_graph_path = context.knowledge_graph_path or context.output / f"{context.paper_name}-knowledge-graph.json"
     context.asset_candidates_path = context.asset_candidates_path or context.output / f"{context.paper_name}-asset-candidates.json"
+    context.acceptance_path = context.acceptance_path or context.output / f"{context.paper_name}-acceptance.json"
 
     trace = []
     for entry in context.agent_trace:
@@ -880,7 +908,9 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
                 "repair_cost_used": context.repair_cost_used,
                 "repair_budget": context.repair_budget,
                 "qa_path": str(context.qa_path) if context.qa_path else "",
+                "acceptance_path": str(context.acceptance_path),
                 "download_ready": context.download_ready,
+                "model_call_count": _model_call_count(context.client),
                 "nodes": trace,
             },
             ensure_ascii=False,
@@ -923,6 +953,11 @@ def _write_harness_sidecars(context: _PaperWorkflowContext) -> None:
         json.dumps(graph_payload, ensure_ascii=False, indent=2),
     )
     _write_asset_candidate_sidecar(context)
+    context.acceptance_result = _build_acceptance_result(
+        context,
+        model_call_count=_model_call_count(context.client),
+    )
+    _write_acceptance_sidecar(context.acceptance_path, context.acceptance_result)
     if context.summary and not context.summary_markdown_path.exists():
         _atomic_write_text(context.summary_markdown_path, context.summary.strip() + "\n")
 
@@ -931,6 +966,14 @@ def _write_asset_candidate_sidecar(context: _PaperWorkflowContext) -> None:
     if context.output is None or not context.paper_name:
         return
     context.asset_candidates_path = context.asset_candidates_path or context.output / f"{context.paper_name}-asset-candidates.json"
+    compatibility_manifest = _legacy_manifest_from_assets(context.assets)
+    selected_manifest = _selected_manifest_from_pools(context.asset_candidate_pools)
+    baseline_manifest = context.legacy_asset_manifest or compatibility_manifest
+    comparison = _compare_asset_manifests(
+        baseline_manifest,
+        selected_manifest,
+        legacy_available=bool(context.legacy_asset_manifest or compatibility_manifest),
+    )
     _atomic_write_text(
         context.asset_candidates_path,
         json.dumps(
@@ -938,6 +981,10 @@ def _write_asset_candidate_sidecar(context: _PaperWorkflowContext) -> None:
                 "run_id": context.run_id,
                 "paper_name": context.paper_name,
                 "pools": [pool.to_dict() for pool in context.asset_candidate_pools],
+                "schema_version": 2,
+                "legacy_manifest": baseline_manifest,
+                "selected_manifest": selected_manifest,
+                "manifest_comparison": comparison.to_dict(),
             },
             ensure_ascii=False,
             indent=2,
@@ -1021,6 +1068,7 @@ def _context_output_value(name: str, context: _PaperWorkflowContext) -> object |
         "asset-candidates.json": context.asset_candidates_path,
         "render_qa": context.qa_result,
         "qa.json": context.qa_path,
+        "acceptance.json": context.acceptance_path,
         "trace.json": context.agent_trace,
     }
     value = mapping.get(name)
@@ -1080,6 +1128,8 @@ def _node_artifacts_snapshot(node: _PaperWorkflowNode, context: _PaperWorkflowCo
         artifacts.append(str(context.asset_candidates_path))
     if "qa.json" in node.produces and context.qa_path:
         artifacts.append(str(context.qa_path))
+    if "acceptance.json" in node.produces and context.acceptance_path:
+        artifacts.append(str(context.acceptance_path))
     return artifacts
 
 
@@ -1169,6 +1219,17 @@ def _summary_run_result(
         else:
             reason_codes.append("workflow_failure")
     reason_codes = list(dict.fromkeys(code for code in reason_codes if code))
+    next_actions: list[str] = []
+    if context.acceptance_result is not None:
+        for blocker in context.acceptance_result.blockers:
+            next_actions.extend(blocker.suggested_actions)
+    if context.verification is not None:
+        for finding in context.verification.findings:
+            next_actions.extend(finding.suggested_actions or _suggested_actions(finding.reason_code))
+    if qa_result is not None:
+        for finding in qa_result.findings:
+            next_actions.extend(finding.suggested_actions or _suggested_actions(finding.reason_code))
+    next_actions = list(dict.fromkeys(action for action in next_actions if action))
 
     status = "success"
     warning = False
@@ -1212,10 +1273,12 @@ def _summary_run_result(
         progress_message=context.progress_message,
         repair_count=len(context.repair_history),
         reason_codes=reason_codes,
+        next_actions=next_actions,
         docx_path=context.docx_path,
         trace_path=context.trace_path,
         verification_path=context.verification_path,
         qa_path=context.qa_path,
+        acceptance_path=context.acceptance_path,
         failure_report_path=context.verification_failed_path,
         downloadable=downloadable,
         warning=warning,
@@ -6287,7 +6350,16 @@ def _write_verification_failed_report(context: _PaperWorkflowContext) -> Path:
             failure_type = failure.get("type", "hard_failure")
             claim = failure.get("claim", "")
             reason = failure.get("reason", "") or failure.get("message", "")
+            finding = _finding_from_legacy(
+                failure,
+                stage="verifier",
+                severity="error",
+                confidence=0.95,
+                provenance=("failure-report",),
+            )
             lines.append(f"- **{failure_type}**: {reason}")
+            lines.append(f"  - reason_code: `{finding.reason_code}`")
+            lines.append(f"  - next_actions: {', '.join(finding.suggested_actions or _suggested_actions(finding.reason_code))}")
             if claim:
                 lines.append(f"  - claim: {claim}")
     elif verification:
@@ -7220,15 +7292,15 @@ def _check_asset_with_visual_model(
         "response_format": response_schema,
     }
     try:
-        response = client.chat.completions.create(**request)
+        response = _create_chat_completion(client, request)
     except openai.BadRequestError:
         request["response_format"] = {"type": "json_object"}
         try:
-            response = client.chat.completions.create(**request)
+            response = _create_chat_completion(client, request)
         except openai.BadRequestError:
             request.pop("response_format", None)
             request.pop("max_tokens", None)
-            response = client.chat.completions.create(**request)
+            response = _create_chat_completion(client, request)
     content = response.choices[0].message.content or ""
     payload = _parse_visual_asset_guard_response(str(content))
     return payload.get("issues", [])
@@ -8392,6 +8464,27 @@ def _codex_stream_timeout_seconds() -> float:
     return max(30.0, min(value, 600.0))
 
 
+def _model_call_count(client: object | None) -> int:
+    if client is None:
+        return 0
+    with _MODEL_CALL_COUNTS_LOCK:
+        return _MODEL_CALL_COUNTS.get(id(client), 0)
+
+
+def _create_chat_completion(client: openai.OpenAI, request: dict):
+    with _MODEL_CALL_COUNTS_LOCK:
+        key = id(client)
+        _MODEL_CALL_COUNTS[key] = _MODEL_CALL_COUNTS.get(key, 0) + 1
+    return client.chat.completions.create(**request)
+
+
+def _release_model_call_count(client: object | None) -> int:
+    if client is None:
+        return 0
+    with _MODEL_CALL_COUNTS_LOCK:
+        return _MODEL_CALL_COUNTS.pop(id(client), 0)
+
+
 def _chat(
     client: openai.OpenAI | None,
     model: str,
@@ -8417,12 +8510,12 @@ def _chat(
             if max_tokens:
                 request["max_tokens"] = max_tokens
             try:
-                response = client.chat.completions.create(**request)
+                response = _create_chat_completion(client, request)
             except openai.BadRequestError:
                 if "max_tokens" not in request:
                     raise
                 request.pop("max_tokens", None)
-                response = client.chat.completions.create(**request)
+                response = _create_chat_completion(client, request)
             content = response.choices[0].message.content or ""
             content = _postprocess_summary(content)
             if content.strip():
@@ -8495,12 +8588,12 @@ def _chat_stream_content(client: openai.OpenAI, request: dict) -> str:
 
 def _read_chat_stream_content(client: openai.OpenAI, stream_request: dict) -> str:
     try:
-        stream = client.chat.completions.create(**stream_request)
+        stream = _create_chat_completion(client, stream_request)
     except openai.BadRequestError:
         if "max_tokens" not in stream_request:
             raise
         stream_request.pop("max_tokens", None)
-        stream = client.chat.completions.create(**stream_request)
+        stream = _create_chat_completion(client, stream_request)
     if hasattr(stream, "choices"):
         choices = getattr(stream, "choices", None) or []
         if not choices:

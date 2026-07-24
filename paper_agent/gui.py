@@ -916,6 +916,7 @@ def _format_summary_diagnostics(result: SummaryRunResult) -> str:
         "failed": "失败",
     }
     reasons = ", ".join(result.reason_codes) or "无"
+    actions = ", ".join(result.next_actions) or "无"
     warning = "\n\n**注意：RenderQA 存在 warning，请先查看 qa.json。**" if result.warning else ""
     return (
         f"### 运行诊断：{labels.get(result.status, result.status)}\n\n"
@@ -923,6 +924,7 @@ def _format_summary_diagnostics(result: SummaryRunResult) -> str:
         f"- 进度：`{result.progress * 100:.0f}%` {result.progress_message}\n"
         f"- 已执行修复次数：`{result.repair_count}`\n"
         f"- 当前 reason code：`{reasons}`\n"
+        f"- 下一步修复动作：`{actions}`\n"
         f"- 结果：{result.message}{warning}"
     )
 
@@ -1213,7 +1215,7 @@ with gr.Blocks(
             output_file_mono = gr.File(label="下载 Word 总结文档", visible=False)
             diagnostic_status = gr.Markdown(visible=False)
             diagnostic_files = gr.File(
-                label="诊断文件（trace / verification / qa / failure report）",
+                label="诊断文件（trace / verification / qa / acceptance / failure report）",
                 file_count="multiple",
                 visible=False,
             )

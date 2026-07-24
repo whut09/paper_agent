@@ -1,0 +1,12 @@
+{
+  "phase": "typed_findings",
+  "legacy_verification": {
+    "passed": false,
+    "hard_failures": [
+      {"type": "guard_failure", "reason": "Asset Guard: referenced critical asset 表2 is missing from asset manifest"}
+    ],
+    "soft_warnings": [],
+    "patch_suggestions": []
+  },
+  "expected": {"reason_code": "missing_critical_asset", "suggested_action": "capture_missing_asset"}
+}

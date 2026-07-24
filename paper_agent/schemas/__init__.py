@@ -4,6 +4,8 @@ from importlib import import_module
 from typing import Any
 
 _LAZY_EXPORTS = {
+    "AcceptanceBlocker": "paper_agent.schemas.acceptance",
+    "AcceptanceMetrics": "paper_agent.schemas.acceptance",
     "AgentContract": "paper_agent.schemas.agent",
     "CodexConfig": "paper_agent.schemas.paper",
     "Claim": "paper_agent.schemas.evidence",
@@ -22,11 +24,14 @@ _LAZY_EXPORTS = {
     "FindingStage": "paper_agent.schemas.findings",
     "migrate_verification_payload": "paper_agent.schemas.findings",
     "GuardResultContract": "paper_agent.schemas.contracts",
+    "ManifestComparison": "paper_agent.schemas.acceptance",
+    "MigrationAcceptanceResult": "paper_agent.schemas.acceptance",
     "RenderAssetMeasurement": "paper_agent.schemas.qa",
     "RenderPageMeasurement": "paper_agent.schemas.qa",
     "RenderQAFinding": "paper_agent.schemas.qa",
     "RenderQAResult": "paper_agent.schemas.qa",
     "SummaryRunResult": "paper_agent.schemas.qa",
+    "SectionCoverageComparison": "paper_agent.schemas.acceptance",
     "GroundingSection": "paper_agent.schemas.claim",
     "KnowledgeGraphEdge": "paper_agent.schemas.report",
     "KnowledgeGraphNode": "paper_agent.schemas.report",

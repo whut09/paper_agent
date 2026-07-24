@@ -18,6 +18,7 @@ from xml.etree import ElementTree as ET
 import fitz
 from PIL import Image
 
+from paper_agent.evaluation.acceptance import suggested_actions
 from paper_agent.schemas.qa import (
     RenderAssetMeasurement,
     RenderPageMeasurement,
@@ -53,7 +54,15 @@ def _finding(
     asset_id: int | None = None,
     **measurements: Any,
 ) -> RenderQAFinding:
-    return RenderQAFinding(reason_code, severity, message, page_number, asset_id, measurements)
+    return RenderQAFinding(
+        reason_code,
+        severity,
+        message,
+        page_number,
+        asset_id,
+        measurements,
+        suggested_actions(reason_code),
+    )
 
 
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:

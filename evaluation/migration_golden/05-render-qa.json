@@ -1,0 +1,10 @@
+{
+  "phase": "render_qa",
+  "qa": {
+    "status": "block",
+    "findings": [
+      {"reason_code": "image_cropped", "severity": "block", "message": "Rendered image exceeds the page boundary"}
+    ]
+  },
+  "expected": {"status": "blocked", "suggested_action": "resize_asset_to_content_area"}
+}

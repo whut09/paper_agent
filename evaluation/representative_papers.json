@@ -1,0 +1,55 @@
+{
+  "name": "paper-agent-representative-10",
+  "papers": [
+    {
+      "paper_name": "2412.15606",
+      "source": "paper_agent_files/2412.15606.pdf",
+      "category": "object-detection"
+    },
+    {
+      "paper_name": "2504.11101",
+      "source": "paper_agent_files/2504.11101.pdf",
+      "category": "vision-language"
+    },
+    {
+      "paper_name": "2604.01777",
+      "source": "paper_agent_files/2604.01777.pdf",
+      "category": "agentic-vision"
+    },
+    {
+      "paper_name": "Li_LensWalk_Agentic_Video_Understanding_by_Planning_How_You_See_in_CVPR_2026_paper",
+      "source": "paper_agent_files/Li_LensWalk_Agentic_Video_Understanding_by_Planning_How_You_See_in_CVPR_2026_paper.pdf",
+      "category": "video-understanding"
+    },
+    {
+      "paper_name": "Wei_GTR-Turbo_Merged_Checkpoint_is_Secretly_a_Free_Teacher_for_Agentic_CVPR_2026_paper",
+      "source": "paper_agent_files/Wei_GTR-Turbo_Merged_Checkpoint_is_Secretly_a_Free_Teacher_for_Agentic_CVPR_2026_paper.pdf",
+      "category": "model-merging"
+    },
+    {
+      "paper_name": "Wang_OVOD-Agent_A_Markov-Bandit_Framework_for_Proactive_Visual_Reasoning_and_Self-Evolving_CVPR_2026_paper",
+      "source": "paper_agent_files/Wang_OVOD-Agent_A_Markov-Bandit_Framework_for_Proactive_Visual_Reasoning_and_Self-Evolving_CVPR_2026_paper.pdf",
+      "category": "open-vocabulary-detection"
+    },
+    {
+      "paper_name": "Tang_Evolutionary_Multi-Agent_Collaboration_for_Real-World_Video_Face_Restoration_CVPRF_2026_paper",
+      "source": "paper_agent_files/Tang_Evolutionary_Multi-Agent_Collaboration_for_Real-World_Video_Face_Restoration_CVPRF_2026_paper.pdf",
+      "category": "video-restoration"
+    },
+    {
+      "paper_name": "Yang_RAAS_LLM_Agentic_System_Architecture_Search_with_GRPO_CVPR_2026_paper",
+      "source": "paper_agent_files/Yang_RAAS_LLM_Agentic_System_Architecture_Search_with_GRPO_CVPR_2026_paper.pdf",
+      "category": "architecture-search"
+    },
+    {
+      "paper_name": "Jiao_Socratic-Geo_Synthetic_Data_Generation_and_Cross-Modal_Geometric_Reasoning_via_Multi-Agent_CVPR_2026_paper",
+      "source": "paper_agent_files/Jiao_Socratic-Geo_Synthetic_Data_Generation_and_Cross-Modal_Geometric_Reasoning_via_Multi-Agent_CVPR_2026_paper.pdf",
+      "category": "geometric-reasoning"
+    },
+    {
+      "paper_name": "Li_SyncMos_Scalable_Motion_Synchronisation_for_Multi-Agent_Scene_Interaction_CVPR_2026_paper",
+      "source": "paper_agent_files/Li_SyncMos_Scalable_Motion_Synchronisation_for_Multi-Agent_Scene_Interaction_CVPR_2026_paper.pdf",
+      "category": "motion-synthesis"
+    }
+  ]
+}

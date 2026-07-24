@@ -18,6 +18,8 @@ __all__ = [
     "VisualMeasurements",
     "decide_visual_layers",
     "precision_recall",
+    "audit_existing_run",
+    "run_acceptance_suite",
 ]
 
 
@@ -54,4 +56,8 @@ def __getattr__(name: str):
             "decide_visual_layers": decide_visual_layers,
             "precision_recall": precision_recall,
         }[name]
+    if name in {"audit_existing_run", "run_acceptance_suite"}:
+        from paper_agent.evaluation.acceptance import audit_existing_run, run_acceptance_suite
+
+        return {"audit_existing_run": audit_existing_run, "run_acceptance_suite": run_acceptance_suite}[name]
     raise AttributeError(name)

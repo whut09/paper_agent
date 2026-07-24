@@ -351,6 +351,16 @@ copy config.json config.local.json
 
 `GenerateReport` 后会执行 `RenderQA`。程序先检查 DOCX 包结构、图片尺寸、caption 邻接、未替换 marker 和关键图表覆盖；平台存在 LibreOffice 或 Windows Word COM 时，还会渲染 PDF/页面图片，检查页数、裁切和页面溢出。结果写入 `*-qa.json`，并与 `trace.json`、`verification.json`、失败报告一起显示在 GUI 诊断区。内容缺陷会阻止 Word 下载；渲染器不可用或渲染超时属于 warning，Word 仍可下载，但界面会明确提示。渲染超时可通过 `PAPER_AGENT_RENDER_QA_TIMEOUT_SECONDS` 调整，默认 `120` 秒。
 
+每次工作流还会写入 `*-acceptance.json`，记录新旧 asset manifest 对比、报告章节覆盖率、总耗时、实际模型接口调用次数、有效/无效修复次数、hard failure、warning 和最终 QA。相同 geometry/content signature 不计为修复进展；任何 blocked 结果都必须同时包含类型化 `reason_code` 和可执行的 `suggested_actions`。旧版 `verification.json` 与 `asset-candidates.json` 的字段至少保留一个迁移周期可读。
+
+运行 10 篇代表论文的迁移验收：
+
+```powershell
+python -m paper_agent acceptance --suite evaluation/representative_papers.json --artifacts paper_agent_files --output paper_agent_files/migration-acceptance.json
+```
+
+默认命令审计已有产物，不会调用模型。加 `--execute --config config.local.json` 会通过现有 `summarize_paper` facade 重新执行论文；可用 `--limit 1` 先做单篇真实验收。验收只接受两种结论：RenderQA `pass` 的 DOCX，或包含明确 reason code 和下一步动作的 blocked report。历史产物没有 `qa.json` 时会得到 `qa_not_recorded`，不会被冒充为通过。
+
 如果分段阶段部分 chunk 超时，PaperAgent 会跳过超时 chunk 并继续使用已完成的中文分段笔记。最终整合超时后会尝试一次轻量快速整合；如果快速整合也超时，程序会停止生成 Word，避免输出不可读文档。
 
 为避免生成不可读报告，Word 写入前会做质量自检：如果报告主体疑似直接复制英文原文、包含内部兜底文本，或快速整合也超时，程序会停止生成 Word 并返回明确错误，避免输出不可交付的文档。

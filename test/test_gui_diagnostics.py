@@ -74,6 +74,7 @@ def test_gradio_network_timeout_has_stage_and_reason_code():
         current_stage="VerifyClaims",
         progress=0.78,
         reason_codes=["verifier_transport_failure"],
+        next_actions=["retry_verifier"],
     )
 
     markdown = _format_summary_diagnostics(result)
@@ -81,6 +82,7 @@ def test_gradio_network_timeout_has_stage_and_reason_code():
     assert "VerifyClaims" in markdown
     assert "78%" in markdown
     assert "verifier_transport_failure" in markdown
+    assert "retry_verifier" in markdown
 
 
 def test_gradio_callback_returns_diagnostics_for_download_timeout():

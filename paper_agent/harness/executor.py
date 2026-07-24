@@ -223,7 +223,12 @@ class PaperWorkflow:
         raise last_error or RuntimeError(f"node {node.name} failed")
 
     def run(self, context: PaperWorkflowContext) -> PaperWorkflowContext:
-        from paper_agent.paper_summary import _node_trace_entry, _normalize_node_result, _write_harness_sidecars
+        from paper_agent.paper_summary import (
+            _node_trace_entry,
+            _normalize_node_result,
+            _release_model_call_count,
+            _write_harness_sidecars,
+        )
 
         pending = set(self.nodes)
         completed: set[str] = set()
@@ -281,6 +286,7 @@ class PaperWorkflow:
                         completed.add(name)
             return context
         finally:
+            context.model_call_count = _release_model_call_count(context.client)
             context.close()
 
 

@@ -1,0 +1,10 @@
+{
+  "phase": "asset_candidates",
+  "legacy_manifest": [
+    {"asset_id": 1, "kind": "table", "page_number": 3, "caption": "Table 1. Results", "bbox": [100, 200, 400, 500]}
+  ],
+  "current_manifest": [
+    {"asset_id": 1, "kind": "table", "page_number": 3, "caption": "Table 1. Results", "bbox": [100, 190, 400, 505], "strategy": "border_enclosed_bbox"}
+  ],
+  "expected": {"matched_count": 1, "changed_count": 1, "legacy_fields_retained": ["pools"]}
+}

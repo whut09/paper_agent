@@ -1,0 +1,13 @@
+{
+  "phase": "repair_state_machine",
+  "repair_history": [
+    {
+      "attempt": 1,
+      "transitions": [
+        {"action": "expand_to_border", "before_signature": "same-crop", "after_signature": "same-crop", "changed": false},
+        {"action": "split_at_border", "before_signature": "crop-a", "after_signature": "crop-b", "changed": true}
+      ]
+    }
+  ],
+  "expected": {"effective_repair_count": 1, "ineffective_repair_count": 1}
+}

@@ -61,6 +61,7 @@ def test_render_qa_warns_when_renderer_is_unavailable(tmp_path):
     assert result.status == "warning"
     assert result.downloadable
     assert result.reason_codes == ["renderer_unavailable"]
+    assert "install_libreoffice_or_enable_word_com" in result.findings[0].suggested_actions
 
 
 def test_render_qa_blocks_missing_manifest_asset(tmp_path):
@@ -75,6 +76,7 @@ def test_render_qa_blocks_missing_manifest_asset(tmp_path):
     assert result.status == "block"
     assert not result.downloadable
     assert "missing_critical_asset" in result.reason_codes
+    assert all(item.suggested_actions for item in result.findings if item.severity == "block")
 
 
 def test_render_qa_renderer_timeout_is_warning_not_content_defect(tmp_path):

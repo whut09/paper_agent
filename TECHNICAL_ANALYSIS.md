@@ -157,7 +157,21 @@ rg -n "sk-[A-Za-z0-9]{20,}" --hidden --glob "!.git/**" --glob "!config.local.jso
 - 修改 GitHub 提交前，先运行敏感信息扫描。
 - 如果 GitHub 推送超时，而浏览器能访问 GitHub，优先检查 Git 是否配置了本机代理。
 
-## 10. Git 代理说明
+## 10. 迁移验收层
+
+Prompt 1-6 保持 `paper_agent.harness.workflow.summarize_paper` 为兼容 facade，并按以下独立提交顺序迁移：
+
+1. `4fdc995`：资产候选生成；
+2. `a50a30e`：类型化 Finding；
+3. `1c0530d`：有界修复状态机；
+4. `f37756d`：内容寻址 checkpoint；
+5. `95e8eba`：DOCX RenderQA。
+
+`paper_agent/evaluation/acceptance.py` 不参与论文内容生成，只读取 workflow context 和 sidecar，形成 `acceptance.json`。它负责比较 compatibility manifest 与候选池选中 manifest、比较新旧报告章节覆盖率，并汇总耗时、模型调用、有效修复、无效重复修复、hard failure、warning 和最终 QA。五个迁移阶段分别有 `evaluation/migration_golden/` fixture，10 篇真实论文清单位于 `evaluation/representative_papers.json`。
+
+验收状态不把 warning 当成 pass：只有最终 RenderQA `pass` 才是 `passed`；无法认证或存在内容缺陷时必须输出 `blocked`，并为每个 blocker 保存 `reason_code` 和 `suggested_actions`。历史 sidecar 缺少 RenderQA 时使用 `qa_not_recorded`，下一步动作是 `rerun_with_render_qa`。
+
+## 11. Git 代理说明
 
 当前机器浏览器通过 `127.0.0.1:7890` 访问 GitHub。Git 需要单独配置代理：
 
