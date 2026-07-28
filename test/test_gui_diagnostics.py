@@ -4,7 +4,7 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from paper_agent.gui import _format_summary_diagnostics, _summary_callback_response, summarize_file
+from paper_agent.gui import _format_summary_diagnostics, _reset_summary_view, _summary_callback_response, summarize_file
 from paper_agent.schemas.qa import SummaryRunResult
 
 
@@ -40,9 +40,10 @@ def test_gradio_success_exposes_word_without_internal_diagnostics(tmp_path):
 
     assert response[0]["value"] == str(result.docx_path)
     assert response[0]["visible"] is True
-    assert response[6]["value"] is None
-    assert response[6]["visible"] is False
-    assert "reason code" not in response[5]["value"]
+    assert len(response) == 6
+    assert response[5]["value"] is None
+    assert response[5]["visible"] is False
+    assert "reason code" not in response[4]["value"]
 
 
 def test_gradio_warning_is_visible_and_downloadable(tmp_path):
@@ -64,10 +65,10 @@ def test_gradio_block_hides_word_and_shows_only_problem_and_cause(tmp_path):
 
     assert response[0]["value"] is None
     assert response[0]["visible"] is False
-    assert "问题" in response[5]["value"]
-    assert "失败原因" in response[5]["value"]
-    assert "missing_critical_asset" not in response[5]["value"]
-    assert response[6]["visible"] is False
+    assert "问题" in response[4]["value"]
+    assert "失败原因" in response[4]["value"]
+    assert "missing_critical_asset" not in response[4]["value"]
+    assert response[5]["visible"] is False
 
 
 def test_gradio_network_timeout_has_plain_language_explanation():
@@ -105,8 +106,8 @@ def test_gradio_callback_returns_diagnostics_for_download_timeout():
         )
 
     assert response[0]["visible"] is False
-    assert "连接超时" in response[5]["value"]
-    assert "network_timeout" not in response[5]["value"]
+    assert "连接超时" in response[4]["value"]
+    assert "network_timeout" not in response[4]["value"]
     assert state["session_id"] is None
 
 
@@ -120,14 +121,35 @@ def test_visual_crop_failure_hides_guard_and_sidecar_details(tmp_path):
     )
 
     response = _summary_callback_response(result, None)
-    markdown = response[5]["value"]
+    markdown = response[4]["value"]
 
     assert "第 4 个图表截图" in markdown
     assert "没有识别到有效的图像主体" in markdown
     assert "reason" not in markdown.lower()
     assert "select_alternate_candidate" not in markdown
     assert "failure.md" not in markdown
-    assert response[6]["visible"] is False
+    assert response[5]["visible"] is False
+
+
+def test_new_link_summary_clears_previous_result_and_preview():
+    response = _reset_summary_view("Link")
+
+    assert len(response) == 6
+    assert response[0]["value"] is None
+    assert response[0]["visible"] is False
+    assert response[1]["value"] is None
+    assert response[1]["visible"] is False
+    assert response[2]["visible"] is False
+    assert response[3]["visible"] is True
+    assert response[4]["visible"] is False
+    assert response[5]["visible"] is False
+
+
+def test_new_file_summary_keeps_uploaded_preview():
+    response = _reset_summary_view("File")
+
+    assert response[1] == {"__type__": "update"}
+    assert response[3]["visible"] is False
 
 
 class _FakeAsyncResult:

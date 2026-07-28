@@ -954,10 +954,21 @@ def _summary_callback_response(result: SummaryRunResult, file_path: str | Path |
     return (
         gr.update(value=download_path, visible=bool(download_path)),
         gr.update(value=preview_path, visible=bool(preview_path)),
-        gr.update(value=download_path, visible=bool(download_path)),
         gr.update(value=title, visible=True),
         gr.update(visible=not bool(preview_path)),
         gr.update(value=_format_summary_diagnostics(result), visible=True),
+        gr.update(value=None, visible=False),
+    )
+
+
+def _reset_summary_view(file_type: str):
+    link_mode = file_type == "Link"
+    return (
+        gr.update(value=None, visible=False),
+        gr.update(value=None, visible=False) if link_mode else gr.update(),
+        gr.update(value="", visible=False),
+        gr.update(visible=link_mode),
+        gr.update(value="", visible=False),
         gr.update(value=None, visible=False),
     )
 
@@ -980,19 +991,19 @@ def summarize_file(
         if flag_demo and not verify_recaptcha(recaptcha_response):
             raise gr.Error("reCAPTCHA fail")
 
-        progress(0, desc="Preparing paper...")
+        progress(0, desc="正在准备论文...")
         output = Path("paper_agent_files")
         output.mkdir(parents=True, exist_ok=True)
 
         if file_type == "File":
             if not file_input:
                 raise gr.Error("No input")
-            progress(0.03, desc="Preparing uploaded paper...")
+            progress(0.03, desc="正在准备上传文件...")
             file_path = shutil.copy(file_input, output)
         else:
             if not link_input:
                 raise gr.Error("No input")
-            progress(0.01, desc="Downloading paper...")
+            progress(0.01, desc="正在下载论文...")
 
             def download_progress(downloaded: int, total: int | None) -> None:
                 if cancellation_event.is_set():
@@ -1003,11 +1014,11 @@ def summarize_file(
                     total_mb = total / 1024 / 1024
                     progress(
                         0.01 + ratio * 0.09,
-                        desc=f"Downloading paper... {downloaded_mb:.1f}/{total_mb:.1f} MB",
+                        desc=f"正在下载论文... {downloaded_mb:.1f}/{total_mb:.1f} MB",
                     )
                 else:
                     downloaded_mb = downloaded / 1024 / 1024
-                    progress(0.03, desc=f"Downloading paper... {downloaded_mb:.1f} MB")
+                    progress(0.03, desc=f"正在下载论文... {downloaded_mb:.1f} MB")
 
             file_path = download_with_limit(
                 link_input,
@@ -1015,7 +1026,7 @@ def summarize_file(
                 5 * 1024 * 1024 if flag_demo else None,
                 progress_callback=download_progress,
             )
-            progress(0.1, desc="Download complete. Parsing paper...")
+            progress(0.1, desc="下载完成，正在解析论文...")
 
         if cancellation_event.is_set():
             raise CancelledError("task cancelled")
@@ -1306,7 +1317,21 @@ with gr.Blocks(
 
     state = gr.State({"session_id": None})
 
-    summary_event = summary_btn.click(
+    reset_summary_event = summary_btn.click(
+        _reset_summary_view,
+        inputs=[file_type],
+        outputs=[
+            output_file_mono,
+            preview,
+            output_title,
+            preview_hint,
+            diagnostic_status,
+            diagnostic_files,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
+    summary_event = reset_summary_event.then(
         summarize_file,
         inputs=[
             file_type,
@@ -1321,13 +1346,13 @@ with gr.Blocks(
         outputs=[
             output_file_mono,
             preview,
-            output_file_mono,
             output_title,
             preview_hint,
             diagnostic_status,
             diagnostic_files,
         ],
         concurrency_limit=2,
+        show_progress="minimal",
     )
     summary_event.then(lambda: None, js="()=>{grecaptcha.reset()}" if flag_demo else "")
 
