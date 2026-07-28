@@ -216,7 +216,12 @@ def _critical_references(text: str) -> set[tuple[str, str]]:
     return refs
 
 
-def _inspect_docx(docx_path: Path, assets: list[Any]) -> tuple[list[RenderAssetMeasurement], list[RenderQAFinding]]:
+def _inspect_docx(
+    docx_path: Path,
+    assets: list[Any],
+    *,
+    required_asset_ids: set[int] | None = None,
+) -> tuple[list[RenderAssetMeasurement], list[RenderQAFinding]]:
     findings: list[RenderQAFinding] = []
     measurements: list[RenderAssetMeasurement] = []
     try:
@@ -261,7 +266,8 @@ def _inspect_docx(docx_path: Path, assets: list[Any]) -> tuple[list[RenderAssetM
                 source_page = int(getattr(asset, "page_number", 0) or 0)
                 drawing = drawings.get(asset_id)
                 if drawing is None:
-                    findings.append(_finding("missing_critical_asset", "block", f"Asset {asset_id} is not embedded in the DOCX", asset_id=asset_id))
+                    if required_asset_ids is None or asset_id in required_asset_ids:
+                        findings.append(_finding("missing_critical_asset", "block", f"Asset {asset_id} is not embedded in the DOCX", asset_id=asset_id))
                     measurements.append(RenderAssetMeasurement(asset_id, kind, caption, source_page))
                     continue
                 rel_id, cx, cy, adjacent = drawing
@@ -381,8 +387,13 @@ def run_render_qa(
     render_dir: Path,
     *,
     timeout_seconds: float = 120.0,
+    required_asset_ids: set[int] | None = None,
 ) -> RenderQAResult:
-    measurements, findings = _inspect_docx(docx_path, assets)
+    measurements, findings = _inspect_docx(
+        docx_path,
+        assets,
+        required_asset_ids=required_asset_ids,
+    )
     attempt = _render_docx(docx_path, render_dir, timeout_seconds)
     pages: list[RenderPageMeasurement] = []
     if attempt.pdf_path is not None:

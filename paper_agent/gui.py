@@ -908,32 +908,49 @@ def stop_summary_file(state: dict) -> None:
 
 
 def _format_summary_diagnostics(result: SummaryRunResult) -> str:
-    labels = {
-        "success": "通过",
-        "warning": "警告",
-        "blocked": "已阻断",
-        "timeout": "网络/服务超时",
-        "failed": "失败",
-    }
-    reasons = ", ".join(result.reason_codes) or "无"
-    actions = ", ".join(result.next_actions) or "无"
-    warning = "\n\n**注意：RenderQA 存在 warning，请先查看 qa.json。**" if result.warning else ""
-    return (
-        f"### 运行诊断：{labels.get(result.status, result.status)}\n\n"
-        f"- 当前阶段：`{result.current_stage or '未进入工作流'}`\n"
-        f"- 进度：`{result.progress * 100:.0f}%` {result.progress_message}\n"
-        f"- 已执行修复次数：`{result.repair_count}`\n"
-        f"- 当前 reason code：`{reasons}`\n"
-        f"- 下一步修复动作：`{actions}`\n"
-        f"- 结果：{result.message}{warning}"
-    )
+    if result.status == "success":
+        return "Word 文档已生成，并通过内容与渲染检查。"
+    if result.status == "warning":
+        if any(code.startswith("renderer_") for code in result.reason_codes):
+            return "Word 文档已生成，内容与图表结构检查通过；本机 Word/LibreOffice 渲染服务不可用，因此未完成自动分页预览。"
+        return "Word 文档已生成。排版检查发现轻微问题，但不影响下载和阅读。"
+
+    issue, cause = _summary_failure_explanation(result)
+    return f"**问题：** {issue}\n\n**失败原因：** {cause}"
+
+
+def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
+    message = str(result.message or "").strip()
+    lowered = message.lower()
+    asset_match = re.search(r"\basset\s+(\d+)\b", lowered)
+    asset_name = f"第 {asset_match.group(1)} 个图表截图" if asset_match else "论文内容"
+
+    if "text-only" in lowered or "只有文字" in message or "图像主体" in message:
+        issue = f"{asset_name}没有识别到有效的图像主体。"
+        cause = "系统自动重新定位并复检后，仍无法确认截图完整，因此停止生成，避免把错误截图写入 Word。"
+    elif "missing critical asset" in lowered or "missing_critical_asset" in result.reason_codes:
+        label_match = re.search(r"(?:图|表)\s*\d+", message)
+        label = label_match.group(0).replace(" ", "") if label_match else "关键图表"
+        issue = f"论文引用的{label}没有成功提取。"
+        cause = "系统尝试重新定位该图表后仍未得到完整截图，因此停止生成，避免输出缺少关键信息的 Word。"
+    elif "table" in lowered and any(token in lowered for token in ("crop", "truncated", "body", "表格")):
+        issue = f"{asset_name}不完整或混入了其他内容。"
+        cause = "系统自动重裁并复检后仍未找到可靠的完整表格，因此停止生成。"
+    elif result.status == "timeout" or any(
+        code in {"network_timeout", "verifier_transport_failure"} for code in result.reason_codes
+    ):
+        issue = "模型服务或下载连接超时。"
+        cause = "自动重试后连接仍未恢复，本次任务无法继续。已有中间结果会保留供下次恢复。"
+    else:
+        issue = "论文总结未能通过最终检查。"
+        cause = "系统自动修复和复检后仍存在会影响 Word 完整性的问题，因此没有提供不可靠的文档。"
+    return issue, cause
 
 
 def _summary_callback_response(result: SummaryRunResult, file_path: str | Path | None):
     preview_path = str(file_path) if file_path and str(file_path).lower().endswith(".pdf") else None
     download_path = str(result.docx_path) if result.downloadable and result.docx_path else None
-    diagnostic_paths = [str(path) for path in result.diagnostic_paths]
-    title = "## 论文总结已生成" if download_path else "## 论文总结诊断"
+    title = "## 论文总结已生成" if download_path else "## 生成失败"
     return (
         gr.update(value=download_path, visible=bool(download_path)),
         gr.update(value=preview_path, visible=bool(preview_path)),
@@ -941,7 +958,7 @@ def _summary_callback_response(result: SummaryRunResult, file_path: str | Path |
         gr.update(value=title, visible=True),
         gr.update(visible=not bool(preview_path)),
         gr.update(value=_format_summary_diagnostics(result), visible=True),
-        gr.update(value=diagnostic_paths or None, visible=bool(diagnostic_paths)),
+        gr.update(value=None, visible=False),
     )
 
 

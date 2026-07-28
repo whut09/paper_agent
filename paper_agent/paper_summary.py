@@ -765,6 +765,11 @@ class RenderQA(_PaperWorkflowNode):
             context.assets,
             render_dir,
             timeout_seconds=_render_qa_timeout_seconds(),
+            required_asset_ids={
+                int(match.group(1))
+                for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", context.summary)
+                if 1 <= int(match.group(1)) <= len(context.assets)
+            },
         )
         context.qa_path = context.output / f"{context.paper_name}-qa.json"
         _write_render_qa_sidecar(context.qa_path, context.qa_result, run_id=context.run_id)
@@ -5364,17 +5369,31 @@ def _add_guard_failures_to_verification(
     for error in guard_errors:
         if error not in verification.errors:
             verification.errors.append(error)
-        if not any(finding.human_message == error for finding in typed_guard_findings):
-            typed_guard_findings.append(
-                _finding_from_legacy(
-                    error,
-                    stage="guard",
-                    severity="error",
-                    confidence=0.95,
-                    provenance=("guard:aggregate",),
-                )
+        matched = next(
+            (
+                finding
+                for finding in typed_guard_findings
+                if finding.human_message == error or error.endswith(finding.human_message)
+            ),
+            None,
+        )
+        if matched is None:
+            matched = _finding_from_legacy(
+                error,
+                stage="guard",
+                severity="error",
+                confidence=0.95,
+                provenance=("guard:aggregate",),
             )
-        verification.hard_failures.append({"type": "guard_failure", "claim": "", "reason": error})
+            typed_guard_findings.append(matched)
+        verification.hard_failures.append(
+            {
+                "type": matched.reason_code,
+                "reason_code": matched.reason_code,
+                "claim": "",
+                "reason": error,
+            }
+        )
     verification.findings = _aggregate_findings([*verification.findings, *typed_guard_findings])
 
 
@@ -5940,10 +5959,10 @@ def _recapture_critical_visual_assets(
                 continue
             original_key = _asset_label_key(original)
             display_label = _critical_asset_label(original_key) if original_key else (original.caption or f"asset {asset_id}")
-            replacement = next(
-                (candidate for candidate in candidates if _asset_label_key(candidate) == original_key),
-                None,
-            )
+            matching_candidates = [
+                candidate for candidate in candidates if _asset_label_key(candidate) == original_key
+            ]
+            replacement = next(iter(matching_candidates), None)
             if replacement is None:
                 logger.warning("Unable to recapture asset %s", display_label)
                 continue
@@ -5961,9 +5980,11 @@ def _recapture_critical_visual_assets(
                     replacement = next(
                         (
                             candidate
-                            for candidate in candidates
+                            for candidate in matching_candidates
                             if _asset_capture_signature(candidate)
                             != _asset_capture_signature(original)
+                            and _asset_bitmap_digest(candidate.path)
+                            != _asset_bitmap_digest(original.path)
                         ),
                         None,
                     )
@@ -5978,6 +5999,9 @@ def _recapture_critical_visual_assets(
                 if replacement is None or _asset_capture_signature(replacement) == _asset_capture_signature(original):
                     logger.warning("Recapture produced no geometric change for asset %s", display_label)
                     continue
+            if not _replacement_passes_visual_recheck(context, asset_id, replacement):
+                logger.warning("Recaptured asset %s failed deterministic visual recheck", display_label)
+                continue
             context.assets[asset_id - 1] = replacement
             repaired.add(asset_id)
             logger.info(
@@ -5988,6 +6012,32 @@ def _recapture_critical_visual_assets(
     finally:
         doc.close()
     return repaired
+
+
+def _replacement_passes_visual_recheck(
+    context: _PaperWorkflowContext,
+    asset_id: int,
+    replacement: PaperAsset,
+) -> bool:
+    candidate_assets = list(context.assets)
+    candidate_assets[asset_id - 1] = replacement
+    measurements = _visual_asset_measurements(
+        asset_id,
+        replacement,
+        context.summary,
+        candidate_assets,
+        context.pdf_path,
+    )
+    deterministic_issues = _local_visual_asset_issues(asset_id, replacement)
+    text_issues = _ocr_text_consistency_issues(asset_id, replacement, measurements)
+    decision = _decide_visual_layers(
+        measurements,
+        deterministic_errors=[
+            issue for issue in deterministic_issues if str(issue.get("severity", "warning")) == "error"
+        ],
+        text_warnings=text_issues,
+    )
+    return decision.outcome == "pass"
 
 
 def _adaptive_visual_recapture(
@@ -6181,7 +6231,15 @@ def _asset_capture_signature(asset: PaperAsset) -> tuple:
         rect,
         _clean_xml_text(asset.caption),
         _clean_xml_text(asset.text),
+        _asset_bitmap_digest(asset.path),
     )
+
+
+def _asset_bitmap_digest(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+    except OSError:
+        return ""
 
 
 def _valid_visual_asset_failure_ids(context: _PaperWorkflowContext) -> set[int]:
@@ -6918,6 +6976,8 @@ def _visual_asset_measurements(
             intersection = asset.rect & other.rect
             if not intersection.is_empty and intersection.get_area() / max(asset.rect.get_area(), 1.0) > 0.1:
                 overlapping_objects += 1
+    bitmap_looks_text_only = _image_looks_text_only(asset.path) if asset.path.exists() else False
+    pdf_has_graphics = _pdf_region_has_graphics(source_pdf, asset)
     return _VisualMeasurements(
         asset_id=asset_id,
         kind=asset.kind,
@@ -6930,10 +6990,56 @@ def _visual_asset_measurements(
         table_border_closed=_table_border_closed(source_pdf, asset),
         numeric_values=numeric_values,
         body_rows=body_rows,
-        text_only=_image_looks_text_only(asset.path) if asset.path.exists() else False,
+        # Sparse scientific plots often have mostly white pixels.  Treat them
+        # as text-only only when the source PDF also has no graphical object
+        # inside the captured region.
+        text_only=bitmap_looks_text_only and pdf_has_graphics is not True,
         overlapping_objects=overlapping_objects,
         page_number=asset.page_number,
     )
+
+
+def _pdf_region_has_graphics(source_pdf: Path | None, asset: PaperAsset) -> bool | None:
+    if source_pdf is None or asset.rect is None or asset.kind != "figure":
+        return None
+    try:
+        doc = fitz.open(source_pdf)
+        try:
+            if not 1 <= asset.page_number <= doc.page_count:
+                return None
+            page = doc[asset.page_number - 1]
+            region = fitz.Rect(asset.rect) & page.rect
+            if region.is_empty:
+                return False
+            for block in page.get_text("dict").get("blocks", []):
+                if block.get("type") != 1 or not block.get("bbox"):
+                    continue
+                image_rect = fitz.Rect(block["bbox"])
+                intersection = image_rect & region
+                if not intersection.is_empty and intersection.get_area() >= region.get_area() * 0.02:
+                    return True
+
+            meaningful_drawings = 0
+            for drawing in page.get_drawings():
+                raw_rect = drawing.get("rect")
+                if not raw_rect:
+                    continue
+                drawing_rect = fitz.Rect(raw_rect)
+                intersection = drawing_rect & region
+                if intersection.is_empty:
+                    continue
+                wide = intersection.width >= max(20.0, region.width * 0.12)
+                tall = intersection.height >= max(12.0, region.height * 0.06)
+                complex_path = len(drawing.get("items", [])) >= 4
+                if (wide and tall) or complex_path:
+                    meaningful_drawings += 1
+                    if meaningful_drawings >= 2:
+                        return True
+            return False
+        finally:
+            doc.close()
+    except Exception:
+        return None
 
 
 def _visual_caption_identity(asset: PaperAsset) -> bool:
@@ -7124,9 +7230,9 @@ def _image_looks_text_only(path: Path) -> bool:
     for red, green, blue in pixels:
         max_channel = max(red, green, blue)
         min_channel = min(red, green, blue)
-        if max_channel < 245:
+        if min_channel < 245:
             non_white += 1
-        if max_channel - min_channel > 35 and max_channel < 245:
+        if max_channel - min_channel > 35 and min_channel < 245:
             colored += 1
     total = len(pixels)
     colored_fraction = colored / total

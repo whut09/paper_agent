@@ -8,12 +8,14 @@ from PIL import Image
 from paper_agent.agents.contracts import PaperAgentRole
 from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.schemas.evidence import EvidenceMap
+from paper_agent.schemas.findings import Finding
 from paper_agent.paper_summary import (
     GenerateReport,
     CorrectionMemory,
     PaperAsset,
     TextLine,
     _asset_display_label,
+    _add_guard_failures_to_verification,
     _asset_context,
     _apply_verifier_patch_suggestions,
     _adaptive_visual_recapture,
@@ -79,6 +81,7 @@ from paper_agent.paper_summary import (
     _visual_rect_for_caption,
     _visual_rect_for_caption_direction,
     _visual_asset_guard,
+    _visual_asset_measurements,
     _visual_guard_assets_to_check,
     _visual_asset_failure_ids,
     _verification_should_block_report,
@@ -88,6 +91,7 @@ from paper_agent.paper_summary import (
     record_summary_correction,
     summarize_paper,
     VerificationResult,
+    GuardResult,
 )
 
 
@@ -1360,6 +1364,70 @@ def test_local_visual_asset_guard_blocks_caption_only_figure():
     assert any(issue["severity"] == "error" and "text-only" in issue["message"] for issue in issues)
 
 
+def test_sparse_pdf_plot_is_not_misclassified_as_text_only():
+    with TemporaryDirectory() as tmp:
+        temp_path = Path(tmp)
+        image_path = temp_path / "sparse-plot.png"
+        Image.new("RGB", (720, 630), "white").save(image_path)
+
+        pdf_path = temp_path / "paper.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=612, height=792)
+        plot_rect = fitz.Rect(318, 165, 554, 343)
+        page.draw_rect(plot_rect, width=1)
+        page.draw_rect(fitz.Rect(345, 185, 530, 323), width=1)
+        page.draw_polyline([(355, 220), (390, 245), (435, 258), (520, 270)], width=2)
+        doc.save(pdf_path)
+        doc.close()
+
+        asset = PaperAsset(
+            "figure",
+            1,
+            image_path,
+            "Figure 2. Empirical reward variance.",
+            rect=plot_rect,
+        )
+        measurements = _visual_asset_measurements(
+            1,
+            asset,
+            "[[ASSET:1]]",
+            [asset],
+            pdf_path,
+        )
+
+    assert measurements.text_only is False
+
+
+def test_guard_failure_preserves_typed_reason_without_legacy_duplicate():
+    message = "asset 4 deterministic visual check failed: figure candidate is text-only"
+    finding = Finding.create(
+        stage="visual_guard",
+        severity="error",
+        confidence=0.9,
+        asset_id=4,
+        reason_code="visual_crop_invalid",
+        human_message=message,
+        provenance=("visual_guard:deterministic",),
+    )
+    guard = GuardResult(
+        name="Visual Asset Guard",
+        status="failed",
+        errors=[message],
+        findings=[finding],
+    )
+    verification = VerificationResult(False)
+
+    _add_guard_failures_to_verification(
+        verification,
+        [f"Visual Asset Guard: {message}"],
+        [guard],
+    )
+
+    assert [item.reason_code for item in verification.findings] == ["visual_crop_invalid"]
+    assert verification.hard_failures[0]["type"] == "visual_crop_invalid"
+    assert verification.hard_failures[0]["reason_code"] == "visual_crop_invalid"
+
+
 def test_formula_clip_rect_excludes_same_row_prose_fragments():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)
@@ -1705,6 +1773,8 @@ def test_recapture_critical_visual_asset_preserves_asset_id():
         doc.save(pdf_path)
         doc.close()
 
+        Image.new("RGB", (800, 600), "blue").save(temp_path / "figure1.png")
+        Image.new("RGB", (800, 600), "blue").save(temp_path / "figure1-recaptured.png")
         original = PaperAsset(
             "figure",
             1,
@@ -1730,6 +1800,7 @@ def test_recapture_critical_visual_asset_preserves_asset_id():
         context.pdf_path = pdf_path
         context.work_dir = temp_path
         context.assets = [original]
+        context.summary = "[[ASSET:1]]"
         context.revision_attempts = 1
 
         with patch(

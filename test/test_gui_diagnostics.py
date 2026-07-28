@@ -33,15 +33,16 @@ def _result(tmp_path: Path, status: str, *, downloadable: bool, warning: bool = 
     )
 
 
-def test_gradio_success_exposes_word_and_diagnostics(tmp_path):
+def test_gradio_success_exposes_word_without_internal_diagnostics(tmp_path):
     result = _result(tmp_path, "success", downloadable=True)
 
     response = _summary_callback_response(result, tmp_path / "paper.pdf")
 
     assert response[0]["value"] == str(result.docx_path)
     assert response[0]["visible"] is True
-    assert len(response[6]["value"]) == 3
-    assert "RenderQA" in response[5]["value"]
+    assert response[6]["value"] is None
+    assert response[6]["visible"] is False
+    assert "reason code" not in response[5]["value"]
 
 
 def test_gradio_warning_is_visible_and_downloadable(tmp_path):
@@ -50,12 +51,12 @@ def test_gradio_warning_is_visible_and_downloadable(tmp_path):
     markdown = _format_summary_diagnostics(result)
     response = _summary_callback_response(result, None)
 
-    assert "warning" in markdown
-    assert "renderer_unavailable" in markdown
+    assert "自动分页预览" in markdown
+    assert "renderer_unavailable" not in markdown
     assert response[0]["visible"] is True
 
 
-def test_gradio_block_hides_word_but_keeps_diagnostics(tmp_path):
+def test_gradio_block_hides_word_and_shows_only_problem_and_cause(tmp_path):
     result = _result(tmp_path, "blocked", downloadable=False)
     result.reason_codes = ["missing_critical_asset"]
 
@@ -63,11 +64,13 @@ def test_gradio_block_hides_word_but_keeps_diagnostics(tmp_path):
 
     assert response[0]["value"] is None
     assert response[0]["visible"] is False
-    assert "missing_critical_asset" in response[5]["value"]
-    assert response[6]["visible"] is True
+    assert "问题" in response[5]["value"]
+    assert "失败原因" in response[5]["value"]
+    assert "missing_critical_asset" not in response[5]["value"]
+    assert response[6]["visible"] is False
 
 
-def test_gradio_network_timeout_has_stage_and_reason_code():
+def test_gradio_network_timeout_has_plain_language_explanation():
     result = SummaryRunResult(
         status="timeout",
         message="upstream timed out",
@@ -79,10 +82,11 @@ def test_gradio_network_timeout_has_stage_and_reason_code():
 
     markdown = _format_summary_diagnostics(result)
 
-    assert "VerifyClaims" in markdown
-    assert "78%" in markdown
-    assert "verifier_transport_failure" in markdown
-    assert "retry_verifier" in markdown
+    assert "连接超时" in markdown
+    assert "自动重试" in markdown
+    assert "VerifyClaims" not in markdown
+    assert "verifier_transport_failure" not in markdown
+    assert "retry_verifier" not in markdown
 
 
 def test_gradio_callback_returns_diagnostics_for_download_timeout():
@@ -101,8 +105,29 @@ def test_gradio_callback_returns_diagnostics_for_download_timeout():
         )
 
     assert response[0]["visible"] is False
-    assert "network_timeout" in response[5]["value"]
+    assert "连接超时" in response[5]["value"]
+    assert "network_timeout" not in response[5]["value"]
     assert state["session_id"] is None
+
+
+def test_visual_crop_failure_hides_guard_and_sidecar_details(tmp_path):
+    result = _result(tmp_path, "blocked", downloadable=False)
+    result.reason_codes = ["verifier_invalid_json", "visual_crop_invalid", "legacy_error"]
+    result.next_actions = ["select_alternate_candidate"]
+    result.message = (
+        "Verifier Agent 未通过。 Visual Asset Guard: asset 4 deterministic visual check failed: "
+        "figure candidate is text-only。失败详情已写入：failure.md"
+    )
+
+    response = _summary_callback_response(result, None)
+    markdown = response[5]["value"]
+
+    assert "第 4 个图表截图" in markdown
+    assert "没有识别到有效的图像主体" in markdown
+    assert "reason" not in markdown.lower()
+    assert "select_alternate_candidate" not in markdown
+    assert "failure.md" not in markdown
+    assert response[6]["visible"] is False
 
 
 class _FakeAsyncResult:

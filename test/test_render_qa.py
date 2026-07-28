@@ -71,12 +71,37 @@ def test_render_qa_blocks_missing_manifest_asset(tmp_path):
     unavailable = render_qa._RenderAttempt("none", reason_code="renderer_unavailable", message="renderer missing")
 
     with patch.object(render_qa, "_render_docx", return_value=unavailable):
-        result = render_qa.run_render_qa(docx_path, [first, second], tmp_path / "render")
+        result = render_qa.run_render_qa(
+            docx_path,
+            [first, second],
+            tmp_path / "render",
+            required_asset_ids={1, 2},
+        )
 
     assert result.status == "block"
     assert not result.downloadable
     assert "missing_critical_asset" in result.reason_codes
     assert all(item.suggested_actions for item in result.findings if item.severity == "block")
+
+
+def test_render_qa_does_not_require_unreferenced_manifest_asset(tmp_path):
+    first = _asset(tmp_path)
+    unused = _asset(tmp_path, "unused-formula.png", "Formula screenshot")
+    unused.kind = "formula"
+    docx_path = _docx(tmp_path, [first])
+    unavailable = render_qa._RenderAttempt("none", reason_code="renderer_unavailable", message="renderer missing")
+
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(
+            docx_path,
+            [first, unused],
+            tmp_path / "render",
+            required_asset_ids={1},
+        )
+
+    assert result.status == "warning"
+    assert result.downloadable
+    assert "missing_critical_asset" not in result.reason_codes
 
 
 def test_render_qa_renderer_timeout_is_warning_not_content_defect(tmp_path):
