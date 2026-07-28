@@ -22,22 +22,11 @@ PaperAgent 关注的不只是“生成一份好看的论文总结”，而是构
 
 PaperAgent 当前的论文总结链路被组织为 DAG / graph executor，而不是单次 prompt 调用：
 
-```mermaid
-flowchart LR
-    A["PreparePaper<br/>输入文件或链接"] --> B["ParsePaper<br/>解析 PDF / Word"]
-    B --> C["ExtractSections<br/>正文、摘要、标题、图表、公式"]
-    C --> D["SummarizeContribution<br/>分段阅读笔记"]
-    D --> E["ExtractMethods<br/>整合方法、贡献和结果"]
-    E --> F["VerifyClaims<br/>Verifier / Critic 校验"]
-    F --> G["GenerateReport<br/>生成 Word + KG sidecar"]
-    H["User Feedback"] --> I["Correction Memory"]
-    I --> J["Self-improving Prompt Patches"]
-    J --> C
-    J --> D
-    J --> F
-```
+<p align="center">
+  <img src="./assets/paperagent-architecture.svg" width="1100" alt="PaperAgent Agent Harness 架构图">
+</p>
 
-这条链路让 Agent 的行为更像一个可观测的实验系统：Reader 负责读入和解析，Extractor 负责结构化证据，Synthesizer 负责写作，Critic 负责拒绝没有证据支持的 claim，最后由报告生成器把文本、图表和元信息写入 `.docx`。
+这条链路让 Agent 的行为更像一个可观测的实验系统：Reader 负责读入和解析，Extractor 负责结构化证据，Synthesizer 负责写作，Critic 负责拒绝没有证据支持的 claim。验证失败不会直接停在门禁，而是转成带置信度与证据来源的 Finding，由有界修复状态机执行重裁、拆分、改写和局部复检；通过后再由报告生成器和 RenderQA 完成 `.docx` 交付。Correction Memory 与 Prompt / Rubric Patch 只影响后续任务，并保留版本、置信度和回滚边界。
 
 ## 代码结构
 
