@@ -118,6 +118,10 @@ DOWNLOAD_HEADERS = {
     "User-Agent": "Mozilla/5.0 PaperAgent/0.1 (+https://github.com/whut09/paper_agent)",
     "Accept": "application/pdf,application/octet-stream,*/*",
 }
+INVALID_PAPER_URL_MESSAGE = (
+    "请输入有效的论文 PDF 链接，例如 https://arxiv.org/pdf/2601.00001；"
+    "论文标题不能直接作为链接下载。"
+)
 DownloadProgressCallback = Callable[[int, int | None], None]
 
 
@@ -138,7 +142,7 @@ def download_with_limit(
     Returns:
         - The path of the downloaded file
     """
-    url = _normalize_paper_url(url)
+    url = _validate_paper_url(url)
     local_result = _try_local_pdf_download(url, save_path, size_limit)
     if local_result:
         return local_result
@@ -833,6 +837,14 @@ def _normalize_paper_url(url: str) -> str:
     return normalized
 
 
+def _validate_paper_url(value: str) -> str:
+    normalized = _normalize_paper_url(str(value or ""))
+    parsed = urlparse(normalized)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise gr.Error(INVALID_PAPER_URL_MESSAGE)
+    return normalized
+
+
 def _download_filename_from_url(url: str) -> str:
     filename = os.path.basename(unquote(urlparse(url).path)).strip() or "paper"
     if not filename.lower().endswith(".pdf"):
@@ -932,6 +944,9 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     elif "table" in lowered and any(token in lowered for token in ("crop", "truncated", "body", "表格")):
         issue = f"{asset_name}不完整或混入了其他内容。"
         cause = "系统自动重裁并复检后仍未找到可靠的完整表格，因此停止生成。"
+    elif "invalid_paper_url" in result.reason_codes:
+        issue = "输入的内容不是有效的论文链接。"
+        cause = "请粘贴以 http:// 或 https:// 开头的论文 PDF 链接；论文标题需要先在浏览器中打开对应 PDF 后再粘贴链接。"
     elif result.status == "timeout" or any(
         code in {"network_timeout", "verifier_transport_failure"} for code in result.reason_codes
     ):
@@ -999,6 +1014,7 @@ def summarize_file(
         else:
             if not link_input:
                 raise gr.Error("No input")
+            paper_url = _validate_paper_url(link_input)
             progress(0.01, desc="正在下载论文...")
 
             def download_progress(downloaded: int, total: int | None) -> None:
@@ -1017,7 +1033,7 @@ def summarize_file(
                     progress(0.03, desc=f"正在下载论文... {downloaded_mb:.1f} MB")
 
             file_path = download_with_limit(
-                link_input,
+                paper_url,
                 output,
                 5 * 1024 * 1024 if flag_demo else None,
                 progress_callback=download_progress,
@@ -1074,7 +1090,10 @@ def summarize_file(
         logger.warning("Summary request rejected for session %s: %s", session_id, exc)
         normalized_error = str(exc).strip("'\"")
         if normalized_error not in {"No input", "reCAPTCHA fail"}:
-            reason_code = "network_timeout" if is_recoverable_error(exc) else "download_failure"
+            if normalized_error == INVALID_PAPER_URL_MESSAGE:
+                reason_code = "invalid_paper_url"
+            else:
+                reason_code = "network_timeout" if is_recoverable_error(exc) else "download_failure"
             summary_result = SummaryRunResult(
                 status="timeout" if reason_code == "network_timeout" else "failed",
                 message=str(exc),
@@ -1193,6 +1212,7 @@ with gr.Blocks(
             )
             link_input = gr.Textbox(
                 label="链接",
+                placeholder="https://arxiv.org/pdf/2601.00001",
                 visible=False,
                 interactive=True,
             )

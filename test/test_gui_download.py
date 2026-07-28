@@ -13,6 +13,7 @@ from paper_agent.gui import (
     _configured_proxy_candidates,
     _download_proxy_config,
     _looks_like_dns_failure,
+    _validate_paper_url,
     _start_summary_session,
     cancellation_event_lock,
     cancellation_event_map,
@@ -145,6 +146,20 @@ def test_summarize_file_cleans_session_after_input_error():
     assert state["session_id"] is None
     assert not cancellation_event_map
     assert str(GUI_LOG_PATH.resolve()) in str(error_info.value.args[0])
+
+
+def test_paper_url_validator_rejects_plain_paper_titles():
+    with pytest.raises(Exception, match="论文标题不能直接作为链接下载"):
+        _validate_paper_url("Visual Document Understanding and Reasoning")
+
+
+def test_paper_url_validator_normalizes_arxiv_abstract_links():
+    assert _validate_paper_url("https://arxiv.org/abs/2601.00001") == "https://arxiv.org/pdf/2601.00001"
+
+
+def test_download_with_limit_rejects_invalid_url_before_download_attempt(tmp_path):
+    with pytest.raises(Exception, match="有效的论文 PDF 链接"):
+        download_with_limit("not a URL", tmp_path, None)
 
 
 def test_download_with_limit_retries_and_resumes_partial_stream():

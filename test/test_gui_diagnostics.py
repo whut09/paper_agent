@@ -111,6 +111,27 @@ def test_gradio_callback_returns_diagnostics_for_download_timeout():
     assert state["session_id"] is None
 
 
+def test_gradio_rejects_plain_title_without_starting_download():
+    state = {"session_id": None}
+    with patch("paper_agent.gui.download_with_limit") as download:
+        response = summarize_file(
+            "Link",
+            None,
+            "Visual Document Understanding and Reasoning",
+            "All",
+            "",
+            13,
+            "",
+            state,
+            progress=lambda *args, **kwargs: None,
+        )
+
+    assert not download.called
+    assert "不是有效的论文链接" in response[4]["value"]
+    assert "连接超时" not in response[4]["value"]
+    assert state["session_id"] is None
+
+
 def test_visual_crop_failure_hides_guard_and_sidecar_details(tmp_path):
     result = _result(tmp_path, "blocked", downloadable=False)
     result.reason_codes = ["verifier_invalid_json", "visual_crop_invalid", "legacy_error"]
