@@ -865,22 +865,20 @@ def _download_expected_size(
     return None
 
 
-def _cancel_active_summary_sessions(exclude_session_id=None) -> int:
+def _cancel_summary_session(session_id) -> bool:
+    if session_id is None:
+        return False
     with cancellation_event_lock:
-        active = [
-            (session_id, event)
-            for session_id, event in cancellation_event_map.items()
-            if session_id != exclude_session_id and not event.is_set()
-        ]
-    for session_id, event in active:
-        logger.info("Stopping summary for session %s", session_id)
-        event.set()
-    return len(active)
+        event = cancellation_event_map.pop(session_id, None)
+    if event is None or event.is_set():
+        return False
+    logger.info("Stopping summary for session %s", session_id)
+    event.set()
+    return True
 
 
 def _start_summary_session(state: dict) -> tuple[uuid.UUID, threading.Event]:
-    if not flag_demo:
-        _cancel_active_summary_sessions()
+    _cancel_summary_session(state.get("session_id"))
     session_id = uuid.uuid4()
     cancellation_event = threading.Event()
     with cancellation_event_lock:
@@ -900,10 +898,8 @@ def stop_summary_file(state: dict) -> None:
     """
     session_id = state.get("session_id")
     if session_id is None:
-        if not flag_demo:
-            _cancel_active_summary_sessions()
         return
-    _cancel_active_summary_sessions()
+    _cancel_summary_session(session_id)
     state["session_id"] = None
 
 

@@ -37,6 +37,11 @@ _RUNTIME_FIELDS = {
     "node_results",
     "agent_trace",
     "run_id",
+    "workflow_started_at",
+    "workflow_timeout_seconds",
+    "current_stage",
+    "current_progress",
+    "progress_message",
 }
 _BEHAVIOR_CONFIG_KEYS = (
     "CODEX_BASE_URL",

@@ -74,26 +74,54 @@ def _clear_summary_sessions():
         cancellation_event_map.clear()
 
 
-def test_start_summary_session_cancels_orphaned_session():
+def test_start_summary_session_does_not_cancel_another_page_session():
     _clear_summary_sessions()
     _, orphan_event = _start_summary_session({"session_id": None})
 
     new_state = {"session_id": None}
     new_session_id, new_event = _start_summary_session(new_state)
 
-    assert orphan_event.is_set()
+    assert not orphan_event.is_set()
     assert not new_event.is_set()
     assert new_state["session_id"] == new_session_id
     _clear_summary_sessions()
 
 
-def test_stop_summary_file_from_fresh_page_cancels_orphaned_session():
+def test_start_summary_session_replaces_only_the_same_page_session():
+    _clear_summary_sessions()
+    state = {"session_id": None}
+    _, first_event = _start_summary_session(state)
+
+    second_session_id, second_event = _start_summary_session(state)
+
+    assert first_event.is_set()
+    assert not second_event.is_set()
+    assert state["session_id"] == second_session_id
+    _clear_summary_sessions()
+
+
+def test_stop_summary_file_from_fresh_page_keeps_other_session_running():
     _clear_summary_sessions()
     _, orphan_event = _start_summary_session({"session_id": None})
 
     stop_summary_file({"session_id": None})
 
-    assert orphan_event.is_set()
+    assert not orphan_event.is_set()
+    _clear_summary_sessions()
+
+
+def test_stop_summary_file_cancels_only_current_page_session():
+    _clear_summary_sessions()
+    other_state = {"session_id": None}
+    current_state = {"session_id": None}
+    _, other_event = _start_summary_session(other_state)
+    _, current_event = _start_summary_session(current_state)
+
+    stop_summary_file(current_state)
+
+    assert current_event.is_set()
+    assert not other_event.is_set()
+    assert current_state["session_id"] is None
     _clear_summary_sessions()
 
 

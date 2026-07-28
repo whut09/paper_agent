@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
+from paper_agent.harness.checkpoints import context_state, restore_context
 
 
 def _context(tmp_path: Path, source: Path) -> PaperWorkflowContext:
@@ -179,3 +180,24 @@ def test_checkpoint_identity_and_payload_do_not_contain_secrets(tmp_path):
     assert b"proxy-password" not in raw
     assert b"token=secret" not in raw
     assert b"gpt-test" in raw
+
+
+def test_checkpoint_does_not_restore_stale_runtime_deadlines(tmp_path):
+    source = tmp_path / "paper.pdf"
+    source.write_bytes(b"stable-pdf")
+    previous = _context(tmp_path, source)
+    previous.workflow_started_at = 1.0
+    previous.workflow_timeout_seconds = 3600.0
+    previous.current_stage = "ExtractMethods"
+    previous.current_progress = 0.68
+    previous.progress_message = "stale progress"
+
+    state = context_state(previous)
+
+    assert "workflow_started_at" not in state
+    assert "workflow_timeout_seconds" not in state
+    assert "current_stage" not in state
+    current = _context(tmp_path, source)
+    current.workflow_started_at = 999.0
+    restore_context(current, state)
+    assert current.workflow_started_at == 999.0
