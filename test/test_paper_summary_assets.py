@@ -2058,6 +2058,18 @@ def test_docx_image_sizing_uses_pdf_rect_for_small_tables():
     assert int(3.7 * 914400) <= table_cx <= int(4.1 * 914400)
 
 
+def test_docx_image_sizing_caps_tall_figures_to_page_content_height():
+    with TemporaryDirectory() as tmp:
+        figure = Path(tmp) / "tall-figure.png"
+        Image.new("RGB", (720, 1215), "white").save(figure)
+
+        width_emu, height_emu = _image_size_emu(figure, "figure")
+
+    assert height_emu <= int(9.75 * 914400)
+    assert width_emu < int(6.2 * 914400)
+    assert abs((width_emu / height_emu) - (720 / 1215)) < 0.001
+
+
 def test_local_visual_asset_guard_blocks_low_resolution_table():
     with TemporaryDirectory() as tmp:
         table = Path(tmp) / "tiny-table.png"

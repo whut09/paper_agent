@@ -104,6 +104,8 @@ class MigrationAcceptanceResult:
     def meets_exit_criteria(self) -> bool:
         if self.status == "passed":
             return self.metrics.final_qa == "pass"
+        if self.status == "warning":
+            return self.metrics.final_qa == "warning" and not self.blockers
         return self.status == "blocked" and bool(self.blockers) and all(
             blocker.reason_code and blocker.suggested_actions for blocker in self.blockers
         )

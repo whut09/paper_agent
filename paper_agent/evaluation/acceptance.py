@@ -20,6 +20,7 @@ from paper_agent.schemas.acceptance import (
     SectionCoverageComparison,
 )
 from paper_agent.schemas.findings import default_actions, finding_from_legacy, findings_from_verification_payload
+from paper_agent.evaluation.quality_policy import QualityDisposition, decide_quality
 
 
 REQUIRED_REPORT_SECTIONS = (
@@ -286,12 +287,16 @@ def build_acceptance_result(context: Any, *, model_call_count: int = 0) -> Migra
     repair_history = list(getattr(context, "repair_history", ()) or ())
     blockers = _verification_blockers(verification)
     ineffective = ineffective_repair_count(repair_history)
+    process_warnings = []
     if ineffective:
-        blockers.append(_blocker("duplicate_repair_signature", f"{ineffective} repair action(s) reused the same geometry/content signature", stage="repair"))
+        process_warnings.append(
+            f"{ineffective} repair action(s) reused the same geometry/content signature"
+        )
     if qa_result is not None:
+        qa_decision = decide_quality(getattr(qa_result, "findings", ()) or ())
         for finding in getattr(qa_result, "findings", ()) or ():
             severity = str(getattr(finding, "severity", ""))
-            if severity != "block" and str(getattr(qa_result, "status", "")) != "warning":
+            if severity != "block" or qa_decision.disposition == QualityDisposition.WARN:
                 continue
             blockers.append(
                 _blocker(
@@ -302,22 +307,38 @@ def build_acceptance_result(context: Any, *, model_call_count: int = 0) -> Migra
                     actions=getattr(finding, "suggested_actions", ()),
                 )
             )
-    failed_nodes = [item for item in getattr(context, "agent_trace", ()) or () if item.get("status") == "failed"]
+    qa_status = str(getattr(qa_result, "status", "pending") or "pending")
+    trace = list(getattr(context, "agent_trace", ()) or ())
+    failed_nodes = []
+    for index, item in enumerate(trace):
+        if item.get("status") != "failed":
+            continue
+        node_name = str(item.get("node") or "")
+        if any(
+            later.get("node") == node_name and later.get("status") != "failed"
+            for later in trace[index + 1 :]
+        ):
+            continue
+        if node_name == "RenderQA" and qa_status in {"pass", "warning"}:
+            continue
+        if node_name in {"VerifyClaims", "ReviseReport"} and not _verification_blockers(verification):
+            continue
+        if node_name == "GenerateReport" and qa_status in {"pass", "warning"}:
+            continue
+        failed_nodes.append(item)
     if failed_nodes and not blockers:
         node = failed_nodes[-1]
         blockers.append(_blocker("workflow_stage_failed", "; ".join(node.get("errors") or ()) or f"{node.get('node')} failed", stage=str(node.get("node") or "workflow")))
 
-    qa_status = str(getattr(qa_result, "status", "pending") or "pending")
     if blockers:
         status = "blocked"
     elif qa_status == "pass":
         status = "passed"
     elif qa_status == "warning":
-        status = "blocked"
-        blockers.append(_blocker("renderer_failed", "RenderQA did not complete certification.", stage="render_qa"))
+        status = "warning"
     else:
         status = "running"
-    warnings = []
+    warnings = list(process_warnings)
     if verification is not None:
         warnings.extend(str(item.get("reason") or item.get("message") or "") for item in getattr(verification, "soft_warnings", ()) or ())
     if qa_result is not None:
@@ -457,11 +478,6 @@ def audit_existing_run(artifacts_dir: str | Path, paper_name: str, source_path: 
     if not qa_payload:
         result.blockers.append(_blocker("qa_not_recorded", "This historical run predates RenderQA and cannot be certified."))
         result.status = "blocked"
-    elif qa_result and qa_result.status == "warning":
-        for finding in qa_findings or [SimpleNamespace(reason_code="renderer_failed", message="RenderQA warning", suggested_actions=())]:
-            if not any(item.reason_code == finding.reason_code for item in result.blockers):
-                result.blockers.append(_blocker(finding.reason_code, finding.message, stage="render_qa", actions=finding.suggested_actions))
-        result.status = "blocked"
     if not docx_path.exists() and not result.blockers:
         result.blockers.append(_blocker("workflow_incomplete", "No generated DOCX is available for this run."))
         result.status = "blocked"
@@ -517,6 +533,19 @@ def run_acceptance_suite(
         "passed_count": sum(item.get("status") == "passed" for item in results),
         "blocked_count": sum(item.get("status") == "blocked" for item in results),
         "warning_count": sum(item.get("status") == "warning" for item in results),
+        "usable_docx_count": sum(item.get("status") in {"passed", "warning"} for item in results),
+        "usable_docx_rate": round(
+            sum(item.get("status") in {"passed", "warning"} for item in results) / len(results),
+            6,
+        )
+        if results
+        else 0.0,
+        "fully_certified_rate": round(
+            sum(item.get("status") == "passed" for item in results) / len(results),
+            6,
+        )
+        if results
+        else 0.0,
         "meets_exit_criteria": len(results) >= 10 and all(bool(item.get("meets_exit_criteria")) for item in results),
         "papers": results,
     }

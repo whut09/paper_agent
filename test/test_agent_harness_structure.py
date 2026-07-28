@@ -21,7 +21,8 @@ from unittest.mock import patch
 from paper_agent.harness import NodeResult, PaperContext, PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.memory import get_self_improving_prompt_patches, record_summary_correction
 from paper_agent.schemas import PaperAsset, VerificationResult
-from paper_agent.paper_summary import _build_repair_plan
+from paper_agent.schemas.findings import Finding
+from paper_agent.paper_summary import _build_repair_plan, _revise_report_once
 from paper_agent.tools.grounding import _build_grounding_map
 
 
@@ -475,3 +476,48 @@ def test_missing_asset_capture_failure_is_not_retried_forever(tmp_path):
     assert capture.call_count == 1
     assert context.repair_history[-1]["changed"] is False
     assert context.repair_attempts["missing:table:2"] == 1
+
+
+def test_failed_alternate_candidate_discards_noncritical_asset_in_same_repair_attempt(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.output = tmp_path
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.summary = "图1是主框架。\n[[ASSET:1]]\n图3是非关键补充。\n[[ASSET:3]]"
+    context.assets = [
+        PaperAsset("figure", 1, tmp_path / "figure1.png", "Figure 1: Overview"),
+        PaperAsset("table", 2, tmp_path / "table1.png", "Table 1: Results"),
+        PaperAsset("figure", 3, tmp_path / "figure3.png", "Figure 3: Auxiliary"),
+    ]
+    context.verification = VerificationResult(
+        False,
+        findings=[
+            Finding.create(
+                stage="visual_guard",
+                severity="error",
+                confidence=0.99,
+                reason_code="type_mismatch",
+                human_message="asset 3 is not a figure",
+                asset_id=3,
+                evidence_refs=("asset:3",),
+            )
+        ],
+    )
+
+    with (
+        patch("paper_agent.paper_summary._recapture_critical_visual_assets", return_value=set()),
+        patch("paper_agent.paper_summary._build_asset_candidate_pools", return_value=[]),
+    ):
+        result = _revise_report_once(context)
+
+    assert result.status == "warning"
+    assert len(context.assets) == 2
+    assert all(asset.caption != "Figure 3: Auxiliary" for asset in context.assets)
+    assert "[[ASSET:3]]" not in context.summary

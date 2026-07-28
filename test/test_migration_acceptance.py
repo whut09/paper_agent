@@ -108,7 +108,7 @@ def test_render_qa_golden_has_executable_block_action():
     assert payload["expected"]["suggested_action"] in suggested_actions(finding["reason_code"])
 
 
-def test_acceptance_result_blocks_duplicate_signature_and_reports_coverage():
+def test_acceptance_result_warns_on_duplicate_signature_and_reports_coverage():
     all_sections = "\n\n".join(f"## {name}\n内容" for name in (
         "核心信息", "摘要", "背景与问题", "创新点", "一句话总结",
         "方法主线", "关键结果", "深度分析", "局限", "总结",
@@ -126,20 +126,26 @@ def test_acceptance_result_blocks_duplicate_signature_and_reports_coverage():
         qa_result=SimpleNamespace(status="pass", findings=[]),
         qa_path=Path("paper-qa.json"),
         repair_history=history,
-        agent_trace=[],
+        agent_trace=[
+            {
+                "node": "RenderQA",
+                "status": "failed",
+                "errors": ["old layout check failed before local repair"],
+            }
+        ],
         guard_results=[],
         workflow_started_at=None,
     )
 
     result = build_acceptance_result(context, model_call_count=7)
 
-    assert result.status == "blocked"
+    assert result.status == "passed"
     assert result.metrics.model_call_count == 7
     assert result.metrics.repair_count == 1
     assert result.metrics.ineffective_repair_count == 1
     assert result.section_coverage.score == 1.0
-    assert result.blockers[0].reason_code == "duplicate_repair_signature"
-    assert result.blockers[0].suggested_actions
+    assert result.blockers == []
+    assert "reused the same geometry/content signature" in result.warnings[0]
 
 
 def test_report_section_coverage_compares_legacy_and_current():
@@ -176,6 +182,9 @@ def test_representative_suite_accepts_pass_or_actionable_block_for_ten_papers(tm
     assert report["paper_count"] == 10
     assert report["passed_count"] == 5
     assert report["blocked_count"] == 5
+    assert report["usable_docx_count"] == 5
+    assert report["usable_docx_rate"] == 0.5
+    assert report["fully_certified_rate"] == 0.5
     assert report["meets_exit_criteria"] is True
     for paper in report["papers"]:
         if paper["status"] == "blocked":
@@ -189,7 +198,7 @@ def test_acceptance_blocker_rejects_missing_next_action():
         AcceptanceBlocker("image_cropped", "cropped", ())
 
 
-def test_render_qa_warning_is_actionable_block_for_migration_acceptance():
+def test_render_qa_infrastructure_warning_remains_downloadable_acceptance_warning():
     context = SimpleNamespace(
         paper_name="paper",
         source_path="paper.pdf",
@@ -220,7 +229,7 @@ def test_render_qa_warning_is_actionable_block_for_migration_acceptance():
 
     result = build_acceptance_result(context)
 
-    assert result.status == "blocked"
+    assert result.status == "warning"
     assert result.meets_exit_criteria
-    assert result.blockers[0].reason_code == "renderer_failed"
-    assert "rerun_render_qa" in result.blockers[0].suggested_actions
+    assert result.blockers == []
+    assert "Word COM unavailable" in result.warnings

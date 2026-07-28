@@ -169,9 +169,29 @@ Prompt 1-6 保持 `paper_agent.harness.workflow.summarize_paper` 为兼容 facad
 
 `paper_agent/evaluation/acceptance.py` 不参与论文内容生成，只读取 workflow context 和 sidecar，形成 `acceptance.json`。它负责比较 compatibility manifest 与候选池选中 manifest、比较新旧报告章节覆盖率，并汇总耗时、模型调用、有效修复、无效重复修复、hard failure、warning 和最终 QA。五个迁移阶段分别有 `evaluation/migration_golden/` fixture，10 篇真实论文清单位于 `evaluation/representative_papers.json`。
 
-验收状态不把 warning 当成 pass：只有最终 RenderQA `pass` 才是 `passed`；无法认证或存在内容缺陷时必须输出 `blocked`，并为每个 blocker 保存 `reason_code` 和 `suggested_actions`。历史 sidecar 缺少 RenderQA 时使用 `qa_not_recorded`，下一步动作是 `rerun_with_render_qa`。
+验收状态区分交付可用性和完整渲染认证：最终 RenderQA `pass` 为 `passed`；DOCX 本地结构检查通过、仅渲染器基础设施不可用时为可下载的 `warning`；证据、关键资产或文档结构不完整时才输出 `blocked`，并为每个 blocker 保存 `reason_code` 和 `suggested_actions`。历史 sidecar 缺少 RenderQA 时使用 `qa_not_recorded`，下一步动作是 `rerun_with_render_qa`。
 
-## 11. Git 代理说明
+## 11. 高通过率可靠性架构
+
+近期 Agent 研究与开源工程给出的共同结论是：可靠性主要来自短而可验证的闭环，而不是继续增加自由规划 Agent。PaperAgent 采用以下原则：
+
+- [Agentless](https://arxiv.org/abs/2407.01489) 的 `localization -> repair -> validation` 支持将修复限制在受影响资产或 DOCX 节点，避免整篇重新生成。
+- [SWE-agent](https://arxiv.org/abs/2405.15793) 强调专用 Agent-Computer Interface；对应到本项目就是类型化 Finding、有限修复动作和明确状态转换，而不是让模型自由描述如何修图。
+- [OpenHands](https://arxiv.org/abs/2407.16741) 与 [LangGraph](https://github.com/langchain-ai/langgraph) 强调可恢复状态、事件轨迹和 durable execution；对应到内容寻址 checkpoint 和节点级重试。
+- [AI Agents That Matter](https://arxiv.org/abs/2407.01502) 要求同时衡量准确率、成本与可复现性；因此不能只看 Guard pass rate，而应同时跟踪可用文档率、误拦截率、缺陷逃逸率、修复轮数和模型调用成本。
+- [Agent Workflow Memory](https://arxiv.org/abs/2409.07429) 与 [DSPy](https://github.com/stanfordnlp/dspy) 支持从成功轨迹中归纳可复用工作流，并按指标优化 prompt/program，避免累积论文名或错误字符串特例。
+- [SWE-smith](https://arxiv.org/abs/2504.21798) 强调多样、可执行的评测实例；对应到代表论文集、golden crop 和真实 DOCX 回归。
+
+质量决策采用四级策略：
+
+1. `ACCEPT`：内容、资产和 DOCX 结构完整，渲染检查通过。
+2. `WARN`：本地确定性检查通过，但 Word COM、LibreOffice 或网络裁判不可用；允许下载，保留未完整认证状态。
+3. `AUTO_REPAIR`：图片超出页高、页面溢出、非关键候选错误等可确定修复问题；只重跑受影响节点并进行一次有界复检。
+4. `BLOCK`：缺少图1/图2/表1/表2、未替换 marker、无效 DOCX、关键证据缺失等完整性问题。
+
+验收的主要指标为 `usable_docx_rate`，同时保留 `fully_certified_rate`。后续代表论文评测还应记录 `false_block_rate`、`auto_repair_success_rate`、`critical_defect_escape_rate`、`mean_repair_attempts`、`model_calls_per_success` 和 `elapsed_seconds_per_success`。目标是在 golden fixtures 上保持关键缺陷逃逸率为零，同时降低误拦截和重复修复。
+
+## 12. Git 代理说明
 
 当前机器浏览器通过 `127.0.0.1:7890` 访问 GitHub。Git 需要单独配置代理：
 

@@ -72,6 +72,7 @@ from paper_agent.evaluation.acceptance import (
     write_acceptance_sidecar as _write_acceptance_sidecar,
 )
 from paper_agent.evaluation.render_qa import run_render_qa as _run_render_qa, write_render_qa_sidecar as _write_render_qa_sidecar
+from paper_agent.evaluation.quality_policy import QualityDisposition as _QualityDisposition, decide_quality as _decide_quality
 from paper_agent.schemas.qa import RenderQAResult as _RenderQAResult, SummaryRunResult as _SummaryRunResult
 from paper_agent.skill_prompts import load_paper_skill_reference
 
@@ -760,17 +761,51 @@ class RenderQA(_PaperWorkflowNode):
         context.check_cancelled()
         context.report(0.95, "渲染 Word 并检查分页、图片和 caption...")
         render_dir = (context.work_dir or context.output / f"{context.paper_name}-summary-assets") / "render-qa"
+        required_asset_ids = {
+            int(match.group(1))
+            for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", context.summary)
+            if 1 <= int(match.group(1)) <= len(context.assets)
+        }
         context.qa_result = _run_render_qa(
             context.docx_path,
             context.assets,
             render_dir,
             timeout_seconds=_render_qa_timeout_seconds(),
-            required_asset_ids={
-                int(match.group(1))
-                for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", context.summary)
-                if 1 <= int(match.group(1)) <= len(context.assets)
-            },
+            required_asset_ids=required_asset_ids,
         )
+        initial_decision = _decide_quality(context.qa_result.findings)
+        layout_repair_attempted = initial_decision.disposition == _QualityDisposition.AUTO_REPAIR
+        if layout_repair_attempted:
+            context.report(0.97, "自动调整 Word 图片尺寸并局部复检...")
+            before_signature = _render_qa_layout_signature(context.qa_result)
+            _write_docx(
+                context.docx_path,
+                context.source_path.name if context.source_path else "paper.pdf",
+                context.summary,
+                context.assets,
+            )
+            context.qa_result = _run_render_qa(
+                context.docx_path,
+                context.assets,
+                render_dir / "layout-repair-1",
+                timeout_seconds=_render_qa_timeout_seconds(),
+                required_asset_ids=required_asset_ids,
+            )
+            after_signature = _render_qa_layout_signature(context.qa_result)
+            context.repair_attempts["render_qa:layout"] = context.repair_attempts.get("render_qa:layout", 0) + 1
+            context.repair_history.append(
+                {
+                    "stage": "RenderQA",
+                    "attempt": context.repair_attempts["render_qa:layout"],
+                    "actions": ["resize_assets_to_content_area", "regenerate_docx", "rerun_render_qa"],
+                    "reason_codes": list(initial_decision.repairable_reason_codes),
+                    "before": before_signature,
+                    "after": after_signature,
+                    "changed": before_signature != after_signature,
+                    "confidence": 1.0,
+                    "cost": 0.0,
+                }
+            )
         context.qa_path = context.output / f"{context.paper_name}-qa.json"
         _write_render_qa_sidecar(context.qa_path, context.qa_result, run_id=context.run_id)
         context.download_ready = context.qa_result.downloadable
@@ -786,6 +821,7 @@ class RenderQA(_PaperWorkflowNode):
             "qa_finding_count": len(context.qa_result.findings),
             "qa_asset_count": len(context.qa_result.assets),
             "renderer": context.qa_result.renderer,
+            "layout_auto_repair_attempted": layout_repair_attempted,
         }
         if context.qa_result.status == "block":
             return _NodeResult(
@@ -803,6 +839,14 @@ class RenderQA(_PaperWorkflowNode):
             warnings=[item.message for item in context.qa_result.findings],
             metrics=metrics,
         )
+
+
+def _render_qa_layout_signature(result: _RenderQAResult) -> str:
+    payload = [
+        (asset.asset_id, asset.document_width_emu, asset.document_height_emu)
+        for asset in result.assets
+    ]
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _ensure_workflow_codex_client(context: _PaperWorkflowContext) -> tuple[openai.OpenAI, CodexConfig]:
@@ -5551,6 +5595,25 @@ def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
         attempted=context.repair_attempts,
         global_cost_used=context.repair_cost_used,
     )
+    content_repair_planned = any(
+        step.action
+        not in {
+            _RepairAction.RETRY_VERIFIER,
+            _RepairAction.USE_DETERMINISTIC,
+            _RepairAction.VISUAL_ARBITRATION,
+        }
+        for step in steps
+    )
+    if content_repair_planned:
+        steps = [
+            step
+            for step in steps
+            if step.reason_code
+            not in {
+                "verifier_invalid_json",
+                "verifier_transport_failure",
+            }
+        ]
     if not context.verification.patch_suggestions:
         steps = [step for step in steps if step.reason_code != "unsupported_core_claim"]
 
@@ -5781,6 +5844,12 @@ def _revise_report_once(
             )
             assets_changed = assets_changed or bool(repaired)
             executed_recaptures.add(step.asset_id)
+            if (
+                step.action == _RepairAction.SELECT_ALTERNATE
+                and step.asset_id not in repaired
+                and not _is_critical_asset(context.assets[step.asset_id - 1])
+            ):
+                executed_removals.add(step.asset_id)
         elif step.action == _RepairAction.DISCARD_CANDIDATE and step.asset_id is not None:
             executed_removals.add(step.asset_id)
 
@@ -10564,6 +10633,7 @@ def _image_paragraph(path: Path, docpr_id: int, rel_id: str, asset: PaperAsset |
 
 def _image_size_emu(path: Path, kind: str = "", rect: fitz.Rect | None = None) -> tuple[int, int]:
     max_width_emu = int(6.2 * 914400)
+    max_height_emu = int(9.75 * 914400)
     min_width_by_kind = {
         "formula": int(3.9 * 914400),
         "table": int(5.7 * 914400),
@@ -10577,16 +10647,25 @@ def _image_size_emu(path: Path, kind: str = "", rect: fitz.Rect | None = None) -
     if width <= 0 or height <= 0:
         width, height = 800, 500
     natural_width_emu = width * 9525
+    natural_height_emu = height * 9525
     min_width_emu = min_width_by_kind.get(kind, 0)
     if kind == "table" and rect is not None and rect.width < 220:
         target_width_inches = min(4.4, max(3.2, (rect.width / 72.0) * 2.1))
-        scale = min(max_width_emu / natural_width_emu, (target_width_inches * 914400) / natural_width_emu)
+        scale = min(
+            max_width_emu / natural_width_emu,
+            max_height_emu / natural_height_emu,
+            (target_width_inches * 914400) / natural_width_emu,
+        )
         return int(width * 9525 * scale), int(height * 9525 * scale)
     target_scale = max(1.0, min_width_emu / natural_width_emu) if min_width_emu else 1.0
     if kind == "table":
         # Small table crops become unreadable if stretched to page width; prefer crisp native scale.
         target_scale = min(target_scale, 1.35)
-    scale = min(max_width_emu / natural_width_emu, target_scale)
+    scale = min(
+        max_width_emu / natural_width_emu,
+        max_height_emu / natural_height_emu,
+        target_scale,
+    )
     return int(width * 9525 * scale), int(height * 9525 * scale)
 
 

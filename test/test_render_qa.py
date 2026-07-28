@@ -6,6 +6,9 @@ from PIL import Image
 
 from paper_agent.evaluation import render_qa
 from paper_agent.paper_summary import PaperAsset, _write_docx
+from paper_agent.paper_summary import RenderQA
+from paper_agent.harness.context import PaperWorkflowContext
+from paper_agent.schemas.qa import RenderAssetMeasurement, RenderQAFinding, RenderQAResult
 
 
 def _asset(tmp_path: Path, name: str = "figure.png", caption: str = "Figure 1: Overview") -> PaperAsset:
@@ -114,3 +117,46 @@ def test_render_qa_renderer_timeout_is_warning_not_content_defect(tmp_path):
 
     assert result.status == "warning"
     assert result.reason_codes == ["renderer_timeout"]
+
+
+def test_render_qa_node_regenerates_docx_and_rechecks_layout_once(tmp_path):
+    asset = _asset(tmp_path)
+    docx_path = _docx(tmp_path, [asset])
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.output = tmp_path
+    context.source_path = tmp_path / "paper.pdf"
+    context.paper_name = "paper"
+    context.work_dir = tmp_path / "assets"
+    context.docx_path = docx_path
+    context.summary = "方法如图所示。\n\n[[ASSET:1]]"
+    context.assets = [asset]
+    blocked = RenderQAResult(
+        "block",
+        "fixture",
+        None,
+        findings=[RenderQAFinding("image_cropped", "block", "too tall", asset_id=1)],
+        assets=[RenderAssetMeasurement(1, "figure", asset.caption, 1, document_width_emu=100, document_height_emu=200)],
+    )
+    warning = RenderQAResult(
+        "warning",
+        "fixture",
+        None,
+        findings=[RenderQAFinding("renderer_failed", "warning", "Word COM unavailable")],
+        assets=[RenderAssetMeasurement(1, "figure", asset.caption, 1, document_width_emu=100, document_height_emu=150)],
+    )
+
+    with patch("paper_agent.paper_summary._run_render_qa", side_effect=[blocked, warning]) as run_qa:
+        result = RenderQA().run(context)
+
+    assert run_qa.call_count == 2
+    assert result.status == "warning"
+    assert context.download_ready
+    assert context.repair_attempts["render_qa:layout"] == 1
+    assert context.repair_history[-1]["changed"] is True
