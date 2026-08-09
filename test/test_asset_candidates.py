@@ -66,7 +66,12 @@ def test_complete_multiline_table_keeps_all_strategies_and_score_explanation():
         ((strategy, bbox, Path(f"{strategy.value}.png")) for strategy, bbox in geometry),
         border_closed={CandidateStrategy.BORDER_ENCLOSED: True},
     )
-    assert {candidate.strategy for candidate in pool.candidates} == set(CandidateStrategy)
+    assert {candidate.strategy for candidate in pool.candidates} == {
+        CandidateStrategy.DETECTOR,
+        CandidateStrategy.TEXT_HEURISTIC,
+        CandidateStrategy.BORDER_ENCLOSED,
+        CandidateStrategy.ADJACENT_SPLIT,
+    }
     assert pool.selected.strategy is CandidateStrategy.BORDER_ENCLOSED
     assert all(candidate.score.explanation for candidate in pool.candidates)
     assert pool.selected.score.numeric_cell_coverage > 0.7

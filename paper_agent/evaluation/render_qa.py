@@ -226,6 +226,7 @@ def _inspect_docx(
     assets: list[Any],
     *,
     required_asset_ids: set[int] | None = None,
+    excluded_asset_ids: set[int] | None = None,
 ) -> tuple[list[RenderAssetMeasurement], list[RenderQAFinding]]:
     findings: list[RenderQAFinding] = []
     measurements: list[RenderAssetMeasurement] = []
@@ -265,7 +266,10 @@ def _inspect_docx(
                 kind = str(getattr(assets[asset_id - 1], "kind", "")) if 0 < asset_id <= len(assets) else ""
                 drawings[asset_id] = (rel_id, cx, cy, _caption_is_adjacent(kind, previous, following))
 
+            excluded = excluded_asset_ids or set()
             for asset_id, asset in enumerate(assets, 1):
+                if asset_id in excluded:
+                    continue
                 kind = str(getattr(asset, "kind", ""))
                 caption = str(getattr(asset, "caption", ""))
                 source_page = int(getattr(asset, "page_number", 0) or 0)
@@ -320,7 +324,9 @@ def _inspect_docx(
                     )
                 )
 
-            manifest_labels = _manifest_labels(assets)
+            manifest_labels = _manifest_labels(
+                [asset for asset_id, asset in enumerate(assets, 1) if asset_id not in excluded]
+            )
             for kind, number in sorted(_critical_references(document_text) - manifest_labels):
                 findings.append(_finding("missing_critical_asset", "block", f"Referenced critical {kind} {number} is absent from the DOCX asset manifest"))
     except (OSError, KeyError, ET.ParseError, zipfile.BadZipFile) as exc:
@@ -405,11 +411,13 @@ def run_render_qa(
     *,
     timeout_seconds: float = 120.0,
     required_asset_ids: set[int] | None = None,
+    excluded_asset_ids: set[int] | None = None,
 ) -> RenderQAResult:
     measurements, findings = _inspect_docx(
         docx_path,
         assets,
         required_asset_ids=required_asset_ids,
+        excluded_asset_ids=excluded_asset_ids,
     )
     attempt = _render_docx(docx_path, render_dir, timeout_seconds)
     pages: list[RenderPageMeasurement] = []

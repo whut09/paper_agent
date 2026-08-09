@@ -64,6 +64,7 @@ class PaperWorkflowContext:
     repair_budget: float = 8.0
     repair_max_actions_per_asset: int = 2
     repair_recheck_guards: set[str] = field(default_factory=set)
+    quarantined_asset_ids: set[int] = field(default_factory=set)
     agent_trace: list[dict[str, object]] = field(default_factory=list)
     node_results: dict[str, NodeResult] = field(default_factory=dict)
     docx_path: Path | None = None

@@ -23,6 +23,7 @@ class CandidateStrategy(str, Enum):
     TEXT_HEURISTIC = "text_heuristic_bbox"
     BORDER_ENCLOSED = "border_enclosed_bbox"
     ADJACENT_SPLIT = "adjacent_object_split"
+    VERTICAL_CONTEXT = "vertical_context_bbox"
 
 
 @dataclass(frozen=True)

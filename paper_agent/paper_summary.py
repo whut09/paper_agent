@@ -800,6 +800,7 @@ class GenerateReport(_PaperWorkflowNode):
             work_dir=context.work_dir,
             max_assets=context.max_assets,
             formula_candidates=context.formulas,
+            excluded_asset_ids=context.quarantined_asset_ids,
         )
         asset_preflight = _asset_guard(context.summary, context.assets, context.formulas)
         if asset_preflight.errors:
@@ -852,7 +853,49 @@ class RenderQA(_PaperWorkflowNode):
             render_dir,
             timeout_seconds=_render_qa_timeout_seconds(),
             required_asset_ids=required_asset_ids,
+            excluded_asset_ids=context.quarantined_asset_ids,
         )
+        source_repair_ids = {
+            finding.asset_id
+            for finding in context.qa_result.findings
+            if finding.reason_code == "visual_crop_invalid" and finding.asset_id is not None
+        }
+        source_repair_attempted = bool(source_repair_ids) and not context.repair_attempts.get("render_qa:source")
+        if source_repair_attempted:
+            context.report(0.965, "检测到源截图裁切，定向重裁并复检...")
+            before_signature = _render_qa_source_signature(context, source_repair_ids)
+            repaired_ids = _repair_render_qa_source_assets(context, source_repair_ids)
+            context.repair_attempts["render_qa:source"] = 1
+            if repaired_ids:
+                _write_docx(
+                    context.docx_path,
+                    context.source_path.name if context.source_path else "paper.pdf",
+                    context.summary,
+                    context.assets,
+                )
+                context.qa_result = _run_render_qa(
+                    context.docx_path,
+                    context.assets,
+                    render_dir / "source-repair-1",
+                    timeout_seconds=_render_qa_timeout_seconds(),
+                    required_asset_ids=required_asset_ids,
+                    excluded_asset_ids=context.quarantined_asset_ids,
+                )
+            after_signature = _render_qa_source_signature(context, source_repair_ids)
+            context.repair_history.append(
+                {
+                    "stage": "RenderQA",
+                    "attempt": 1,
+                    "actions": ["recapture_source_assets", "regenerate_docx", "rerun_render_qa"],
+                    "asset_ids": sorted(source_repair_ids),
+                    "repaired_asset_ids": sorted(repaired_ids),
+                    "before": before_signature,
+                    "after": after_signature,
+                    "changed": before_signature != after_signature,
+                    "confidence": 1.0,
+                    "cost": 0.0,
+                }
+            )
         initial_decision = _decide_quality(context.qa_result.findings)
         layout_repair_attempted = initial_decision.disposition == _QualityDisposition.AUTO_REPAIR
         if layout_repair_attempted:
@@ -870,6 +913,7 @@ class RenderQA(_PaperWorkflowNode):
                 render_dir / "layout-repair-1",
                 timeout_seconds=_render_qa_timeout_seconds(),
                 required_asset_ids=required_asset_ids,
+                excluded_asset_ids=context.quarantined_asset_ids,
             )
             after_signature = _render_qa_layout_signature(context.qa_result)
             context.repair_attempts["render_qa:layout"] = context.repair_attempts.get("render_qa:layout", 0) + 1
@@ -902,6 +946,7 @@ class RenderQA(_PaperWorkflowNode):
             "qa_asset_count": len(context.qa_result.assets),
             "renderer": context.qa_result.renderer,
             "layout_auto_repair_attempted": layout_repair_attempted,
+            "source_auto_repair_attempted": source_repair_attempted,
         }
         if context.qa_result.status == "block":
             return _NodeResult(
@@ -927,6 +972,52 @@ def _render_qa_layout_signature(result: _RenderQAResult) -> str:
         for asset in result.assets
     ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _render_qa_source_signature(context: _PaperWorkflowContext, asset_ids: set[int]) -> str:
+    payload = [
+        _asset_capture_signature(context.assets[asset_id - 1])
+        for asset_id in sorted(asset_ids)
+        if 1 <= asset_id <= len(context.assets)
+    ]
+    return hashlib.sha256(repr(payload).encode("utf-8")).hexdigest()
+
+
+def _repair_render_qa_source_assets(
+    context: _PaperWorkflowContext,
+    asset_ids: set[int],
+) -> set[int]:
+    """Perform one deterministic recapture pass without re-running model verification."""
+
+    if context.pdf_path is None or context.work_dir is None:
+        return set()
+    repaired: set[int] = set()
+    document = fitz.open(context.pdf_path)
+    try:
+        for asset_id in sorted(asset_ids):
+            if not 1 <= asset_id <= len(context.assets):
+                continue
+            original = context.assets[asset_id - 1]
+            if not 1 <= original.page_number <= document.page_count:
+                continue
+            repair_dir = context.work_dir / "render-qa-repair" / f"asset-{asset_id}"
+            repair_dir.mkdir(parents=True, exist_ok=True)
+            replacement = _adaptive_visual_recapture(
+                document[original.page_number - 1],
+                original,
+                repair_dir,
+                asset_id,
+                ["visual_crop_invalid", "source bitmap cropped or truncated"],
+            )
+            if replacement is None or _asset_capture_signature(replacement) == _asset_capture_signature(original):
+                continue
+            if not _replacement_passes_visual_recheck(context, asset_id, replacement):
+                continue
+            context.assets[asset_id - 1] = replacement
+            repaired.add(asset_id)
+    finally:
+        document.close()
+    return repaired
 
 
 def _ensure_workflow_codex_client(context: _PaperWorkflowContext) -> tuple[openai.OpenAI, CodexConfig]:
@@ -1841,6 +1932,11 @@ def _build_asset_candidate_pool(
                         )
                         for strategy, candidate_bbox in geometry
                     ]
+                    if asset.kind == "figure":
+                        vertical_body = _expanded_captioned_figure_body_rect(page, asset)
+                        if vertical_body is not None:
+                            vertical_clip = _captioned_object_clip_rect(page, asset.caption_rect, vertical_body)
+                            geometry.append((_CandidateStrategy.VERTICAL_CONTEXT, tuple(vertical_clip)))
                     # The full-column candidate preserves the object's vertical
                     # boundaries while recovering content lost on either side.
                     geometry = [
@@ -5905,6 +6001,7 @@ def _compile_report_asset_references(
     work_dir: Path | None = None,
     max_assets: int | None = None,
     formula_candidates: list[str] | None = None,
+    excluded_asset_ids: set[int] | None = None,
 ) -> str:
     """Compile semantic figure/table/formula references into stable markers.
 
@@ -5922,9 +6019,12 @@ def _compile_report_asset_references(
         max_assets=max_assets,
     )
     summary = _remove_mismatched_asset_markers(summary, assets)
-    summary = _ensure_asset_markers(summary, assets)
-    summary = _ensure_primary_result_table_marker(summary, assets)
-    summary = _ensure_key_formula_markers(summary, assets)
+    excluded = excluded_asset_ids or set()
+    summary = _remove_excluded_asset_markers(summary, excluded)
+    summary = _ensure_asset_markers(summary, assets, excluded_asset_ids=excluded)
+    summary = _ensure_primary_result_table_marker(summary, assets, excluded_asset_ids=excluded)
+    summary = _ensure_key_formula_markers(summary, assets, excluded_asset_ids=excluded)
+    summary = _remove_excluded_asset_markers(summary, excluded)
     summary = _remove_mismatched_asset_markers(summary, assets)
     return _suppress_formula_text_when_assets_present(summary, assets)
 
@@ -7104,6 +7204,7 @@ def _quarantine_recoverable_visual_failures(context: _PaperWorkflowContext) -> s
                 "reason_code": "visual_crop_invalid",
             }
         )
+    context.quarantined_asset_ids.update(quarantined)
 
     retained_findings = [
         finding
@@ -7395,8 +7496,14 @@ def _expand_truncated_column_asset(
     caption_rect = original.caption_rect or original.rect
     left, right = _conservative_caption_column_bounds(page, caption_rect)
     object_rect = fitz.Rect(original.rect)
-    expanded = fitz.Rect(left, object_rect.y0, right, object_rect.y1) & page.rect
-    if expanded.width <= object_rect.width + 8:
+    vertical = _expanded_captioned_figure_body_rect(page, original)
+    expanded = fitz.Rect(
+        left,
+        vertical.y0 if vertical is not None else object_rect.y0,
+        right,
+        vertical.y1 if vertical is not None else object_rect.y1,
+    ) & page.rect
+    if expanded.width <= object_rect.width + 8 and expanded.height <= object_rect.height + 8:
         return None
     clip_rect = _captioned_object_clip_rect(page, caption_rect, expanded)
     path = repair_dir / f"asset-{asset_id:02d}-expanded-column.png"
@@ -7412,6 +7519,53 @@ def _expand_truncated_column_asset(
         rect=expanded,
         caption_rect=caption_rect,
     )
+
+
+def _expanded_captioned_figure_body_rect(
+    page: fitz.Page,
+    asset: PaperAsset,
+) -> fitz.Rect | None:
+    """Recover vector figure content omitted above or below a captioned crop."""
+
+    if asset.rect is None or asset.caption_rect is None:
+        return None
+    body = fitz.Rect(asset.rect)
+    caption = fitz.Rect(asset.caption_rect)
+    left, right = _conservative_caption_column_bounds(page, caption)
+    caption_below = caption.y0 >= body.y1 - 6
+    caption_above = caption.y1 <= body.y0 + 6
+    if not caption_below and not caption_above:
+        return None
+    window_top = max(page.rect.y0 + 36, caption.y0 - 440) if caption_below else caption.y1 + 2
+    window_bottom = caption.y0 - 2 if caption_below else min(page.rect.y1 - 24, caption.y1 + 440)
+    regions: list[fitz.Rect] = []
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        drawings = []
+    for drawing in drawings:
+        raw = drawing.get("rect")
+        if not raw:
+            continue
+        rect = fitz.Rect(raw)
+        if _graphic_region_is_page_artifact(page, rect):
+            continue
+        if rect.is_empty or rect.x1 < left or rect.x0 > right:
+            continue
+        if rect.y1 < window_top or rect.y0 > window_bottom:
+            continue
+        regions.append(rect)
+    if not regions:
+        return None
+    expanded = fitz.Rect(
+        min(body.x0, min(rect.x0 for rect in regions)),
+        min(body.y0, min(rect.y0 for rect in regions)),
+        max(body.x1, max(rect.x1 for rect in regions)),
+        max(body.y1, max(rect.y1 for rect in regions)),
+    ) & fitz.Rect(left, window_top, right, window_bottom)
+    if expanded.is_empty or (expanded.width <= body.width + 4 and expanded.height <= body.height + 4):
+        return None
+    return expanded
 
 
 def _split_mixed_visual_asset(
@@ -11323,7 +11477,12 @@ def _recognized_formula_context(assets: list[PaperAsset]) -> str:
     return "\n".join(formulas)
 
 
-def _ensure_key_formula_markers(summary: str, assets: list[PaperAsset]) -> str:
+def _ensure_key_formula_markers(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    excluded_asset_ids: set[int] | None = None,
+) -> str:
     """Place real formula screenshots inside the report's key-formula subsection."""
 
     formula_numbers = set(_formula_reference_numbers(summary))
@@ -11332,7 +11491,9 @@ def _ensure_key_formula_markers(summary: str, assets: list[PaperAsset]) -> str:
     formula_ids = {
         index: _formula_asset_number(asset)
         for index, asset in enumerate(assets, 1)
-        if asset.kind == "formula" and _formula_asset_number(asset) in formula_numbers
+        if asset.kind == "formula"
+        and index not in (excluded_asset_ids or set())
+        and _formula_asset_number(asset) in formula_numbers
     }
     if not formula_ids:
         return summary
@@ -11408,7 +11569,12 @@ def _ensure_key_formula_markers(summary: str, assets: list[PaperAsset]) -> str:
     return "\n".join(result)
 
 
-def _ensure_primary_result_table_marker(summary: str, assets: list[PaperAsset]) -> str:
+def _ensure_primary_result_table_marker(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    excluded_asset_ids: set[int] | None = None,
+) -> str:
     """Keep at least one real result-table screenshot in the key-results section."""
 
     result_body = _section_body(summary, "关键结果")
@@ -11417,7 +11583,7 @@ def _ensure_primary_result_table_marker(summary: str, assets: list[PaperAsset]) 
     table_ids = [
         index
         for index, asset in enumerate(assets, 1)
-        if asset.kind == "table"
+        if asset.kind == "table" and index not in (excluded_asset_ids or set())
     ]
     if not table_ids:
         return summary
@@ -11586,17 +11752,30 @@ def _looks_like_front_matter_author(text: str) -> bool:
     return 2 <= len(tokens) <= 5 and not re.search(r"\b(?:abstract|introduction|framework|agent|integration)\b", text, re.I)
 
 
-def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
+def _remove_excluded_asset_markers(summary: str, excluded_asset_ids: set[int]) -> str:
+    if not excluded_asset_ids:
+        return summary
+    pattern = "|".join(str(asset_id) for asset_id in sorted(excluded_asset_ids))
+    return re.sub(rf"(?m)^\s*\[\[ASSET:(?:{pattern})\]\]\s*$\n?", "", summary)
+
+
+def _ensure_asset_markers(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    excluded_asset_ids: set[int] | None = None,
+) -> str:
     """Keep figures/tables near related sections even if the model forgot markers."""
     if not assets:
         return summary
 
-    summary = _insert_markers_after_explicit_references(summary, assets)
+    excluded = excluded_asset_ids or set()
+    summary = _insert_markers_after_explicit_references(summary, assets, excluded_asset_ids=excluded)
     referenced = set(re.findall(r"\[\[ASSET:(\d+)\]\]", summary))
     missing_ids = [
         idx
         for idx, asset in enumerate(assets, 1)
-        if str(idx) not in referenced and asset.kind in {"figure", "table", "formula"}
+        if idx not in excluded and str(idx) not in referenced and asset.kind in {"figure", "table", "formula"}
     ]
     if not missing_ids:
         return summary
@@ -11652,7 +11831,12 @@ def _next_nonempty_line_is_asset_marker(lines: list[str], line_index: int) -> bo
     return False
 
 
-def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAsset]) -> str:
+def _insert_markers_after_explicit_references(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    excluded_asset_ids: set[int] | None = None,
+) -> str:
     lines = summary.splitlines()
     if not lines:
         return summary
@@ -11660,6 +11844,8 @@ def _insert_markers_after_explicit_references(summary: str, assets: list[PaperAs
     referenced = set(re.findall(r"\[\[ASSET:(\d+)\]\]", summary))
     insert_after: dict[int, list[str]] = {}
     for asset_id, asset in enumerate(assets, 1):
+        if asset_id in (excluded_asset_ids or set()):
+            continue
         if str(asset_id) in referenced:
             continue
         label = _original_asset_label(asset)

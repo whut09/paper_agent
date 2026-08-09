@@ -125,7 +125,7 @@ NODE_CONTRACTS = {
                 "knowledge_graph.json",
                 "asset-candidates.json",
             ),
-            context_reads=("assets", "docx_path", "formulas", "max_assets", "output", "paper_name", "pdf_path", "source_path", "summary", "summary_markdown_path", "work_dir"),
+            context_reads=("assets", "docx_path", "formulas", "max_assets", "output", "paper_name", "pdf_path", "quarantined_asset_ids", "source_path", "summary", "summary_markdown_path", "work_dir"),
             context_writes=("asset_candidates_path", "docx_path", "grounding_map_path", "knowledge_graph_path", "summary", "summary_markdown_path", "trace_path", "verification_path"),
         ),
         WorkflowNodeContract(
