@@ -102,10 +102,12 @@ def build_asset_candidate_pool(
     border_closed: dict[CandidateStrategy, bool | None] | None = None,
     object_bboxes: Iterable[BoundingBox] = (),
     page_width: float | None = None,
+    candidate_diagnostics: dict[CandidateStrategy, tuple[str, ...]] | None = None,
 ) -> AssetCandidatePool:
     """Build and retain every supplied candidate, including low-quality ones."""
 
     border_closed = border_closed or {}
+    candidate_diagnostics = candidate_diagnostics or {}
     boxes = tuple(object_bboxes)
     result = []
     for strategy, bbox, image_path in candidates:
@@ -117,7 +119,7 @@ def build_asset_candidate_pool(
             object_bboxes=boxes,
             page_width=page_width,
         )
-        diagnostics = (score.explanation,)
+        diagnostics = (score.explanation, *candidate_diagnostics.get(strategy, ()))
         result.append(AssetCandidate(evidence, strategy, bbox, image_path, score, diagnostics))
     if not result:
         raise ValueError("At least one asset candidate is required.")

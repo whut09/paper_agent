@@ -3,6 +3,26 @@ import threading
 import paper_agent.paper_summary as ps
 
 
+def _complete_test_report() -> str:
+    paragraph = (
+        "这是一段基于论文证据撰写的中文内容，用于说明研究问题、方法机制、实验设置、"
+        "主要结果及其适用边界，并确保最终整合候选满足完整报告契约。" * 2
+    )
+    sections = (
+        "核心信息",
+        "摘要",
+        "背景与问题",
+        "创新点",
+        "一句话总结",
+        "方法主线",
+        "关键结果",
+        "深度分析",
+        "局限",
+        "总结",
+    )
+    return "# Test\n\n" + "\n\n".join(f"## {section}\n{paragraph}" for section in sections)
+
+
 def _assert_raises_runtime_error(func, expected_text: str | None = None):
     try:
         func()
@@ -56,7 +76,7 @@ def test_final_integration_uses_parallel_partial_summaries():
     try:
         def fake_chat(*args, **kwargs):
             prompts.append(args[2])
-            return "# Test\n\n## 核心信息\n- 标题: Test\n"
+            return _complete_test_report()
 
         ps._chat = fake_chat
         chunk_notes = [f"note {idx}" for idx in range(1, 11)]
@@ -132,13 +152,13 @@ def test_parallel_chunk_summary_retries_failed_chunk_after_batch():
         ps._codex_summary_concurrency = original_concurrency
 
 
-def test_fast_integration_uses_standard_chat_retries():
+def test_fast_integration_uses_single_bounded_chat_attempt():
     original_chat = ps._chat
     seen_kwargs = {}
 
     def fake_chat(*_args, **kwargs):
         seen_kwargs.update(kwargs)
-        return "# Test\n\n## 摘要\n中文摘要"
+        return _complete_test_report()
 
     try:
         ps._chat = fake_chat
@@ -157,7 +177,7 @@ def test_fast_integration_uses_standard_chat_retries():
         )
 
         assert result.startswith("# Test")
-        assert "max_attempts" not in seen_kwargs
+        assert seen_kwargs["max_attempts"] == 1
     finally:
         ps._chat = original_chat
 

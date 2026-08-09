@@ -62,6 +62,7 @@ from paper_agent.evaluation.visual_validation import (
     VisualMeasurements as _VisualMeasurements,
     decide_visual_layers as _decide_visual_layers,
 )
+from paper_agent.evaluation.image_integrity import inspect_crop_integrity as _inspect_crop_integrity
 from paper_agent.evaluation.acceptance import (
     build_acceptance_result as _build_acceptance_result,
     compare_asset_manifests as _compare_asset_manifests,
@@ -287,7 +288,15 @@ class _RepairPlan:
             self.missing_asset_keys
             or self.recapture_asset_ids
             or self.remove_asset_ids
-            or any(step.asset_id is not None or step.action == _RepairAction.CAPTURE_MISSING for step in self.steps)
+            or any(
+                step.asset_id is not None
+                or step.action
+                in {
+                    _RepairAction.CAPTURE_MISSING,
+                    _RepairAction.RECONCILE_REPORT_ASSETS,
+                }
+                for step in self.steps
+            )
         )
 
     def action_keys(self) -> list[str]:
@@ -503,7 +512,17 @@ class ParsePaper(_PaperWorkflowNode):
             context.pages,
             context.max_assets,
         )
-        context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
+        context.asset_candidate_pools = _build_asset_candidate_pools(
+            context.assets,
+            source_pdf=context.pdf_path,
+            work_dir=context.work_dir,
+        )
+        if not context.legacy_asset_manifest:
+            context.legacy_asset_manifest = _legacy_manifest_from_assets(context.assets)
+        context.assets = _commit_selected_asset_candidates(
+            context.assets,
+            context.asset_candidate_pools,
+        )
         if context.output is not None:
             context.asset_candidates_path = context.output / f"{context.paper_name}-asset-candidates.json"
             _write_asset_candidate_sidecar(context)
@@ -587,27 +606,52 @@ class ExtractMethods(_PaperWorkflowNode):
     depends_on = ("SummarizeContribution",)
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
-    requires = ["chunk_notes", "assets", "abstract", "formulas"]
+    requires = ["chunk_notes", "assets", "abstract", "formulas", "legacy_summary"]
     produces = ["draft_report"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         client, config = _ensure_workflow_codex_client(context)
         context.check_cancelled()
         context.report(0.68, "整合方法、结果和分析...")
-        context.summary = _integrate_summary_with_codex(
-            client,
-            config.model,
-            context.chunk_notes,
-            context.assets,
-            context.summary_language,
-            context.abstract,
-            context.formulas,
-            _recognized_formula_context(context.assets),
-            context.paper_title,
-            context.correction_memories,
-            context.prompt_patches,
-            context.partial_summaries,
-        )
+        try:
+            candidate = _integrate_summary_with_codex(
+                client,
+                config.model,
+                context.chunk_notes,
+                context.assets,
+                context.summary_language,
+                context.abstract,
+                context.formulas,
+                _recognized_formula_context(context.assets),
+                context.paper_title,
+                context.correction_memories,
+                context.prompt_patches,
+                context.partial_summaries,
+            )
+        except RuntimeError as exc:
+            legacy_errors = _report_draft_contract_errors(context.legacy_summary)
+            if not context.legacy_summary or legacy_errors:
+                raise
+            logger.warning(
+                "Final integration failed (%s); preserving the last valid report incumbent.",
+                _clean_xml_text(str(exc))[:240],
+            )
+            candidate = context.legacy_summary
+        contract_errors = _report_draft_contract_errors(candidate)
+        legacy_errors = _report_draft_contract_errors(context.legacy_summary)
+        if contract_errors and context.legacy_summary and not legacy_errors:
+            logger.warning(
+                "Integrated draft rejected (%s); preserving the last valid report incumbent.",
+                "; ".join(contract_errors),
+            )
+            candidate = context.legacy_summary
+            contract_errors = []
+        if contract_errors:
+            raise RuntimeError(
+                "最终整合未返回完整论文报告，已丢弃异常候选，未进入验证和 Word 生成："
+                + "；".join(contract_errors)
+            )
+        context.summary = candidate
 
 
 class VerifyClaims(_PaperWorkflowNode):
@@ -615,12 +659,13 @@ class VerifyClaims(_PaperWorkflowNode):
     depends_on = ("ExtractMethods",)
     agent_role = _PaperAgentRole.CRITIC
     agent_contract = _VERIFIER_AGENT_CONTRACT
-    requires = ["draft_report", "grounding_map", "assets"]
+    requires = ["draft_report", "grounding_map", "assets", "formulas"]
     produces = ["verification_report", "verified_report", "knowledge_graph"]
 
     def run(self, context: _PaperWorkflowContext) -> None:
         client, config = _ensure_workflow_codex_client(context)
         context.report(0.78, "校验标题、摘要和图表引用...")
+        prior_verification = context.verification
         context.summary, context.verification, context.guard_results = _verify_summary_claims(
             context.summary,
             context.text,
@@ -634,6 +679,10 @@ class VerifyClaims(_PaperWorkflowNode):
             context.prompt_patches,
             guard_names=context.repair_recheck_guards or None,
             source_pdf=context.pdf_path,
+            work_dir=context.work_dir,
+            max_assets=context.max_assets,
+            prior_verification=prior_verification,
+            formula_candidates=context.formulas,
         )
         context.repair_recheck_guards.clear()
         context.knowledge_graph = _build_knowledge_graph(context.grounding_map, context.summary)
@@ -653,14 +702,32 @@ class ReviseReport(_PaperWorkflowNode):
         policy = _GatePolicy()
         repair_plan = _build_repair_plan(context)
         decision = policy.decide(context.verification, context.revision_attempts)
+        emergency_missing_repair = (
+            decision == _GateDecision.BLOCK
+            and bool(repair_plan.missing_asset_keys)
+            and any(step.action == _RepairAction.CAPTURE_MISSING for step in repair_plan.steps)
+        )
         if (
             decision == _GateDecision.BLOCK
-            and context.revision_attempts < policy.max_revision_attempts
+            and (
+                context.revision_attempts < policy.max_revision_attempts
+                or emergency_missing_repair
+            )
             and repair_plan.has_asset_actions
         ):
             decision = _GateDecision.REVISE
         elif decision == _GateDecision.REVISE and not repair_plan.actionable:
             decision = _GateDecision.BLOCK
+        quarantined_asset_ids: set[int] = set()
+        if decision == _GateDecision.BLOCK:
+            # A report-level gate should block only when the failed visual is
+            # the last usable evidence for a required claim.  After the bounded
+            # repair budget is exhausted, isolate a bad asset when an accepted
+            # peer of the same kind already supports that report section.
+            quarantined_asset_ids = _quarantine_recoverable_visual_failures(context)
+            if quarantined_asset_ids:
+                repair_plan = _RepairPlan()
+                decision = policy.decide(context.verification, context.revision_attempts)
         context.gate_decision = decision.value
         context.gate_history.append(
             {
@@ -670,6 +737,7 @@ class ReviseReport(_PaperWorkflowNode):
                 "soft_warnings": len(context.verification.soft_warnings),
                 "patch_suggestions": len(context.verification.patch_suggestions),
                 "repair_actions": repair_plan.action_keys(),
+                "quarantined_assets": sorted(quarantined_asset_ids),
             }
         )
         _record_harness_learnings(context)
@@ -700,7 +768,7 @@ class GenerateReport(_PaperWorkflowNode):
     depends_on = ("ReviseReport",)
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
-    requires = ["verified_report", "asset_manifest"]
+    requires = ["verified_report", "asset_manifest", "formulas"]
     produces = [
         "docx",
         "summary.md",
@@ -724,8 +792,20 @@ class GenerateReport(_PaperWorkflowNode):
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
         context.asset_candidates_path = context.output / f"{context.paper_name}-asset-candidates.json"
         context.summary = _ensure_chinese_report_title(context.summary)
-        context.summary = _ensure_asset_markers(context.summary, context.assets)
-        context.summary = _suppress_formula_text_when_assets_present(context.summary, context.assets)
+        context.summary = _enrich_core_info_from_pdf(context.summary, context.pdf_path)
+        context.summary = _compile_report_asset_references(
+            context.summary,
+            context.assets,
+            source_pdf=context.pdf_path,
+            work_dir=context.work_dir,
+            max_assets=context.max_assets,
+            formula_candidates=context.formulas,
+        )
+        asset_preflight = _asset_guard(context.summary, context.assets, context.formulas)
+        if asset_preflight.errors:
+            raise RuntimeError(
+                "Word 生成前资产完整性检查未通过：" + "；".join(asset_preflight.errors)
+            )
         _assert_report_ready_for_docx(context.summary)
         try:
             _write_docx(
@@ -1479,7 +1559,10 @@ def _capture_captioned_tables(
         table_rect, table_text = _table_rect_for_caption(page, caption_rect, lines)
         if table_rect is None:
             continue
-        clip_rect = _merge_rects([caption_rect, table_rect])
+        table_rect, table_text = _expand_composite_table_rect(
+            page, caption_text, caption_rect, table_rect, table_text, lines
+        )
+        clip_rect = _captioned_object_clip_rect(page, caption_rect, table_rect)
         if clip_rect.width < 80 or clip_rect.height < 55:
             continue
         key = _box_key(page_no, clip_rect)
@@ -1663,24 +1746,42 @@ def _deduplicate_assets(assets: list[PaperAsset]) -> list[PaperAsset]:
     return result
 
 
-def _build_asset_candidate_pools(assets: list[PaperAsset]) -> list[_AssetCandidatePool]:
-    """Adapt legacy assets to immutable candidate pools without changing selection.
-
-    The current image is shared by geometry alternatives until the capture layer
-    renders per-candidate files.  This still preserves every strategy and score
-    in a sidecar, while the selected candidate resolves to the same legacy image.
-    """
+def _build_asset_candidate_pools(
+    assets: list[PaperAsset],
+    *,
+    source_pdf: Path | None = None,
+    work_dir: Path | None = None,
+) -> list[_AssetCandidatePool]:
+    """Build immutable candidates whose bbox and bitmap describe the same crop."""
 
     indexed_assets = [(index, asset) for index, asset in enumerate(assets) if asset.rect is not None]
     if not indexed_assets:
         return []
     workers = max(1, min(4, len(indexed_assets)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="paper-candidate") as executor:
-        pools = list(executor.map(lambda item: _build_asset_candidate_pool(item[1], assets), indexed_assets))
+        pools = list(
+            executor.map(
+                lambda item: _build_asset_candidate_pool(
+                    item[1],
+                    assets,
+                    asset_index=item[0] + 1,
+                    source_pdf=source_pdf,
+                    work_dir=work_dir,
+                ),
+                indexed_assets,
+            )
+        )
     return [pool for pool in pools if pool is not None]
 
 
-def _build_asset_candidate_pool(asset: PaperAsset, assets: list[PaperAsset]) -> _AssetCandidatePool | None:
+def _build_asset_candidate_pool(
+    asset: PaperAsset,
+    assets: list[PaperAsset],
+    *,
+    asset_index: int = 1,
+    source_pdf: Path | None = None,
+    work_dir: Path | None = None,
+) -> _AssetCandidatePool | None:
     if asset.rect is None:
         return None
     bbox = tuple(float(value) for value in (asset.rect.x0, asset.rect.y0, asset.rect.x1, asset.rect.y1))
@@ -1708,19 +1809,141 @@ def _build_asset_candidate_pool(asset: PaperAsset, assets: list[PaperAsset]) -> 
                 asset.caption_rect.y1,
             )
         )
-    geometry = candidate_bboxes_for_asset(
+    geometry = list(candidate_bboxes_for_asset(
         bbox,
         caption_bbox=caption_bbox,
         adjacent_bboxes=adjacent,
-    )
+    ))
+    rendered_candidates: list[tuple[_CandidateStrategy, tuple[float, float, float, float], Path | None]] = []
+    diagnostics: dict[_CandidateStrategy, tuple[str, ...]] = {}
+    border_closed: dict[_CandidateStrategy, bool | None] = {
+        _CandidateStrategy.BORDER_ENCLOSED: None,
+    }
+    page_width: float | None = None
+    if source_pdf is not None and source_pdf.exists() and work_dir is not None:
+        doc = fitz.open(source_pdf)
+        try:
+            if 1 <= asset.page_number <= doc.page_count:
+                page = doc[asset.page_number - 1]
+                page_width = float(page.rect.width)
+                if asset.caption_rect is not None and asset.kind in {"figure", "table"}:
+                    left, right = _conservative_caption_column_bounds(page, asset.caption_rect)
+                    merged = _merge_rects([asset.rect, asset.caption_rect])
+                    geometry = [
+                        (
+                            strategy,
+                            (
+                                left if strategy == _CandidateStrategy.TEXT_HEURISTIC else min(candidate_bbox[0], asset.caption_rect.x0),
+                                min(candidate_bbox[1], asset.caption_rect.y0),
+                                right if strategy == _CandidateStrategy.TEXT_HEURISTIC else max(candidate_bbox[2], asset.caption_rect.x1),
+                                max(candidate_bbox[3], asset.caption_rect.y1),
+                            ),
+                        )
+                        for strategy, candidate_bbox in geometry
+                    ]
+                    # The full-column candidate preserves the object's vertical
+                    # boundaries while recovering content lost on either side.
+                    geometry = [
+                        (strategy, candidate_bbox if strategy != _CandidateStrategy.TEXT_HEURISTIC else (left, merged.y0, right, merged.y1))
+                        for strategy, candidate_bbox in geometry
+                    ]
+                candidate_dir = work_dir / "asset-candidates" / f"asset-{asset_index:02d}"
+                candidate_dir.mkdir(parents=True, exist_ok=True)
+                for strategy, candidate_bbox in geometry:
+                    rect = fitz.Rect(candidate_bbox) & page.rect
+                    if rect.is_empty or rect.width < 20 or rect.height < 12:
+                        continue
+                    geometry_key = hashlib.sha256(
+                        ",".join(f"{value:.3f}" for value in rect).encode("ascii")
+                    ).hexdigest()[:10]
+                    path = candidate_dir / f"{strategy.value}-{geometry_key}.png"
+                    _save_clip(page, rect, path, padding=2, scale=4)
+                    integrity = _inspect_crop_integrity(path, kind=asset.kind)
+                    if integrity and integrity.clipped_sides:
+                        diagnostics[strategy] = tuple(
+                            f"edge_cutoff:{side}" for side in integrity.clipped_sides
+                        )
+                    rendered_candidates.append((strategy, tuple(float(value) for value in rect), path))
+                    if asset.kind == "table":
+                        candidate_asset = PaperAsset(
+                            "table",
+                            asset.page_number,
+                            path,
+                            asset.caption,
+                            asset.text,
+                            rect=rect,
+                            caption_rect=asset.caption_rect,
+                        )
+                        border_closed[strategy] = _table_border_closed(source_pdf, candidate_asset)
+        finally:
+            doc.close()
+    if not rendered_candidates:
+        rendered_candidates = [
+            (strategy, candidate_bbox, asset.path)
+            for strategy, candidate_bbox in geometry
+        ]
     return build_asset_candidate_pool(
         evidence,
-        ((strategy, candidate_bbox, asset.path) for strategy, candidate_bbox in geometry),
-        border_closed={
-            _CandidateStrategy.BORDER_ENCLOSED: True if asset.kind == "table" else None,
-        },
+        rendered_candidates,
+        border_closed=border_closed,
         object_bboxes=adjacent,
+        page_width=page_width,
+        candidate_diagnostics=diagnostics,
     )
+
+
+def _commit_selected_asset_candidates(
+    assets: list[PaperAsset],
+    pools: list[_AssetCandidatePool],
+) -> list[PaperAsset]:
+    """Transactionally make selected candidate bitmaps the workflow incumbent."""
+
+    pools_by_identity = {
+        (
+            pool.evidence.page_number,
+            pool.evidence.object_type,
+            _clean_xml_text(pool.evidence.caption_text),
+        ): pool
+        for pool in pools
+    }
+    committed: list[PaperAsset] = []
+    for asset in assets:
+        identity = (
+            asset.page_number,
+            asset.kind,
+            _clean_xml_text(asset.caption),
+        )
+        pool = pools_by_identity.get(identity)
+        selected = pool.selected if pool is not None else None
+        if selected is None or selected.image_path is None or not selected.image_path.exists():
+            committed.append(asset)
+            continue
+
+        selected_rect = fitz.Rect(selected.bbox)
+        if asset.rect is not None and asset.caption_rect is not None:
+            # Candidate geometry includes the caption because it describes the
+            # rendered bitmap. PaperAsset.rect remains the object body used by
+            # border, overlap, and repair checks; only adopt horizontal recovery
+            # here and keep the original object/caption vertical separation.
+            selected_rect = fitz.Rect(
+                selected_rect.x0,
+                asset.rect.y0,
+                selected_rect.x1,
+                asset.rect.y1,
+            )
+        committed.append(
+            PaperAsset(
+                asset.kind,
+                asset.page_number,
+                selected.image_path,
+                asset.caption,
+                asset.text,
+                latex=asset.latex,
+                rect=selected_rect,
+                caption_rect=asset.caption_rect,
+            )
+        )
+    return committed
 
 
 def _asset_is_captioned(asset: PaperAsset) -> bool:
@@ -1857,6 +2080,238 @@ def _capture_formula_blocks_from_doc(
         if formula_label:
             selected_formula_labels.add(formula_label)
     return assets
+
+
+def _formula_reference_numbers(summary: str) -> list[str]:
+    """Return numbered formulas explicitly discussed in the key-formula section."""
+
+    body = _subsection_body(summary, "关键公式") or summary
+    numbers: list[str] = []
+    pattern = re.compile(
+        r"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*"
+        r"([0-9一二三四五六七八九十]+[A-Za-z]?)"
+    )
+    for match in pattern.finditer(body):
+        value = str(match.group(1)).strip()
+        value = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}.get(value, value)
+        if value not in numbers and re.fullmatch(r"[0-9]{1,2}[A-Za-z]?", value):
+            numbers.append(value)
+    return numbers
+
+
+def _ensure_formula_evidence_disclosure(
+    summary: str,
+    assets: list[PaperAsset],
+    formula_candidates: list[str] | None = None,
+) -> str:
+    """Prevent prose about an absent equation from masquerading as evidence."""
+
+    if any(asset.kind == "formula" for asset in assets) or formula_candidates:
+        return summary
+    lines = summary.splitlines()
+    heading_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^###\s*关键公式\s*$", line.strip())
+        ),
+        None,
+    )
+    if heading_index is None:
+        return summary
+    end_index = len(lines)
+    for index in range(heading_index + 1, len(lines)):
+        if re.match(r"^#{1,3}\s+", lines[index].strip()):
+            end_index = index
+            break
+    existing = "\n".join(lines[heading_index + 1 : end_index])
+    disclosure = (
+        "原文没有给出可独立截取的编号公式或显示方程。本节只解释正文和方法图中明确出现的调度符号与机制关系，"
+        "不把通用 Q-learning 等式补写成论文原始公式。"
+    )
+    if disclosure in existing:
+        return summary
+    lines[heading_index + 1 : heading_index + 1] = [disclosure, ""]
+    return "\n".join(lines)
+
+
+def _formula_asset_number(asset: PaperAsset) -> str:
+    label = _compact_asset_label(_original_asset_label(asset))
+    match = re.match(r"^公式([0-9]+[A-Za-z]?)$", label)
+    return match.group(1) if match else ""
+
+
+def _capture_formula_asset_by_number(
+    source_pdf: Path,
+    work_dir: Path,
+    number: str,
+) -> PaperAsset | None:
+    """Capture one numbered equation without spending a model/OCR call."""
+
+    try:
+        doc = fitz.open(source_pdf)
+    except Exception:
+        return None
+    candidates: list[tuple[float, int, fitz.Rect, str]] = []
+    try:
+        for page_index in range(doc.page_count):
+            page = doc[page_index]
+            lines = _page_text_lines(page)
+            for line in lines:
+                if _equation_number_token(line.text) != number:
+                    continue
+                rect, text = _numbered_formula_clip(page, line, lines)
+                if rect.is_empty or rect.width < 45 or rect.height < 8 or not text:
+                    continue
+                math_text = re.sub(r"[\(\[（]\s*\d+[A-Za-z]?\s*[\)\]）]", "", text)
+                if not _line_has_formula_syntax(math_text):
+                    # Parenthesized list items such as "validation: (1)" are
+                    # not equation anchors.
+                    continue
+                probe = PaperAsset("formula", page_index + 1, Path(""), "", text=text)
+                if _formula_asset_number(probe) != number:
+                    continue
+                # The number token is a stronger source anchor than generic
+                # formula heuristics.  The tight clip deliberately excludes
+                # adjacent prose, so do not reject it solely because a PDF
+                # exposes the equation as several text fragments.
+                candidates.append((100.0, page_index, rect, text))
+        if not candidates:
+            return None
+        _score, page_index, rect, text = max(candidates, key=lambda item: item[0])
+        page_no = page_index + 1
+        target_dir = work_dir / "referenced-formulas"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / f"page-{page_no:03d}-formula-{number}.png"
+        _save_clip(doc[page_index], rect, path, padding=0)
+        _trim_formula_edge_fragments(path)
+        return PaperAsset(
+            "formula",
+            page_no,
+            path,
+            f"公式 {number} 截图：原文公式本体见截图，正文解释变量含义和工程作用",
+            text=text,
+            rect=rect,
+        )
+    finally:
+        doc.close()
+
+
+def _numbered_formula_clip(
+    page: fitz.Page,
+    number_line: TextLine,
+    lines: list[TextLine],
+) -> tuple[fitz.Rect, str]:
+    """Return a tight equation crop anchored by its printed number token."""
+
+    left, right = _column_bounds(page, number_line.rect)
+    # Keep the band tight enough to exclude the preceding prose and the next
+    # displayed equation in a numbered stack, while retaining superscripts
+    # and subscripts around the number row.
+    top = number_line.rect.y0 - 11.0
+    bottom = number_line.rect.y1 + 7.0
+    selected: list[TextLine] = []
+    formula_parts: list[str] = []
+    for line in lines:
+        if line.rect.y1 < top or line.rect.y0 > bottom:
+            continue
+        overlap = min(line.rect.x1, right) - max(line.rect.x0, left)
+        if overlap < 2.0:
+            continue
+        selected.append(line)
+        if (
+            line is number_line
+            or _is_formula_continuation_line(line.text)
+            or _line_has_formula_syntax(line.text)
+        ):
+            formula_parts.append(_clean_xml_text(line.text).strip())
+    if not selected:
+        return fitz.Rect(), ""
+    rect = _merge_rects([line.rect for line in selected])
+    rect = fitz.Rect(
+        max(page.rect.x0, left, rect.x0 - 18.0),
+        max(page.rect.y0, rect.y0 - 4.0),
+        min(page.rect.x1, right, rect.x1 + 18.0),
+        min(page.rect.y1, rect.y1 + 8.0),
+    )
+    return rect, " ".join(part for part in formula_parts if part)
+
+
+def _align_referenced_formula_assets(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    source_pdf: Path | None,
+    work_dir: Path | None,
+    max_assets: int | None,
+) -> str:
+    """Make explicit formula references point to real, embeddable screenshots."""
+
+    numbers = _formula_reference_numbers(summary)
+    if not numbers or source_pdf is None or work_dir is None:
+        return summary
+
+    existing = {
+        _formula_asset_number(asset): asset
+        for asset in assets
+        if asset.kind == "formula" and _formula_asset_number(asset)
+    }
+    budget = max_assets if max_assets is not None else len(assets) + len(numbers)
+    budget = max(1, int(budget))
+    changed = False
+    for number in numbers:
+        current = existing.get(number)
+        if current is not None and current.path.exists():
+            continue
+        candidate = _capture_formula_asset_by_number(source_pdf, work_dir, number)
+        if candidate is None:
+            continue
+        # Formula extraction often finds an unnumbered continuation or a
+        # nearby prose fragment first.  Reuse that formula slot when the
+        # report already references it, so max_assets cannot prevent a real
+        # numbered equation from replacing a weaker crop.  Keeping the list
+        # position preserves existing [[ASSET:n]] markers and downstream
+        # sidecar compatibility.
+        replace_index = next(
+            (
+                index
+                for index, asset in enumerate(assets)
+                if asset.kind == "formula"
+                and not _formula_asset_number(asset)
+            ),
+            None,
+        )
+        if replace_index is not None:
+            # Replacement is correct even when the slot is already marked:
+            # the marker keeps its id and now points to the numbered crop.
+            assets[replace_index] = candidate
+            existing[number] = candidate
+            changed = True
+            continue
+        if len(assets) >= budget:
+            marker_ids = {
+                int(match.group(1))
+                for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", summary)
+            }
+            replace_index = next(
+                (
+                    index
+                    for index, asset in enumerate(assets)
+                    if asset.kind == "formula"
+                    and index + 1 not in marker_ids
+                    and _formula_asset_number(asset) not in numbers
+                ),
+                None,
+            )
+            if replace_index is None:
+                continue
+            assets[replace_index] = candidate
+        else:
+            assets.append(candidate)
+        existing[number] = candidate
+        changed = True
+
+    return _ensure_asset_markers(summary, assets) if changed else summary
 
 
 def _page_text_lines(page: fitz.Page) -> list[TextLine]:
@@ -2130,7 +2585,12 @@ def _formula_block_text(lines: list[TextLine], rect: fitz.Rect) -> str:
         line_mid = (line.rect.y0 + line.rect.y1) / 2
         if line_mid < rect.y0 - 1 or line_mid > rect.y1 + 1:
             continue
-        if line.rect.x1 < rect.x0 - 1 or line.rect.x0 > rect.x1 + 1:
+        horizontal_overlap = min(line.rect.x1, rect.x1) - max(line.rect.x0, rect.x0)
+        # A formula crop can intentionally overhang the column gutter.  A
+        # one-pixel/tiny overlap with the adjacent column is not evidence that
+        # its prose belongs to the equation, and used to poison otherwise
+        # valid numbered formula candidates in two-column papers.
+        if horizontal_overlap < 2.0:
             continue
         text = _clean_xml_text(line.text).strip()
         if text:
@@ -2304,7 +2764,7 @@ def _capture_captioned_figures(
             visual_rect = _fallback_visual_rect_for_caption(page, line.rect, lines)
         if visual_rect is None:
             continue
-        clip_rect = _merge_rects([visual_rect, caption_rect])
+        clip_rect = _captioned_object_clip_rect(page, caption_rect, visual_rect)
         min_height = 50 if clip_rect.width >= 420 else 80
         if clip_rect.height < min_height or clip_rect.width < 80:
             continue
@@ -2378,15 +2838,24 @@ def _caption_is_figure(caption: str) -> bool:
     stripped = caption.strip()
     if stripped.startswith("图"):
         return True
-    return bool(re.match(r"(?i)^(?:figure|fig\.?)\s*\d+[A-Za-z]?\s*(?:[.:：]|\|)", stripped))
+    return bool(
+        re.match(
+            r"(?i)^(?:figure|fig\.?)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\s*(?:[.:：]|\||$)",
+            stripped,
+        )
+    )
 
 
 def _caption_is_table(caption: str) -> bool:
-    lowered = caption.strip().lower()
     stripped = caption.strip()
     if stripped.startswith("表"):
         return True
-    return bool(re.match(r"(?i)^(?:table|tab\.)\s*\d+[A-Za-z]?\s*(?:[.:：]|\|)", stripped))
+    return bool(
+        re.match(
+            r"(?i)^(?:table|tab\.)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\s*(?:[.:：]|\||$)",
+            stripped,
+        )
+    )
 
 
 def _table_rect_for_caption(
@@ -2394,6 +2863,13 @@ def _table_rect_for_caption(
     caption_rect: fitz.Rect,
     lines: list[TextLine],
 ) -> tuple[fitz.Rect | None, str]:
+    # Table captions are not consistently placed in scientific PDFs.  When a
+    # page has horizontal table rules, they are stronger evidence than the
+    # nearest text row and let us recover both caption-above and
+    # caption-below layouts without guessing from numeric density.
+    bordered_rect, bordered_text = _border_enclosed_table_rect_for_caption(page, caption_rect)
+    if bordered_rect is not None:
+        return bordered_rect, bordered_text[:2500]
     detected_rect, detected_text = _detected_table_rect_for_caption(page, caption_rect)
     if detected_rect is not None:
         return detected_rect, detected_text
@@ -2401,6 +2877,144 @@ def _table_rect_for_caption(
     if below_rect is not None:
         return below_rect, below_text
     return _table_rect_above_caption(page, caption_rect, lines)
+
+
+def _border_enclosed_table_rect_for_caption(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+) -> tuple[fitz.Rect | None, str]:
+    """Recover a table from its top/bottom rules in either caption layout.
+
+    ``find_tables`` is intentionally conservative and may return only a few
+    cells for borderless or multi-column tables.  A pair of long horizontal
+    rules is a better object boundary when the PDF has them.  We require a
+    nearby rule pair so a page separator or an unrelated line cannot turn into
+    a table candidate.
+    """
+
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return None, ""
+    # Keep the pure text heuristic available for lightweight test doubles and
+    # alternate PDF adapters that expose drawings but not text extraction.
+    if not hasattr(page, "get_textbox"):
+        return None, ""
+
+    left, right = _caption_column_bounds(page, caption_rect)
+    rules: list[fitz.Rect] = []
+    minimum_width = max(80.0, min(page.rect.width * 0.45, (right - left) * 0.72))
+    for drawing in drawings:
+        raw_rect = drawing.get("rect")
+        if not raw_rect:
+            continue
+        rule = fitz.Rect(raw_rect)
+        if rule.width < minimum_width or rule.height > 2.5:
+            continue
+        if (
+            _horizontal_overlap_fraction(rule, left, right) < 0.72
+            and rule.width < page.rect.width * 0.72
+        ):
+            continue
+        rules.append(rule)
+    if len(rules) < 2:
+        return None, ""
+    rules.sort(key=lambda item: (item.y0, item.x0))
+
+    def compatible(rule: fitz.Rect, anchor: fitz.Rect) -> bool:
+        if (
+            rule.width >= page.rect.width * 0.72
+            and anchor.width >= page.rect.width * 0.72
+        ):
+            return True
+        overlap = min(rule.x1, anchor.x1) - max(rule.x0, anchor.x0)
+        return overlap / max(1.0, min(rule.width, anchor.width)) >= 0.72
+
+    candidates: list[tuple[float, fitz.Rect, str]] = []
+
+    # Caption below the table: the nearest lower rule is the table bottom.
+    below_bottoms = [
+        rule
+        for rule in rules
+        if rule.y1 <= caption_rect.y0 + 3
+        and caption_rect.y0 - rule.y1 <= 80
+    ]
+    if below_bottoms:
+        bottom = max(below_bottoms, key=lambda item: item.y1)
+        top_candidates = [
+            rule
+            for rule in rules
+            if rule.y1 < bottom.y0 - 18
+            and bottom.y0 - rule.y1 <= min(380.0, page.rect.height * 0.5)
+            and compatible(rule, bottom)
+        ]
+        paired_tops = [
+            rule
+            for rule in top_candidates
+            if any(
+                8 <= next_rule.y0 - rule.y1 <= 32
+                and compatible(next_rule, bottom)
+                for next_rule in rules
+            )
+        ]
+        top = min(paired_tops or top_candidates, key=lambda item: item.y0, default=None)
+        if top is not None:
+            rect = fitz.Rect(
+                max(page.rect.x0, min(top.x0, bottom.x0)),
+                max(page.rect.y0, top.y0),
+                min(page.rect.x1, max(top.x1, bottom.x1)),
+                min(page.rect.y1, bottom.y1),
+            )
+            if rect.width >= 80 and rect.height >= 30:
+                candidates.append(
+                    (
+                        max(0.0, caption_rect.y0 - bottom.y1),
+                        rect,
+                        _clean_xml_text(page.get_textbox(rect)).strip(),
+                    )
+                )
+
+    # Caption above the table: the nearest upper rule is the table top and the
+    # next compatible rule after it is the table bottom.  Stop before a later
+    # caption so two stacked tables cannot be merged.
+    above_tops = [
+        rule
+        for rule in rules
+        if rule.y0 >= caption_rect.y1 - 3
+        and rule.y0 - caption_rect.y1 <= 80
+    ]
+    if above_tops:
+        top = min(above_tops, key=lambda item: item.y0)
+        lower_rules = [
+            rule
+            for rule in rules
+            if rule.y0 > top.y1 + 18
+            and rule.y0 - top.y1 <= min(380.0, page.rect.height * 0.5)
+            and compatible(rule, top)
+        ]
+        bottom = max(lower_rules, key=lambda item: item.y1, default=None)
+        if bottom is not None:
+            rect = fitz.Rect(
+                max(page.rect.x0, min(top.x0, bottom.x0)),
+                max(page.rect.y0, top.y0),
+                min(page.rect.x1, max(top.x1, bottom.x1)),
+                min(page.rect.y1, bottom.y1),
+            )
+            if rect.width >= 80 and rect.height >= 30:
+                candidates.append(
+                    (
+                        max(0.0, top.y0 - caption_rect.y1),
+                        rect,
+                        _clean_xml_text(page.get_textbox(rect)).strip(),
+                    )
+                )
+    if not candidates:
+        return None, ""
+    _gap, rect, text = min(
+        candidates,
+        key=lambda item: (item[0], -(item[1].width * item[1].height)),
+    )
+    return rect, text
 
 
 def _detected_table_rect_for_caption(
@@ -2854,7 +3468,7 @@ def _caption_text_and_rect(
     kind: str,
 ) -> tuple[str, fitz.Rect]:
     caption_line = lines[caption_index]
-    seed_indices = _caption_same_row_indices(lines, caption_index)
+    seed_indices = _caption_same_row_indices(lines, caption_index, page)
     seed_lines = [lines[index] for index in seed_indices]
     seed_rect = _merge_rects([line.rect for line in seed_lines])
     left, right = _caption_column_bounds(page, seed_rect)
@@ -2891,6 +3505,8 @@ def _caption_text_and_rect(
             break
         if previous is not None and re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Za-z]", row_text):
             break
+        if previous is not None and _caption_row_starts_adjacent_visual(ordered):
+            break
         if kind == "figure":
             if len(caption_lines) >= max_rows:
                 break
@@ -2915,9 +3531,28 @@ def _caption_text_and_rect(
     return _clean_xml_text(caption_text), caption_rect
 
 
-def _caption_same_row_indices(lines: list[TextLine], caption_index: int) -> list[int]:
+def _caption_row_starts_adjacent_visual(lines: list[TextLine]) -> bool:
+    """Detect subfigure headings that belong to the next visual object."""
+
+    labels = [
+        line
+        for line in lines
+        if re.match(r"^\s*[\(（][A-Za-z0-9]+[\)）]\s+\S+", _clean_xml_text(line.text))
+    ]
+    if len(labels) < 2:
+        return False
+    centers = sorted((line.rect.x0 + line.rect.x1) / 2 for line in labels)
+    return centers[-1] - centers[0] >= 70
+
+
+def _caption_same_row_indices(
+    lines: list[TextLine],
+    caption_index: int,
+    page: fitz.Page,
+) -> list[int]:
     anchor = lines[caption_index]
     anchor_mid = (anchor.rect.y0 + anchor.rect.y1) / 2
+    page_mid = page.rect.width / 2
     selected = {caption_index}
     group_rect = fitz.Rect(anchor.rect)
     changed = True
@@ -2928,6 +3563,21 @@ def _caption_same_row_indices(lines: list[TextLine], caption_index: int) -> list
                 continue
             line_mid = (line.rect.y0 + line.rect.y1) / 2
             if abs(line_mid - anchor_mid) > 3.5:
+                continue
+            # A narrow inter-column gutter is not caption continuation.  Keep
+            # a genuinely full-width continuation, but never join a line that
+            # is wholly in the opposite column from the caption anchor.
+            anchor_center = (anchor.rect.x0 + anchor.rect.x1) / 2
+            line_center = (line.rect.x0 + line.rect.x1) / 2
+            right_column_anchor = anchor_center > page_mid + 18
+            left_column_anchor = anchor_center < page_mid - 18
+            if (
+                right_column_anchor
+                and line.rect.x1 <= page_mid
+            ) or (
+                left_column_anchor
+                and line.rect.x0 >= page_mid
+            ):
                 continue
             if _caption_is_figure(line.text) or _caption_is_table(line.text):
                 continue
@@ -2971,15 +3621,90 @@ def _caption_column_bounds(page: fitz.Page, caption_rect: fitz.Rect) -> tuple[fl
         return max(0, page.rect.width * 0.05), min(page.rect.width, page.rect.width * 0.95)
     mid = page.rect.width / 2
     margin = max(28.0, page.rect.width * 0.06)
-    if caption_rect.x0 < mid < caption_rect.x1 and caption_rect.x0 > page.rect.width * 0.22:
-        return max(0, page.rect.width * 0.05), min(page.rect.width, page.rect.width * 0.95)
-    if caption_rect.x0 < mid - 20:
-        if caption_rect.x1 <= mid:
-            return _column_bounds(page, caption_rect)
-        return margin, min(page.rect.width - margin, mid + 55)
-    if caption_rect.x0 > mid + 20:
-        return max(margin, mid - 12), page.rect.width - margin
+    center = (caption_rect.x0 + caption_rect.x1) / 2
+    # A caption can cross the physical page midpoint while still belonging to
+    # one column (for example, a wide table in the right column).  Its center
+    # and width are more stable signals than x0/x1 crossing the midpoint.
+    if center >= mid + 18:
+        return max(margin, caption_rect.x0 - 14), page.rect.width - margin
+    if center <= mid - 18:
+        return margin, min(page.rect.width - margin, caption_rect.x1 + 14)
     return _column_bounds(page, caption_rect)
+
+
+def _conservative_caption_column_bounds(page: fitz.Page, caption_rect: fitz.Rect) -> tuple[float, float]:
+    """Return stable physical column bounds independent of caption width."""
+
+    if page.rect.width < 420 or caption_rect.width > page.rect.width * 0.58:
+        return _caption_column_bounds(page, caption_rect)
+    margin = max(28.0, page.rect.width * 0.055)
+    midpoint = page.rect.width / 2
+    gutter = max(7.0, page.rect.width * 0.012)
+    center = (caption_rect.x0 + caption_rect.x1) / 2
+    if center >= midpoint + 12:
+        return midpoint + gutter, page.rect.width - margin
+    if center <= midpoint - 12:
+        return margin, midpoint - gutter
+    return _caption_column_bounds(page, caption_rect)
+
+
+def _captioned_object_clip_rect(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    object_rect: fitz.Rect,
+) -> fitz.Rect:
+    """Merge an object and caption without absorbing an adjacent column."""
+
+    merged = _merge_rects([caption_rect, object_rect])
+    if (
+        object_rect.width > page.rect.width * 0.55
+        or caption_rect.width > page.rect.width * 0.55
+    ):
+        return merged & page.rect
+    left, right = _caption_column_bounds(page, object_rect)
+    clipped = fitz.Rect(max(merged.x0, left), merged.y0, min(merged.x1, right), merged.y1)
+    if clipped.is_empty or not clipped.contains(object_rect):
+        return merged & page.rect
+    return clipped & page.rect
+
+
+def _expand_composite_table_rect(
+    page: fitz.Page,
+    caption_text: str,
+    caption_rect: fitz.Rect,
+    table_rect: fitz.Rect,
+    table_text: str,
+    lines: list[TextLine],
+) -> tuple[fitz.Rect, str]:
+    """Keep both bodies when a full-width caption describes side-by-side tables."""
+
+    if (
+        caption_rect.width <= page.rect.width * 0.55
+        or table_rect.width >= page.rect.width * 0.45
+        or not re.search(r"\([ab]\)", caption_text, re.I)
+    ):
+        return table_rect, table_text
+    candidate_lines = [
+        line
+        for line in lines
+        if table_rect.y0 - 12 <= line.rect.y0 <= table_rect.y1 + 12
+        and not _caption_is_table(line.text)
+        and not _caption_is_figure(line.text)
+    ]
+    body_lines: list[TextLine] = []
+    for group in _group_lines_by_row(candidate_lines):
+        row_text = " ".join(line.text for line in group)
+        subtable_heading = any(
+            re.match(r"^\s*[\(（][ab][\)）]\s+", _clean_xml_text(line.text), re.I)
+            for line in group
+        )
+        if _row_looks_table_like(row_text, group) or subtable_heading:
+            body_lines.extend(group)
+    if not body_lines:
+        return table_rect, table_text
+    expanded = _merge_rects([table_rect, *[line.rect for line in body_lines]]) & page.rect
+    text = "\n".join(_clean_xml_text(line.text) for line in body_lines)
+    return expanded, text[:2500]
 
 
 def _visual_rect_for_caption(
@@ -2992,15 +3717,40 @@ def _visual_rect_for_caption(
     if above is None:
         return below
     if below is None:
-        return above
+        return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
 
     above_gap = max(0.0, caption_rect.y0 - above.y1)
     below_gap = max(0.0, below.y0 - caption_rect.y1)
     if above_gap <= 25:
-        return above
+        return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
     if below_gap <= 70 and (above_gap > 70 or below.height > above.height * 0.75):
         return below
-    return above
+    return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+
+
+def _trim_figure_region_by_upper_page_text(
+    page: fitz.Page,
+    region: fitz.Rect,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine],
+) -> fitz.Rect:
+    """Remove title/front-matter text accidentally merged above a first-page figure."""
+
+    left, right = _caption_column_bounds(page, caption_rect)
+    barriers = [
+        line.rect.y1
+        for line in lines
+        if region.y0 - 2 <= line.rect.y0 < region.y1
+        and _horizontal_overlap_fraction(line.rect, left, right) > 0.08
+        and _line_is_front_matter_or_body_before_figure(line.text)
+    ]
+    if not barriers:
+        return region
+    top = max(barriers) + 6
+    if top >= region.y1 - 30:
+        return region
+    trimmed = fitz.Rect(region.x0, top, region.x1, region.y1)
+    return trimmed if trimmed.width >= 40 and trimmed.height >= 30 else region
 
 
 def _visual_rect_for_caption_direction(
@@ -3093,13 +3843,21 @@ def _trim_figure_region_top_text(
 def _line_is_front_matter_or_body_before_figure(text: str) -> bool:
     if not text:
         return False
-    if "@" in text:
+    if re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, flags=re.IGNORECASE):
         return True
     lowered = text.lower()
     if lowered in {"abstract", "introduction"}:
         return True
     if re.search(r"\b(?:amazon|university|institute|college|foundation|proceedings|xplore|open access|accepted version)\b", lowered):
         return True
+    if re.search(r"\b(?:abstract|corresponding authors?|authors?)\b", lowered):
+        return True
+    if re.search(r"\b\d[A-Za-z].*(?:university|data\d|csiro)\b", text, flags=re.IGNORECASE):
+        return True
+    title_case_pairs = re.findall(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+\b", text)
+    if len(text) >= 35 and len(title_case_pairs) >= 2:
+        if not re.search(r"\b(?:figure|table|sam|model|prompt|segmentation)\b", lowered):
+            return True
     if re.search(r"\b(?:aims|recent|restoration agents|suffer|bottlenecks|models|paper)\b", lowered) and len(text) > 45:
         return True
     return False
@@ -3625,7 +4383,10 @@ def _looks_like_title_line(text: str) -> bool:
 
 def _looks_like_author_or_affiliation(text: str) -> bool:
     lowered = text.lower()
-    if any(token in lowered for token in ("university", "institute", "research", "lab", "school", "department")):
+    if re.search(
+        r"\b(?:university|institute|research|lab|laboratory|school|department)\b",
+        lowered,
+    ):
         return True
     if re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+[0-9]?\b", text) and "," in text:
         return True
@@ -3641,6 +4402,8 @@ def _extract_formula_candidates(text: str, limit: int = 8) -> list[str]:
         line = _clean_xml_text(raw_line).strip()
         if not _looks_like_formula(line):
             continue
+        if _formula_candidate_is_code(line):
+            continue
         if _formula_line_is_prose_fragment(line):
             continue
         normalized = _textualize_latex(line)
@@ -3650,6 +4413,21 @@ def _extract_formula_candidates(text: str, limit: int = 8) -> list[str]:
         if len(candidates) >= limit:
             break
     return candidates[:limit]
+
+
+def _formula_candidate_is_code(line: str) -> bool:
+    """Keep code expressions from becoming mandatory math screenshots."""
+
+    compact = re.sub(r"\s+", "", line).lower()
+    lowered = line.lower()
+    return bool(
+        any(token in lowered for token in ("#pragma", "extern \"c\"", "hls::", "std::"))
+        or any(token in compact for token in ("p_size", "result[", "a[", "b[", "c[", "ii=", "loop_tripcount"))
+        or re.match(r"^(?:for|while|if)\s*\(", lowered)
+        or ";" in line
+        or "{" in line
+        or "}" in line
+    )
 
 
 def _known_formula_seeds(text: str) -> list[str]:
@@ -4627,7 +5405,7 @@ def _integrate_summary_with_codex(
     usable_partials = _usable_partial_summaries(partial_summaries or [], len(chunk_notes))
     if usable_partials:
         try:
-            return _integrate_summary_from_partials_with_codex(
+            candidate = _integrate_summary_from_partials_with_codex(
                 client,
                 model,
                 chunk_notes,
@@ -4639,6 +5417,7 @@ def _integrate_summary_with_codex(
                 correction_memories,
                 prompt_patches,
             )
+            return _require_complete_report_draft(candidate)
         except RuntimeError as exc:
             return _fast_integrate_summary_with_codex(
                 client,
@@ -4674,13 +5453,15 @@ def _integrate_summary_with_codex(
         f"可用图表截图：\n{asset_context}\n\n分段笔记：\n{final_input}"
     )
     try:
-        return _chat(
+        candidate = _chat(
             client,
             model,
             prompt,
             system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
             max_tokens=5200,
+            max_attempts=1,
         )
+        return _require_complete_report_draft(candidate)
     except RuntimeError as exc:
         return _fast_integrate_summary_with_codex(
             client,
@@ -4809,6 +5590,7 @@ def _integrate_summary_from_partials_with_codex(
         prompt,
         system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
         max_tokens=5200,
+        max_attempts=1,
     )
 
 
@@ -4924,13 +5706,15 @@ def _fast_integrate_summary_with_codex(
         f"分段笔记：\n{compact_notes}"
     )
     try:
-        return _chat(
+        candidate = _chat(
             client,
             model,
             prompt,
             system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
             max_tokens=3600,
+            max_attempts=1,
         )
+        return _require_complete_report_draft(candidate)
     except RuntimeError as exc:
         raise RuntimeError(
             "总结质量自检未通过：完整整合和快速整合都超时，已停止生成 Word，避免输出不可读的原文摘录版报告。"
@@ -4938,6 +5722,33 @@ def _fast_integrate_summary_with_codex(
             f"快速整合错误：{_clean_xml_text(str(exc))[:220]}。"
             "请降低 CODEX_SUMMARY_CONCURRENCY，或提高/修复 CODEX_TIMEOUT_SECONDS 后重试。"
         ) from exc
+
+
+def _report_draft_contract_errors(summary: str) -> list[str]:
+    """Return errors that prevent a model candidate becoming the report incumbent."""
+
+    normalized = _normalize_final_sections(_postprocess_summary(summary or ""))
+    if not normalized:
+        return ["接口返回空内容"]
+    if _looks_like_sse_payload(normalized):
+        return ["接口返回了 SSE 控制帧而不是报告正文"]
+    errors: list[str] = []
+    if not re.search(r"(?m)^#\s+\S", normalized):
+        errors.append("缺少报告标题")
+    missing = _missing_required_report_sections(normalized)
+    if missing:
+        errors.append("缺少必需章节：" + "、".join(missing))
+    if _compact_text_len(normalized) < 900:
+        errors.append("报告正文过短")
+    return errors
+
+
+def _require_complete_report_draft(summary: str) -> str:
+    normalized = _normalize_final_sections(_postprocess_summary(summary))
+    errors = _report_draft_contract_errors(normalized)
+    if errors:
+        raise RuntimeError("最终整合候选不满足报告契约：" + "；".join(errors))
+    return normalized
 
 
 def _truncate_middle(text: str, max_chars: int) -> str:
@@ -4968,6 +5779,10 @@ def _verify_summary_claims(
     prompt_patches: list[PromptPatch] | None = None,
     guard_names: set[str] | None = None,
     source_pdf: Path | None = None,
+    work_dir: Path | None = None,
+    max_assets: int | None = None,
+    prior_verification: VerificationResult | None = None,
+    formula_candidates: list[str] | None = None,
 ) -> tuple[str, VerificationResult, list[GuardResult]]:
     client = _coerce_codex_client(client)
     summary = _postprocess_summary(summary)
@@ -4985,10 +5800,15 @@ def _verify_summary_claims(
     )
     summary = _enforce_core_original_title(summary, paper_title)
     summary = _ensure_chinese_report_title(summary)
-    summary = _remove_mismatched_asset_markers(summary, assets)
-    summary = _ensure_asset_markers(summary, assets)
-    summary = _remove_mismatched_asset_markers(summary, assets)
-    summary = _suppress_formula_text_when_assets_present(summary, assets)
+    summary = _enrich_core_info_from_pdf(summary, source_pdf)
+    summary = _compile_report_asset_references(
+        summary,
+        assets,
+        source_pdf=source_pdf,
+        work_dir=work_dir,
+        max_assets=max_assets,
+        formula_candidates=formula_candidates,
+    )
     _assert_summary_quality(summary)
     claims = _extract_verifiable_claims(summary)
     grounded_map = _attach_claims_to_grounding_map(grounding_map, claims)
@@ -5002,6 +5822,7 @@ def _verify_summary_claims(
         model,
         guard_names=guard_names,
         source_pdf=source_pdf,
+        formula_candidates=formula_candidates,
     )
     guard_errors = _blocking_guard_errors(guard_results)
     if _summary_is_degraded_fallback(summary):
@@ -5054,14 +5875,19 @@ def _verify_summary_claims(
             ],
         )
         return summary, verification, guard_results
-    verification = _run_verification_agent(
-        client,
-        model,
-        paper_text,
-        grounded_map,
-        correction_memories or [],
-        prompt_patches,
+    verification = _verification_for_targeted_guard_recheck(
+        prior_verification,
+        guard_names,
     )
+    if verification is None:
+        verification = _run_verification_agent(
+            client,
+            model,
+            paper_text,
+            grounded_map,
+            correction_memories or [],
+            prompt_patches,
+        )
     verification.findings = _aggregate_findings(
         [*verification.findings, *[finding for guard in guard_results for finding in guard.findings]]
     )
@@ -5069,6 +5895,71 @@ def _verify_summary_claims(
         _add_guard_failures_to_verification(verification, guard_errors, guard_results)
         verification.passed = False
     return summary, verification, guard_results
+
+
+def _compile_report_asset_references(
+    summary: str,
+    assets: list[PaperAsset],
+    *,
+    source_pdf: Path | None = None,
+    work_dir: Path | None = None,
+    max_assets: int | None = None,
+    formula_candidates: list[str] | None = None,
+) -> str:
+    """Compile semantic figure/table/formula references into stable markers.
+
+    LLM output is treated as a report draft. Marker placement and manifest
+    alignment are deterministic compiler work and must be repeated after every
+    report rewrite or asset mutation before any guard evaluates the artifact.
+    """
+
+    summary = _ensure_formula_evidence_disclosure(summary, assets, formula_candidates)
+    summary = _align_referenced_formula_assets(
+        summary,
+        assets,
+        source_pdf=source_pdf,
+        work_dir=work_dir,
+        max_assets=max_assets,
+    )
+    summary = _remove_mismatched_asset_markers(summary, assets)
+    summary = _ensure_asset_markers(summary, assets)
+    summary = _ensure_primary_result_table_marker(summary, assets)
+    summary = _ensure_key_formula_markers(summary, assets)
+    summary = _remove_mismatched_asset_markers(summary, assets)
+    return _suppress_formula_text_when_assets_present(summary, assets)
+
+
+def _verification_for_targeted_guard_recheck(
+    prior: VerificationResult | None,
+    guard_names: set[str] | None,
+) -> VerificationResult | None:
+    """Reuse content verification when a repair changed only visual assets."""
+
+    asset_guards = {"Asset Guard", "Visual Asset Guard"}
+    if prior is None or not guard_names or not guard_names.issubset(asset_guards):
+        return None
+    non_guard_failures = [
+        failure
+        for failure in prior.hard_failures
+        if str(failure.get("type", "")) != "guard_failure"
+    ]
+    if non_guard_failures or prior.patch_suggestions:
+        return None
+    retained_findings = [
+        finding
+        for finding in prior.findings
+        if finding.asset_id is None and finding.severity != "error"
+    ]
+    return VerificationResult(
+        True,
+        [],
+        hard_failures=[],
+        soft_warnings=list(prior.soft_warnings),
+        patch_suggestions=[],
+        revision_attempted=prior.revision_attempted,
+        revision_applied=prior.revision_applied,
+        findings=retained_findings,
+    )
 
 
 def _summary_is_degraded_fallback(summary: str) -> bool:
@@ -5153,6 +6044,7 @@ def _repair_report_substance_if_needed(
         paper_title,
         assets,
         issues,
+        base_summary=summary,
     )
     return _normalize_final_sections(repaired)
 
@@ -5165,6 +6057,12 @@ def _report_substance_issues(summary: str) -> list[str]:
         body = _section_body(summary, title)
         if body and _section_is_generic_filler(body):
             issues.append(f"{title} 疑似模板兜底，不是实质论文内容")
+    background = _section_body(summary, "背景与问题")
+    if background:
+        background_body = re.sub(r"(?m)^#{1,6}\s+.*$", "", background)
+        paragraphs = [item.strip() for item in re.split(r"\n\s*\n", background_body) if item.strip()]
+        if _compact_text_len(background_body) < 240 or len(paragraphs) < 2:
+            issues.append("背景与问题信息量不足：至少需要两个证据化自然段，覆盖研究背景、现实痛点和具体问题")
     return list(dict.fromkeys(issues))
 
 
@@ -5190,6 +6088,42 @@ def _section_is_english_heavy(section: str) -> bool:
     return latin_letters > 220 and cjk_chars < 80
 
 
+def _substance_issue_sections(summary: str, issues: list[str]) -> tuple[str, ...]:
+    """Map quality findings to the smallest report sections that can fix them."""
+
+    ordered = tuple(section for section in _required_report_section_order() if section != "核心信息")
+    selected: set[str] = set()
+    for issue in issues:
+        selected.update(section for section in ordered if section in issue)
+        if "中文正文内容过少" in issue or "必要章节覆盖不足" in issue:
+            selected.update(_missing_required_report_sections(summary))
+            selected.update(_too_short_required_sections(summary))
+    return tuple(section for section in ordered if section in selected)
+
+
+def _replace_report_section_body(summary: str, section: str, body: str) -> str:
+    """Replace one level-two section without regenerating its neighbors."""
+
+    body = body.strip()
+    pattern = re.compile(
+        rf"(?ms)(^##\s*{re.escape(section)}\s*\n).*?(?=^##\s+|\Z)"
+    )
+    if pattern.search(summary):
+        return pattern.sub(lambda match: f"{match.group(1)}{body}\n\n", summary, count=1)
+
+    lines = summary.splitlines()
+    order = list(_required_report_section_order())
+    section_index = order.index(section)
+    later = set(order[section_index + 1 :])
+    insert_at = len(lines)
+    for index, line in enumerate(lines):
+        if line.startswith("##") and line.strip().lstrip("#").strip() in later:
+            insert_at = index
+            break
+    lines[insert_at:insert_at] = [f"## {section}", body, ""]
+    return "\n".join(lines)
+
+
 def _synthesize_report_by_sections_with_codex(
     client: openai.OpenAI | None,
     model: str,
@@ -5199,47 +6133,34 @@ def _synthesize_report_by_sections_with_codex(
     paper_title: str,
     assets: list[PaperAsset],
     issues: list[str],
+    *,
+    base_summary: str = "",
 ) -> str:
     client = _coerce_codex_client(client)
-    section_bodies: dict[str, str] = {
-        "核心信息": _complete_core_info_body("", paper_title),
-    }
+    report = base_summary or f"# {paper_title or '论文精读笔记'}"
     asset_context = _asset_context(assets[:8], text_preview_chars=160, latex_preview_chars=300)
-    for section in (
-        "摘要",
-        "背景与问题",
-        "创新点",
-        "一句话总结",
-        "方法主线",
-        "关键结果",
-        "深度分析",
-        "局限",
-        "总结",
-    ):
+    for section in _substance_issue_sections(report, issues):
         evidence = _section_evidence_for_report(section, paper_text, grounding_map, abstract)
-        body = _synthesize_report_section_with_codex(
-            client,
-            model,
-            section,
-            evidence,
-            abstract,
-            paper_title,
-            asset_context,
-            issues,
-        )
-        section_bodies[section] = body
-
-    result = [f"# {paper_title or '论文精读笔记'}"]
-    for section in _required_report_section_order():
-        result.extend(["", f"## {section}", section_bodies.get(section, "").strip()])
-    report = _normalize_final_sections("\n".join(result))
-    remaining_issues = _report_substance_issues(report)
-    if remaining_issues:
-        raise RuntimeError(
-            "总结质量自检未通过：逐章节重写后仍未达到可交付质量，已停止生成 Word："
-            + "；".join(remaining_issues[:8])
-        )
-    return report
+        try:
+            body = _synthesize_report_section_with_codex(
+                client,
+                model,
+                section,
+                evidence,
+                abstract,
+                paper_title,
+                asset_context,
+                issues,
+            )
+        except RuntimeError as exc:
+            logger.warning("Section repair skipped for %s: %s", section, exc)
+            continue
+        candidate = _replace_report_section_body(report, section, body)
+        if not _report_section_repair_is_safe(report, candidate, section, body):
+            logger.warning("Section repair rejected transactionally for %s", section)
+            continue
+        report = candidate
+    return _normalize_final_sections(report)
 
 
 def _synthesize_report_section_with_codex(
@@ -5272,11 +6193,28 @@ def _synthesize_report_section_with_codex(
         prompt,
         system_prompt=SYNTHESIZER_SYSTEM_PROMPT,
         max_tokens=1200 if section != "方法主线" else 1700,
+        max_attempts=1,
     )
     body = _strip_section_heading(_postprocess_summary(body), section).strip()
     if not body or _section_is_english_heavy(body) or _section_is_generic_filler(body):
         raise RuntimeError(f"总结质量自检未通过：{section} 章节重写后仍不可用。")
     return body
+
+
+def _report_section_repair_is_safe(previous: str, candidate: str, section: str, body: str) -> bool:
+    """Commit a section patch only when it cannot damage healthy neighbors."""
+
+    if _looks_like_sse_payload(body) or re.search(r"(?m)^#{1,2}\s+", body):
+        return False
+    if not _section_body(candidate, section).strip():
+        return False
+    previous_missing = set(_missing_required_report_sections(previous))
+    candidate_missing = set(_missing_required_report_sections(candidate))
+    if not candidate_missing.issubset(previous_missing):
+        return False
+    previous_errors = set(_format_guard(previous).errors)
+    candidate_errors = set(_format_guard(candidate).errors)
+    return not (candidate_errors - previous_errors)
 
 
 def _section_evidence_for_report(
@@ -5373,10 +6311,11 @@ def _run_harness_guards(
     model: str = "",
     guard_names: set[str] | None = None,
     source_pdf: Path | None = None,
+    formula_candidates: list[str] | None = None,
 ) -> list[GuardResult]:
     results = [
         _evidence_guard(grounded_map),
-        _asset_guard(summary, assets),
+        _asset_guard(summary, assets, formula_candidates),
         _visual_asset_guard(summary, assets, client, model, source_pdf=source_pdf),
         _coverage_guard(summary, grounded_map),
         _format_guard(summary),
@@ -5595,6 +6534,16 @@ def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
         attempted=context.repair_attempts,
         global_cost_used=context.repair_cost_used,
     )
+    steps = [
+        step
+        for step in steps
+        if not (
+            step.action == _RepairAction.DISCARD_CANDIDATE
+            and step.asset_id is not None
+            and 1 <= step.asset_id <= len(context.assets)
+            and _is_critical_asset(context.assets[step.asset_id - 1])
+        )
+    ]
     content_repair_planned = any(
         step.action
         not in {
@@ -5668,6 +6617,7 @@ def _build_repair_plan(context: _PaperWorkflowContext) -> _RepairPlan:
         if step.asset_id is not None
         and step.action == _RepairAction.DISCARD_CANDIDATE
         and 1 <= step.asset_id <= len(context.assets)
+        and not _is_critical_asset(context.assets[step.asset_id - 1])
     }
     remove_asset_ids.update(
         asset_id
@@ -5750,6 +6700,7 @@ def _repair_step_signature(context: _PaperWorkflowContext, step: _RepairStep) ->
         _RepairAction.REWRITE_REPORT,
         _RepairAction.RETRY_VERIFIER,
         _RepairAction.USE_DETERMINISTIC,
+        _RepairAction.RECONCILE_REPORT_ASSETS,
     }:
         return _RepairStateMachine.signature(context.summary)
     return _repair_state_fingerprint(context)
@@ -5805,7 +6756,11 @@ def _revise_report_once(
         if step.action == _RepairAction.SCORE_CANDIDATES:
             # Candidate pools are deterministic and local; this step is the
             # classification evidence used by the next mutation step.
-            context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
+            context.asset_candidate_pools = _build_asset_candidate_pools(
+                context.assets,
+                source_pdf=context.pdf_path,
+                work_dir=context.work_dir,
+            )
         elif step.action == _RepairAction.CAPTURE_MISSING:
             missing_key = _missing_key_for_repair_step(step, plan.missing_asset_keys, context.summary)
             if missing_key is None and step.asset_id is not None:
@@ -5851,13 +6806,22 @@ def _revise_report_once(
             ):
                 executed_removals.add(step.asset_id)
         elif step.action == _RepairAction.DISCARD_CANDIDATE and step.asset_id is not None:
-            executed_removals.add(step.asset_id)
+            if (
+                1 <= step.asset_id <= len(context.assets)
+                and not _is_critical_asset(context.assets[step.asset_id - 1])
+            ):
+                executed_removals.add(step.asset_id)
 
     legacy_recaptures = plan.recapture_asset_ids - executed_recaptures
     if legacy_recaptures:
         repaired = _recapture_critical_visual_assets(context, legacy_recaptures)
         assets_changed = assets_changed or bool(repaired)
-    all_removals = plan.remove_asset_ids | executed_removals
+    all_removals = {
+        asset_id
+        for asset_id in plan.remove_asset_ids | executed_removals
+        if 1 <= asset_id <= len(context.assets)
+        and not _is_critical_asset(context.assets[asset_id - 1])
+    }
     if all_removals:
         revised_summary, context.assets = _drop_assets_and_rewrite_markers(
             revised_summary,
@@ -5868,7 +6832,7 @@ def _revise_report_once(
 
     if plan.rewrite_report:
         client, config = _ensure_workflow_codex_client(context)
-        revised_summary = _repair_report_format_with_codex(
+        rewrite_candidate = _repair_report_format_with_codex(
             client,
             config.model,
             revised_summary,
@@ -5877,21 +6841,37 @@ def _revise_report_once(
             context.paper_title,
             context.verification,
         )
+        if _report_rewrite_is_safe(revised_summary, rewrite_candidate):
+            revised_summary = rewrite_candidate
+        else:
+            logger.warning("Full report rewrite rejected transactionally; preserving incumbent report.")
     elif plan.apply_patches:
         revised_summary = _apply_verifier_patch_suggestions(
             revised_summary,
             context.verification.patch_suggestions,
         )
 
-    if revised_summary != context.summary or assets_changed:
+    if revised_summary != context.summary or assets_changed or plan.steps:
+        previous_summary = context.summary
         context.summary = _postprocess_summary(revised_summary)
         context.summary = _normalize_final_sections(context.summary)
         context.summary = _enforce_core_original_title(context.summary, context.paper_title)
         context.summary = _ensure_chinese_report_title(context.summary)
-        context.summary = _ensure_asset_markers(context.summary, context.assets)
-        context.verification.revision_applied = True
+        context.summary = _compile_report_asset_references(
+            context.summary,
+            context.assets,
+            source_pdf=context.pdf_path,
+            work_dir=context.work_dir,
+            max_assets=context.max_assets,
+            formula_candidates=context.formulas,
+        )
+        context.verification.revision_applied = context.summary != previous_summary or assets_changed
     if assets_changed:
-        context.asset_candidate_pools = _build_asset_candidate_pools(context.assets)
+        context.asset_candidate_pools = _build_asset_candidate_pools(
+            context.assets,
+            source_pdf=context.pdf_path,
+            work_dir=context.work_dir,
+        )
 
     after = _repair_state_fingerprint(context)
     changed = before != after
@@ -5936,9 +6916,237 @@ def _revise_report_once(
     )
 
 
+def _report_rewrite_is_safe(previous: str, candidate: str) -> bool:
+    if _looks_like_sse_payload(candidate):
+        return False
+    previous_normalized = _normalize_final_sections(_postprocess_summary(previous))
+    candidate_normalized = _normalize_final_sections(_postprocess_summary(candidate))
+    previous_errors = set(_format_guard(previous_normalized).errors)
+    candidate_errors = set(_format_guard(candidate_normalized).errors)
+    if candidate_errors - previous_errors:
+        return False
+    if len(candidate_errors) >= len(previous_errors) and candidate_normalized == previous_normalized:
+        return False
+    return _compact_text_len(candidate_normalized) >= max(300, int(_compact_text_len(previous_normalized) * 0.7))
+
+
 def _is_critical_asset(asset: PaperAsset) -> bool:
     key = _asset_label_key(asset)
     return bool(key and key[1] in {"1", "2"})
+
+
+def _asset_report_role(summary: str, asset_id: int) -> str:
+    marker = f"[[ASSET:{asset_id}]]"
+    if marker in _section_body(summary, "关键结果"):
+        return "key_evidence"
+    if marker in summary:
+        return "required_for_report"
+    return "optional_context"
+
+
+def _asset_is_locally_usable(context: _PaperWorkflowContext, asset_id: int) -> bool:
+    if not 1 <= asset_id <= len(context.assets):
+        return False
+    asset = context.assets[asset_id - 1]
+    if not asset.path.exists():
+        return False
+    issues = _local_visual_asset_issues(asset_id, asset, source_pdf=context.pdf_path)
+    if any(str(issue.get("severity", "warning")) == "error" for issue in issues):
+        return False
+    measurements = _visual_asset_measurements(
+        asset_id,
+        asset,
+        context.summary,
+        context.assets,
+        context.pdf_path,
+    )
+    return not (
+        asset.kind == "table" and not measurements.body_evidence_valid
+    ) and not (
+        asset.kind == "figure" and measurements.text_only
+    )
+
+
+def _has_usable_peer_evidence(context: _PaperWorkflowContext, asset_id: int) -> bool:
+    if not 1 <= asset_id <= len(context.assets):
+        return False
+    failed = context.assets[asset_id - 1]
+    role = _asset_report_role(context.summary, asset_id)
+    scope = _section_body(context.summary, "关键结果") if role == "key_evidence" else context.summary
+    for peer_id, peer in enumerate(context.assets, 1):
+        if peer_id == asset_id or peer.kind != failed.kind:
+            continue
+        if f"[[ASSET:{peer_id}]]" not in scope:
+            continue
+        if _asset_is_locally_usable(context, peer_id):
+            return True
+    return False
+
+
+def _rewrite_quarantined_asset_reference(summary: str, asset_id: int, asset: PaperAsset) -> str:
+    result = re.sub(rf"(?m)^\s*\[\[ASSET:{asset_id}\]\]\s*$\n?", "", summary)
+    key = _asset_label_key(asset)
+    if key is None:
+        return result
+    kind, number = key
+    replacements = {
+        "table": "相关比较表",
+        "figure": "相关图示",
+        "formula": "相关公式",
+    }
+    replacement = replacements.get(kind, "相关证据")
+    if kind == "table":
+        result = re.sub(rf"(?i)(?:Table|Tab\.)\s*{re.escape(number)}(?!\d)", replacement, result)
+        result = re.sub(rf"表\s*{re.escape(number)}(?!\d)", replacement, result)
+    elif kind == "figure":
+        result = re.sub(rf"(?i)(?:Figure|Fig\.?)\s*{re.escape(number)}(?!\d)", replacement, result)
+        result = re.sub(rf"图\s*{re.escape(number)}(?!\d)", replacement, result)
+    elif kind == "formula":
+        result = re.sub(
+            rf"(?i)(?:公式|方程|Equation|Eq\.?)\s*[（(]?\s*{re.escape(number)}\s*[）)]?",
+            replacement,
+            result,
+        )
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
+def _quarantine_recoverable_visual_failures(context: _PaperWorkflowContext) -> set[int]:
+    """Demote replaceable visual failures after bounded repair is exhausted.
+
+    Missing evidence, unsupported claims, and the last usable key-result asset
+    remain blocking.  Only crop-quality failures with a locally accepted peer
+    can be isolated from the report.
+    """
+
+    verification = context.verification
+    if verification is None:
+        return set()
+    visual_codes = {
+        "table_body_missing",
+        "table_truncated",
+        "caption_truncated",
+        "mixed_objects",
+        "type_mismatch",
+        "formula_contamination",
+        "visual_crop_invalid",
+        "irrelevant_content",
+    }
+    candidates: set[int] = set()
+    for finding in verification.findings:
+        if (
+            finding.severity == "error"
+            and finding.asset_id is not None
+            and finding.reason_code in visual_codes
+        ):
+            candidates.add(finding.asset_id)
+    for failure in verification.hard_failures:
+        finding = _finding_from_legacy(
+            failure,
+            stage="degradation",
+            severity="error",
+            confidence=0.95,
+            provenance=("report_gate",),
+        )
+        if finding.asset_id is not None and finding.reason_code in visual_codes:
+            candidates.add(finding.asset_id)
+
+    quarantined = {
+        asset_id
+        for asset_id in candidates
+        if 1 <= asset_id <= len(context.assets)
+        and _has_usable_peer_evidence(context, asset_id)
+    }
+    if not quarantined:
+        return set()
+
+    def belongs_to_quarantined(value: object) -> bool:
+        finding = _finding_from_legacy(
+            value,
+            stage="degradation",
+            severity="error",
+            confidence=0.95,
+            provenance=("report_gate",),
+        )
+        return finding.asset_id in quarantined and finding.reason_code in visual_codes
+
+    demoted = [item for item in verification.hard_failures if belongs_to_quarantined(item)]
+    verification.hard_failures = [
+        item for item in verification.hard_failures if not belongs_to_quarantined(item)
+    ]
+    verification.errors = [
+        error for error in verification.errors if not belongs_to_quarantined(error)
+    ]
+    for asset_id in sorted(quarantined):
+        context.summary = _rewrite_quarantined_asset_reference(
+            context.summary,
+            asset_id,
+            context.assets[asset_id - 1],
+        )
+        message = (
+            f"asset {asset_id} 截图在有限修复后仍未通过，已从报告中隔离；"
+            "同类关键证据仍由其他已通过资产提供。"
+        )
+        verification.soft_warnings.append(
+            {
+                "type": "asset_quarantined",
+                "reason_code": "visual_crop_invalid",
+                "asset_id": asset_id,
+                "claim": "",
+                "reason": message,
+            }
+        )
+        context.repair_history.append(
+            {
+                "stage": "ReportGate",
+                "actions": ["quarantine_asset", "rewrite_asset_reference"],
+                "asset_id": asset_id,
+                "changed": True,
+                "reason_code": "visual_crop_invalid",
+            }
+        )
+
+    retained_findings = [
+        finding
+        for finding in verification.findings
+        if not (
+            finding.asset_id in quarantined
+            and finding.reason_code in visual_codes
+            and finding.severity == "error"
+        )
+    ]
+    retained_findings.extend(
+        _finding_from_legacy(
+            warning,
+            stage="degradation",
+            severity="warning",
+            confidence=0.99,
+            provenance=("report_gate", "local_peer_evidence"),
+        )
+        for warning in verification.soft_warnings
+        if warning.get("type") == "asset_quarantined"
+        and warning.get("asset_id") in quarantined
+    )
+    verification.findings = _aggregate_findings(retained_findings)
+    verification.passed = not verification.hard_failures
+
+    for guard in context.guard_results:
+        if guard.name != "Visual Asset Guard":
+            continue
+        moved = [error for error in guard.errors if belongs_to_quarantined(error)]
+        guard.errors = [error for error in guard.errors if not belongs_to_quarantined(error)]
+        guard.warnings.extend(moved)
+        guard.findings = [
+            finding
+            for finding in guard.findings
+            if not (
+                finding.asset_id in quarantined
+                and finding.reason_code in visual_codes
+                and finding.severity == "error"
+            )
+        ]
+        guard.metrics["quarantined_assets"] = sorted(quarantined)
+        guard.status = "warning" if guard.warnings else "passed"
+    return quarantined
 
 
 def _capture_missing_asset_by_label(
@@ -6046,16 +7254,46 @@ def _recapture_critical_visual_assets(
                         asset_id,
                     )
                 elif action == _RepairAction.SELECT_ALTERNATE:
-                    replacement = next(
-                        (
-                            candidate
-                            for candidate in matching_candidates
-                            if _asset_capture_signature(candidate)
-                            != _asset_capture_signature(original)
-                            and _asset_bitmap_digest(candidate.path)
-                            != _asset_bitmap_digest(original.path)
-                        ),
-                        None,
+                    pool = _build_asset_candidate_pool(
+                        original,
+                        [original],
+                        asset_index=asset_id,
+                        source_pdf=context.pdf_path,
+                        work_dir=repair_dir,
+                    )
+                    alternate = (
+                        next(
+                            (
+                                candidate
+                                for candidate in sorted(
+                                    pool.candidates,
+                                    key=lambda item: item.effective_quality,
+                                    reverse=True,
+                                )
+                                if candidate.image_path is not None
+                                and _asset_bitmap_digest(candidate.image_path)
+                                != _asset_bitmap_digest(original.path)
+                                and tuple(round(value, 2) for value in candidate.bbox)
+                                != tuple(round(value, 2) for value in original.rect)
+                            ),
+                            None,
+                        )
+                        if pool is not None
+                        else None
+                    )
+                    replacement = (
+                        PaperAsset(
+                            original.kind,
+                            original.page_number,
+                            alternate.image_path,
+                            original.caption,
+                            original.text,
+                            latex=original.latex,
+                            rect=fitz.Rect(alternate.bbox),
+                            caption_rect=original.caption_rect,
+                        )
+                        if alternate is not None and alternate.image_path is not None
+                        else None
                     )
                 else:
                     replacement = _adaptive_visual_recapture(
@@ -6097,7 +7335,11 @@ def _replacement_passes_visual_recheck(
         candidate_assets,
         context.pdf_path,
     )
-    deterministic_issues = _local_visual_asset_issues(asset_id, replacement)
+    deterministic_issues = _local_visual_asset_issues(
+        asset_id,
+        replacement,
+        source_pdf=context.pdf_path,
+    )
     text_issues = _ocr_text_consistency_issues(asset_id, replacement, measurements)
     decision = _decide_visual_layers(
         measurements,
@@ -6116,7 +7358,7 @@ def _adaptive_visual_recapture(
     asset_id: int,
     reasons: list[str],
 ) -> PaperAsset | None:
-    if original.kind != "table" or original.rect is None:
+    if original.kind not in {"table", "figure"} or original.rect is None:
         return None
     lowered = " ".join(reasons).lower()
     incomplete_crop = any(
@@ -6135,7 +7377,41 @@ def _adaptive_visual_recapture(
     )
     if not incomplete_crop:
         return None
+    if original.kind == "figure":
+        return _expand_truncated_column_asset(page, original, repair_dir, asset_id)
     return _expand_truncated_table_asset(page, original, repair_dir, asset_id)
+
+
+def _expand_truncated_column_asset(
+    page: fitz.Page,
+    original: PaperAsset,
+    repair_dir: Path,
+    asset_id: int,
+) -> PaperAsset | None:
+    """Recover a captioned object clipped by a detector at a column edge."""
+
+    if original.rect is None:
+        return None
+    caption_rect = original.caption_rect or original.rect
+    left, right = _conservative_caption_column_bounds(page, caption_rect)
+    object_rect = fitz.Rect(original.rect)
+    expanded = fitz.Rect(left, object_rect.y0, right, object_rect.y1) & page.rect
+    if expanded.width <= object_rect.width + 8:
+        return None
+    clip_rect = _captioned_object_clip_rect(page, caption_rect, expanded)
+    path = repair_dir / f"asset-{asset_id:02d}-expanded-column.png"
+    _save_clip(page, clip_rect, path, padding=2, scale=4)
+    text = _clean_xml_text(page.get_textbox(expanded)).strip()
+    return PaperAsset(
+        original.kind,
+        original.page_number,
+        path,
+        original.caption,
+        text or original.text,
+        latex=original.latex,
+        rect=expanded,
+        caption_rect=caption_rect,
+    )
 
 
 def _split_mixed_visual_asset(
@@ -6625,8 +7901,13 @@ def _evidence_guard(grounded_map: dict[str, list[dict[str, str]]]) -> GuardResul
     )
 
 
-def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
+def _asset_guard(
+    summary: str,
+    assets: list[PaperAsset],
+    formula_candidates: list[str] | None = None,
+) -> GuardResult:
     errors: list[str] = []
+    findings: list[_Finding] = []
     asset_count = len(assets)
     for match in re.finditer(r"\[\[ASSET:([^\]]+)\]\]", summary):
         raw_id = match.group(1).strip()
@@ -6641,15 +7922,98 @@ def _asset_guard(summary: str, assets: list[PaperAsset]) -> GuardResult:
         asset = assets[asset_id - 1]
         if _asset_reference_kind_mismatch(nearby, asset):
             errors.append(f"asset id {asset_id} kind mismatch: text references {nearby[:80]!r}, manifest kind is {asset.kind}")
-    errors.extend(_critical_referenced_asset_errors(summary, assets))
+    critical_reference_errors = _critical_referenced_asset_errors(summary, assets)
+    errors.extend(critical_reference_errors)
+    for reason in critical_reference_errors:
+        findings.append(
+            _finding_from_legacy(
+                reason,
+                stage="asset_guard",
+                severity="error",
+                confidence=0.99,
+                provenance=("local:report-asset-reconciliation",),
+            )
+        )
+    formula_errors = _referenced_formula_asset_errors(summary, assets)
+    if formula_candidates and not any(asset.kind == "formula" for asset in assets):
+        formula_errors.append("论文存在公式候选，但没有可嵌入的公式截图")
+    errors.extend(formula_errors)
+    result_table_errors = _key_results_table_errors(summary, assets)
+    errors.extend(result_table_errors)
+    for reason in [*formula_errors, *result_table_errors]:
+        findings.append(
+            _finding_from_legacy(
+                {
+                    "reason_code": "missing_critical_asset",
+                    "severity": "error",
+                    "reason": reason,
+                },
+                stage="asset_guard",
+                severity="error",
+                confidence=0.99,
+                provenance=("local:report-asset-completeness",),
+            )
+        )
     return _guard_result(
         "Asset Guard",
         errors=errors,
+        findings=findings,
         metrics={
             "asset_count": asset_count,
             "placeholder_count": len(re.findall(r"\[\[ASSET:", summary)),
         },
     )
+
+
+def _referenced_formula_asset_errors(summary: str, assets: list[PaperAsset]) -> list[str]:
+    numbers = _formula_reference_numbers(summary)
+    if not numbers:
+        return []
+    available = {
+        _formula_asset_number(asset): index
+        for index, asset in enumerate(assets, 1)
+        if asset.kind == "formula" and _formula_asset_number(asset)
+    }
+    formula_body = _subsection_body(summary, "关键公式") or summary
+    used_ids = {
+        int(match.group(1))
+        for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", formula_body)
+    }
+    errors: list[str] = []
+    for number in numbers:
+        label = f"公式{number}"
+        asset_id = available.get(number)
+        if asset_id is None:
+            errors.append(f"referenced critical asset {label} is missing from asset manifest")
+        elif asset_id not in used_ids:
+            errors.append(f"missing screenshot marker for critical referenced asset {label} ([[ASSET:{asset_id}]])")
+    return errors
+
+
+def _key_results_table_errors(summary: str, assets: list[PaperAsset]) -> list[str]:
+    result_body = _section_body(summary, "关键结果")
+    if not result_body:
+        return []
+    table_ids = {
+        index
+        for index, asset in enumerate(assets, 1)
+        if asset.kind == "table"
+    }
+    table_referenced = bool(
+        re.search(
+            r"(?i)\b(?:table|tab\.)\s*(?:[12]|I{1,2})\b|表\s*[12一二]",
+            result_body,
+        )
+    )
+    if not table_ids:
+        return ["关键结果章节引用了结果表格，但 manifest 中没有可嵌入的表格截图"] if table_referenced else []
+    referenced_ids = {
+        int(match.group(1))
+        for match in re.finditer(r"\[\[ASSET:(\d+)\]\]", result_body)
+    }
+    if table_ids & referenced_ids:
+        return []
+    return ["关键结果章节缺少可嵌入的结果表格截图"]
 
 
 def _critical_referenced_asset_errors(summary: str, assets: list[PaperAsset]) -> list[str]:
@@ -6715,14 +8079,16 @@ def _critical_referenced_asset_keys_in_text(text: str) -> set[tuple[str, str]]:
             if number:
                 keys.add((kind, number))
     english_patterns = [
-        ("table", r"(?i)\b(?:table|tab\.)\s*([12])\b"),
-        ("figure", r"(?i)\b(?:figure|fig\.?)\s*([12])\b"),
+        ("table", r"(?i)\b(?:table|tab\.)\s*([12]|I{1,2})\b"),
+        ("figure", r"(?i)\b(?:figure|fig\.?)\s*([12]|I{1,2})\b"),
     ]
     for kind, pattern in english_patterns:
         for match in re.finditer(pattern, text):
             if _asset_reference_is_layout_hint(text, match.end()):
                 continue
-            keys.add((kind, match.group(1)))
+            number = _critical_asset_number(match.group(1))
+            if number:
+                keys.add((kind, number))
     return keys
 
 
@@ -6732,8 +8098,25 @@ def _asset_reference_is_layout_hint(text: str, end: int) -> bool:
 
 
 def _critical_asset_number(value: str) -> str:
-    normalized = {"一": "1", "二": "2"}.get(str(value).strip(), str(value).strip())
+    raw = str(value).strip().upper()
+    normalized = {"一": "1", "二": "2"}.get(raw, raw)
+    roman = _roman_to_int(normalized)
+    if roman is not None:
+        normalized = str(roman)
     return normalized if normalized in {"1", "2"} else ""
+
+
+def _roman_to_int(value: str) -> int | None:
+    if not re.fullmatch(r"[IVXLCDM]+", value):
+        return None
+    values = {"I": 1, "V": 5, "X": 10, "L": 50, "C": 100, "D": 500, "M": 1000}
+    total = 0
+    previous = 0
+    for char in reversed(value):
+        current = values[char]
+        total += -current if current < previous else current
+        previous = current
+    return total if 0 < total <= 80 else None
 
 
 def _critical_asset_label(key: tuple[str, str]) -> str:
@@ -6743,7 +8126,8 @@ def _critical_asset_label(key: tuple[str, str]) -> str:
 
 def _critical_asset_sort_key(key: tuple[str, str]) -> tuple[int, int]:
     kind_rank = 0 if key[0] == "figure" else 1
-    return kind_rank, int(key[1])
+    number = _critical_asset_number(key[1])
+    return kind_rank, int(number) if number else 999
 
 
 def _remove_mismatched_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
@@ -6792,7 +8176,7 @@ def _visual_asset_guard(
     selected_by_id = {asset_id: asset for asset_id, asset in selected}
     for asset_id, asset in local_selected:
         measurements = _visual_asset_measurements(asset_id, asset, summary, assets, source_pdf)
-        deterministic_issues = _local_visual_asset_issues(asset_id, asset)
+        deterministic_issues = _local_visual_asset_issues(asset_id, asset, source_pdf=source_pdf)
         text_issues = _ocr_text_consistency_issues(asset_id, asset, measurements)
         measurement_payloads[str(asset_id)] = measurements.to_dict()
         for issue in deterministic_issues:
@@ -6916,6 +8300,7 @@ def _visual_asset_guard(
         future_map = {executor.submit(check_one, item): item for item in arbitration}
         for future in as_completed(future_map):
             asset_id, _asset, issues, exc = future.result()
+            measurements = future_map[future][2]
             if isinstance(exc, openai.BadRequestError):
                 for issue in pending_text_issues.get(asset_id, []):
                     findings.append(_visual_issue_to_finding(asset_id, issue))
@@ -6961,14 +8346,25 @@ def _visual_asset_guard(
                 issue_type = str(issue.get("type", "visual_issue")).strip() or "visual_issue"
                 reason = _clean_xml_text(str(issue.get("reason", ""))).strip()
                 message = f"asset {asset_id} {issue_type}: {reason}" if reason else f"asset {asset_id} {issue_type}"
+                reason_code = _infer_reason_code(issue_type, message)
+                confidence = issue.get("confidence", 0.9 if severity == "error" else 0.65)
+                provenance: object = issue.get("provenance", "vision_model")
+                if (
+                    severity == "error"
+                    and reason_code in {"type_mismatch", "mixed_objects"}
+                    and not _visual_model_issue_has_independent_support(reason_code, measurements)
+                ):
+                    severity = "warning"
+                    confidence = min(_safe_finding_confidence(confidence, 0.65), 0.69)
+                    provenance = ("vision_model", "deterministic_reconciliation")
                 findings.append(
                     _finding_from_legacy(
                         {
                             "asset_id": asset_id,
                             "severity": severity,
-                            "confidence": issue.get("confidence", 0.9 if severity == "error" else 0.65),
-                            "provenance": issue.get("provenance", "vision_model"),
-                            "reason_code": _infer_reason_code(issue_type, message),
+                            "confidence": confidence,
+                            "provenance": provenance,
+                            "reason_code": reason_code,
                             "reason": message,
                         },
                         stage="visual_guard",
@@ -6988,6 +8384,27 @@ def _visual_asset_guard(
         },
         findings=findings,
     )
+
+
+def _visual_model_issue_has_independent_support(
+    reason_code: str,
+    measurements: _VisualMeasurements,
+) -> bool:
+    """Require a local signal before a model-only identity finding can block."""
+
+    if reason_code == "type_mismatch":
+        return (
+            not measurements.caption_identity
+            or not measurements.bbox_valid
+            or measurements.bbox_within_page is False
+            or (measurements.kind == "figure" and measurements.text_only)
+            or (measurements.kind == "table" and not measurements.body_evidence_valid)
+        )
+    if reason_code == "mixed_objects":
+        # A visual model can directly observe two object bodies inside one
+        # bitmap; manifest overlap alone cannot represent that evidence.
+        return True
+    return True
 
 
 def _visual_issue_to_finding(asset_id: int, issue: dict[str, object]) -> _Finding:
@@ -7036,7 +8453,11 @@ def _visual_asset_measurements(
     numeric_pattern = r"(?<![A-Za-z0-9])[-+]?\d+(?:\.\d+)?(?:/\d+)?%?(?![A-Za-z0-9])"
     numeric_values = len(re.findall(numeric_pattern, text))
     rows = [line for line in text.splitlines() if line.strip()]
-    body_rows = sum(1 for row in rows if len(re.findall(numeric_pattern, row)) >= 2)
+    numeric_rows = sum(1 for row in rows if len(re.findall(numeric_pattern, row)) >= 2)
+    # Some valid tables describe architecture layers, datasets, or protocols
+    # and contain no numbers at all.  Preserve row evidence independently from
+    # numeric evidence so those tables do not require model arbitration.
+    body_rows = max(numeric_rows, len(rows) if len(rows) >= 3 else 0)
     overlapping_objects = 0
     if asset.rect is not None:
         for other in assets:
@@ -7113,11 +8534,31 @@ def _pdf_region_has_graphics(source_pdf: Path | None, asset: PaperAsset) -> bool
 
 def _visual_caption_identity(asset: PaperAsset) -> bool:
     if asset.kind == "table":
-        return bool(re.match(r"(?i)^\s*(?:table|tab\.)\s*\d+\b", asset.caption)) or asset.caption.strip().startswith("表")
+        return bool(
+            re.match(
+                r"(?i)^\s*(?:table|tab\.)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\b",
+                asset.caption,
+            )
+        ) or asset.caption.strip().startswith("表")
     if asset.kind == "figure":
-        return bool(re.match(r"(?i)^\s*(?:figure|fig\.?)\s*\d+\b", asset.caption)) or asset.caption.strip().startswith("图")
+        return bool(
+            re.match(
+                r"(?i)^\s*(?:figure|fig\.?)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\b",
+                asset.caption,
+            )
+        ) or asset.caption.strip().startswith("图")
     if asset.kind == "formula":
-        return bool(re.search(r"(?i)(?:equation|formula|eq\.?|\(\s*\d+\s*\))", asset.caption))
+        return bool(
+            re.search(
+                r"(?i)(?:公式|方程|equation|formula|eq\.?|\(\s*\d+\s*\))",
+                asset.caption,
+            )
+            or _formula_asset_number(asset)
+            or _line_has_formula_syntax(asset.text)
+            or asset.text.strip()
+            or asset.latex.strip()
+            or "formula" in asset.path.name.lower()
+        )
     return False
 
 
@@ -7178,7 +8619,12 @@ def _table_border_closed(source_pdf: Path | None, asset: PaperAsset) -> bool | N
         return None
 
 
-def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[str, object]]:
+def _local_visual_asset_issues(
+    asset_id: int,
+    asset: PaperAsset,
+    *,
+    source_pdf: Path | None = None,
+) -> list[dict[str, object]]:
     if not asset.path.exists():
         return [
             {
@@ -7191,7 +8637,32 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
         ]
     width, height = _image_pixel_size(asset.path)
     issues: list[dict[str, object]] = []
+    integrity = _inspect_crop_integrity(asset.path, kind=asset.kind)
+    if integrity is not None and integrity.clipped:
+        sides = ", ".join(integrity.clipped_sides)
+        issues.append(
+            {
+                "severity": "error",
+                "reason_code": "visual_crop_invalid",
+                "confidence": 0.96,
+                "provenance": "local:bitmap-edge-integrity",
+                "message": (
+                    f"asset {asset_id} {asset.kind} bitmap contains meaningful content "
+                    f"cut off at the {sides} edge; recapture the complete object"
+                ),
+                "measurements": integrity.to_dict(),
+            }
+        )
     if asset.kind == "figure":
+        if _figure_asset_contains_front_matter(source_pdf, asset):
+            issues.append(
+                {
+                    "severity": "error",
+                    "reason_code": "irrelevant_content",
+                    "confidence": 0.99,
+                    "message": f"asset {asset_id} figure crop contains title/author/institution front matter above the figure body",
+                }
+            )
         if width >= 600 and height < 120:
             issues.append(
                 {
@@ -7209,8 +8680,10 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
     if asset.kind == "table" and width >= 650 and height >= 650 and "captioned" not in asset.path.name.lower():
         issues.append(
             {
-                "severity": "error",
-                "message": f"asset {asset_id} generic table crop is unusually large ({width}x{height}); likely includes multiple objects",
+                "severity": "warning",
+                "reason_code": "visual_crop_invalid",
+                "confidence": 0.55,
+                "message": f"asset {asset_id} generic table crop is large ({width}x{height}); size alone is insufficient to reject it",
             }
         )
     if asset.kind == "table" and width < 460:
@@ -7239,6 +8712,37 @@ def _local_visual_asset_issues(asset_id: int, asset: PaperAsset) -> list[dict[st
         issue.setdefault("confidence", 0.92 if issue.get("severity") == "error" else 0.65)
         issue.setdefault("provenance", "local:visual-heuristic")
     return issues
+
+
+def _figure_asset_contains_front_matter(source_pdf: Path | None, asset: PaperAsset) -> bool:
+    if (
+        source_pdf is None
+        or asset.kind != "figure"
+        or asset.rect is None
+        or asset.page_number != 1
+    ):
+        return False
+    try:
+        doc = fitz.open(source_pdf)
+        try:
+            if not 1 <= asset.page_number <= doc.page_count:
+                return False
+            page = doc[asset.page_number - 1]
+            if asset.rect.y0 > page.rect.height * 0.28:
+                return False
+            lines = _page_text_lines(page)
+            matches = [
+                line
+                for line in lines
+                if not (line.rect & asset.rect).is_empty
+                and line.rect.y0 < page.rect.height * 0.32
+                and _line_is_front_matter_or_body_before_figure(line.text)
+            ]
+            return bool(matches)
+        finally:
+            doc.close()
+    except Exception:
+        return False
 
 
 def _formula_asset_text_looks_contaminated(text: str) -> bool:
@@ -7476,7 +8980,7 @@ def _check_asset_with_visual_model(
             request.pop("response_format", None)
             request.pop("max_tokens", None)
             response = _create_chat_completion(client, request)
-    content = response.choices[0].message.content or ""
+    content = _completion_content(response)
     payload = _parse_visual_asset_guard_response(str(content))
     return payload.get("issues", [])
 
@@ -7802,6 +9306,21 @@ def _section_body(summary: str, title: str) -> str:
     pattern = re.compile(rf"(?ms)^##\s*{re.escape(title)}\s*\n(.*?)(?=^## |\Z)")
     match = pattern.search(summary)
     return match.group(1) if match else ""
+
+
+def _subsection_body(summary: str, title: str) -> str:
+    """Return a heading body while preserving nested report subsections."""
+
+    heading = re.search(
+        rf"(?m)^(?P<marks>#{{2,4}})\s*{re.escape(title)}\s*$",
+        summary,
+    )
+    if not heading:
+        return ""
+    level = len(heading.group("marks"))
+    end = re.search(rf"(?m)^#{{1,{level}}}\s+\S", summary[heading.end() :])
+    body_end = heading.end() + end.start() if end else len(summary)
+    return summary[heading.end() : body_end].strip()
 
 
 def _run_verification_agent(
@@ -8653,6 +10172,74 @@ def _create_chat_completion(client: openai.OpenAI, request: dict):
     return client.chat.completions.create(**request)
 
 
+def _completion_content(response: object) -> str:
+    """Read text from OpenAI SDK objects and common compatible API shapes."""
+
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return _text_from_possible_sse_payload(response)
+    if isinstance(response, dict):
+        output_text = response.get("output_text")
+        choices = response.get("choices")
+    else:
+        output_text = getattr(response, "output_text", None)
+        choices = getattr(response, "choices", None)
+    if isinstance(output_text, str) and output_text:
+        return _text_from_possible_sse_payload(output_text)
+    if not choices:
+        return ""
+    choice = choices[0]
+    message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+    if isinstance(message, dict):
+        content = message.get("content")
+    else:
+        content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return _text_from_possible_sse_payload(content)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            value = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _looks_like_sse_payload(value: str) -> bool:
+    lines = [line.strip() for line in str(value or "").splitlines() if line.strip()]
+    return bool(lines) and all(
+        line.startswith(("data:", "event:", "id:", "retry:", ":"))
+        for line in lines
+    )
+
+
+def _text_from_possible_sse_payload(value: str) -> str:
+    """Extract actual delta text from raw SSE, never return transport frames."""
+
+    if not _looks_like_sse_payload(value):
+        return value
+    parts: list[str] = []
+    for raw_line in value.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload_text = line[5:].strip()
+        if not payload_text or payload_text == "[DONE]":
+            continue
+        try:
+            payload = json.loads(payload_text)
+        except (TypeError, ValueError):
+            continue
+        for choice in payload.get("choices") or []:
+            message = choice.get("delta") or choice.get("message") or {}
+            content = message.get("content")
+            if isinstance(content, str):
+                parts.append(content)
+    return "".join(parts)
+
+
 def _release_model_call_count(client: object | None) -> int:
     if client is None:
         return 0
@@ -8691,7 +10278,7 @@ def _chat(
                     raise
                 request.pop("max_tokens", None)
                 response = _create_chat_completion(client, request)
-            content = response.choices[0].message.content or ""
+            content = _completion_content(response)
             content = _postprocess_summary(content)
             if content.strip():
                 return content
@@ -8960,7 +10547,11 @@ def _ensure_chinese_report_title(text: str) -> str:
     title = _extract_note_title(text)
     chinese_title = _core_info_field(text, ("中文标题",))
     if not _looks_like_usable_chinese_title(chinese_title):
-        chinese_title = _build_chinese_title_from_core_info(text)
+        chinese_title = (
+            title
+            if _looks_like_usable_chinese_title(title)
+            else _build_chinese_title_from_core_info(text)
+        )
     if not chinese_title:
         return text
 
@@ -9012,6 +10603,8 @@ def _mixed_english_placeholder_title(title: str) -> bool:
     if not title:
         return False
     if re.search(r"[A-Za-z][A-Za-z -]{6,}(?:论文精读|论文笔记|精读)$", title):
+        return True
+    if re.search(r"[A-Za-z][A-Za-z-]{4,}的(?:论文精读|论文笔记|精读)$", title):
         return True
     if re.search(r"(?:paper|summary|reading|analysis)\s*(?:论文|精读|笔记)", title, flags=re.IGNORECASE):
         return True
@@ -9730,6 +11323,269 @@ def _recognized_formula_context(assets: list[PaperAsset]) -> str:
     return "\n".join(formulas)
 
 
+def _ensure_key_formula_markers(summary: str, assets: list[PaperAsset]) -> str:
+    """Place real formula screenshots inside the report's key-formula subsection."""
+
+    formula_numbers = set(_formula_reference_numbers(summary))
+    if not formula_numbers:
+        return summary
+    formula_ids = {
+        index: _formula_asset_number(asset)
+        for index, asset in enumerate(assets, 1)
+        if asset.kind == "formula" and _formula_asset_number(asset) in formula_numbers
+    }
+    if not formula_ids:
+        return summary
+
+    # A previous draft may have assigned these ids to a table or figure.  The
+    # manifest is authoritative after recapture, so move formula markers out
+    # of their old location before inserting them next to the matching text.
+    formula_id_tokens = {f"[[ASSET:{asset_id}]]" for asset_id in formula_ids}
+    lines = [line for line in summary.splitlines() if line.strip() not in formula_id_tokens]
+    heading_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^#{2,4}\s*关键公式\s*$", line.strip())
+        ),
+        None,
+    )
+    if heading_index is None:
+        return summary
+
+    heading_level = len(lines[heading_index]) - len(lines[heading_index].lstrip("#"))
+    end_index = len(lines)
+    for index in range(heading_index + 1, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped.startswith("#"):
+            continue
+        level = len(stripped) - len(stripped.lstrip("#"))
+        if level <= heading_level:
+            end_index = index
+            break
+
+    insertions: dict[int, list[str]] = {}
+    for asset_id, number in sorted(formula_ids.items(), key=lambda item: int(re.match(r"\d+", item[1]).group(0))):
+        number_pattern = re.compile(
+            rf"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}\b"
+        )
+        matching_heading = None
+        for index in range(heading_index + 1, end_index):
+            if re.match(r"^#{3,4}\s*公式\s*" + re.escape(number) + r"\b", lines[index].strip(), re.IGNORECASE):
+                matching_heading = index
+                break
+        if matching_heading is None:
+            matching_heading = next(
+                (
+                    index
+                    for index in range(heading_index + 1, end_index)
+                    if number_pattern.search(lines[index])
+                ),
+                None,
+            )
+        if matching_heading is None:
+            continue
+        block_end = end_index
+        for index in range(matching_heading + 1, end_index):
+            stripped = lines[index].strip()
+            if re.match(r"^#{3,4}\s*公式\s*\d+", stripped, re.IGNORECASE):
+                block_end = index
+                break
+        insert_at = block_end
+        while insert_at > matching_heading + 1 and not lines[insert_at - 1].strip():
+            insert_at -= 1
+        insertions.setdefault(insert_at, []).append(f"[[ASSET:{asset_id}]]")
+
+    if not insertions:
+        return summary
+    result: list[str] = []
+    for index, line in enumerate(lines):
+        if index in insertions:
+            result.extend(insertions[index])
+        result.append(line)
+    if len(lines) in insertions:
+        result.extend(insertions[len(lines)])
+    return "\n".join(result)
+
+
+def _ensure_primary_result_table_marker(summary: str, assets: list[PaperAsset]) -> str:
+    """Keep at least one real result-table screenshot in the key-results section."""
+
+    result_body = _section_body(summary, "关键结果")
+    if not result_body:
+        return summary
+    table_ids = [
+        index
+        for index, asset in enumerate(assets, 1)
+        if asset.kind == "table"
+    ]
+    if not table_ids:
+        return summary
+    result_marker_ids = {
+        int(match)
+        for match in re.findall(r"\[\[ASSET:(\d+)\]\]", result_body)
+    }
+    if result_marker_ids.intersection(table_ids):
+        return summary
+
+    # Existing markers are semantic references established by the report
+    # compiler. Never move one merely to satisfy a preferred section: doing so
+    # can place a table beside an unrelated figure paragraph, after which the
+    # mismatch guard correctly removes it. Only add an unused table here.
+    used_ids = {
+        int(match)
+        for match in re.findall(r"\[\[ASSET:(\d+)\]\]", summary)
+    }
+    unused_table_ids = [index for index in table_ids if index not in used_ids]
+    if not unused_table_ids:
+        return summary
+
+    result_terms = (
+        "result",
+        "performance",
+        "comparison",
+        "benchmark",
+        "ablation",
+        "accuracy",
+        "结果",
+        "性能",
+        "对比",
+        "消融",
+    )
+    preferred = next(
+        (
+            index
+            for index in unused_table_ids
+            if any(
+                term in f"{assets[index - 1].caption} {assets[index - 1].text}".lower()
+                for term in result_terms
+            )
+        ),
+        unused_table_ids[0],
+    )
+    marker = f"[[ASSET:{preferred}]]"
+
+    lines = summary.splitlines()
+    heading_index = next(
+        (index for index, line in enumerate(lines) if line.strip() == "## 关键结果"),
+        None,
+    )
+    if heading_index is None:
+        return summary
+    insert_at = heading_index + 1
+    while insert_at < len(lines):
+        stripped = lines[insert_at].strip()
+        if not stripped:
+            insert_at += 1
+            continue
+        if stripped.startswith("### "):
+            insert_at += 1
+            continue
+        insert_at += 1
+        break
+    lines[insert_at:insert_at] = [marker]
+    return "\n".join(lines)
+
+
+def _enrich_core_info_from_pdf(summary: str, source_pdf: Path | None) -> str:
+    """Add only deterministic front-matter metadata that is present in the PDF."""
+
+    if source_pdf is None or not source_pdf.exists():
+        return summary
+    metadata = _extract_front_matter_metadata(source_pdf)
+    if not metadata:
+        return summary
+    pattern = re.compile(r"(?ms)(^##\s*核心信息\s*\n)(.*?)(?=^## |\Z)")
+
+    def replace(match: re.Match[str]) -> str:
+        body = match.group(2).strip()
+        lines = body.splitlines() if body else []
+        existing = {_core_info_line_key(line) for line in lines}
+        for label, value in metadata.items():
+            if not value:
+                continue
+            replacement = f"- {label}: {value}"
+            replaced = False
+            for index, line in enumerate(lines):
+                if _core_info_line_key(line) == label:
+                    lines[index] = replacement
+                    replaced = True
+                    break
+            if not replaced:
+                lines.append(f"- {label}: {value}")
+        return match.group(1) + "\n".join(lines).strip() + "\n\n"
+
+    return pattern.sub(replace, summary, count=1)
+
+
+def _extract_front_matter_metadata(source_pdf: Path) -> dict[str, str]:
+    try:
+        document = fitz.open(source_pdf)
+    except Exception:
+        return {}
+    try:
+        if not document.page_count:
+            return {}
+        page = document[0]
+        blocks = sorted(page.get_text("blocks"), key=lambda block: (block[1], block[0]))
+        abstract_y = next(
+            (
+                float(block[1])
+                for block in blocks
+                if re.fullmatch(r"\s*abstract\s*", _clean_xml_text(str(block[4])), re.I)
+            ),
+            270.0,
+        )
+        front_matter_bottom = min(270.0, abstract_y)
+        authors: list[str] = []
+        institutions: list[str] = []
+        for x0, y0, _x1, _y1, raw_text, *_ in blocks:
+            if y0 < 105 or y0 >= front_matter_bottom:
+                continue
+            lines = [_clean_xml_text(line).strip() for line in raw_text.splitlines() if line.strip()]
+            if not lines:
+                continue
+            for line in lines:
+                author = re.sub(r"[\u2217*]+", "", line).strip(" ,;")
+                if _looks_like_front_matter_author(author):
+                    authors.append(author)
+                if re.search(r"\b(?:university|institute|college|laboratory|lab|school)\b", line, re.I):
+                    institution = re.sub(r"^[\d*\u2217\s]+", "", line).strip(" ,;|-^")
+                    if institution and institution not in institutions:
+                        institutions.append(institution)
+        full_text = "\n".join(page.get_text("text").splitlines())
+        arxiv_match = re.search(
+            r"arXiv:([0-9]{4}\.[0-9]{4,5})(?:v(\d+))?\s*\[[^\]]+\]\s*(\d{1,2}\s+[A-Za-z]{3}\s+\d{4})",
+            full_text,
+        )
+        metadata: dict[str, str] = {}
+        if authors:
+            metadata["作者"] = "、".join(dict.fromkeys(authors))
+        if institutions:
+            metadata["机构"] = "；".join(dict.fromkeys(institutions))
+        if arxiv_match:
+            paper_id, version, date_text = arxiv_match.groups()
+            metadata["发表时间"] = f"{date_text}（arXiv{(' v' + version) if version else ''}）"
+            metadata["领域"] = "arXiv " + re.search(r"arXiv:[^\[]+\[([^\]]+)\]", full_text).group(1)
+            metadata["论文链接"] = f"https://arxiv.org/abs/{paper_id}"
+        return metadata
+    finally:
+        document.close()
+
+
+def _looks_like_front_matter_author(text: str) -> bool:
+    if not text or "@" in text:
+        return False
+    if re.search(r"\barxiv\s*:|\[[a-z]{2}(?:\.[a-z]{2})?\]|\b\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\b", text, re.I):
+        return False
+    if re.search(r"\b(?:corresponding\s+author|abstract|keywords?)\b", text, re.I):
+        return False
+    if re.search(r"\b(?:university|institute|college|laboratory|lab|school|department)\b", text, re.I):
+        return False
+    tokens = re.findall(r"[A-Z][A-Za-z.'-]*", text)
+    return 2 <= len(tokens) <= 5 and not re.search(r"\b(?:abstract|introduction|framework|agent|integration)\b", text, re.I)
+
+
 def _ensure_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     """Keep figures/tables near related sections even if the model forgot markers."""
     if not assets:
@@ -10045,7 +11901,9 @@ def _document_xml(
                 section_name = text_without_markers[3:].strip()
                 body.append(_paragraph(section_name, "Heading1"))
             elif text_without_markers.startswith("### "):
-                body.append(_paragraph(text_without_markers[4:].strip(), "Heading3"))
+                body.append(_paragraph(text_without_markers[4:].strip(), "Heading2"))
+            elif text_without_markers.startswith("#### "):
+                body.append(_paragraph(text_without_markers[5:].strip(), "Heading3"))
             elif re.fullmatch(r"[-*_]{3,}", text_without_markers):
                 continue
             elif _looks_like_subheading_text(text_without_markers, section_name):
@@ -10227,8 +12085,18 @@ def _paragraph(text: str, style: str | None = None) -> str:
 
 def _run_properties(style: str | None = None) -> str:
     base_fonts = _font_run_xml()
-    if style == "Heading3":
-        return f'<w:rPr>{base_fonts}<w:b/><w:color w:val="0F766E"/><w:sz w:val="23"/></w:rPr>'
+    heading_properties = {
+        "Heading1": ("26", "DCEFEA"),
+        "Heading2": ("24", "E7EDF8"),
+        "Heading3": ("23", "F4EAD5"),
+    }
+    if style in heading_properties:
+        size, fill = heading_properties[style]
+        return (
+            f'<w:rPr>{base_fonts}<w:b/><w:color w:val="0F766E"/>'
+            f'<w:sz w:val="{size}"/>'
+            f'<w:shd w:val="clear" w:color="auto" w:fill="{fill}"/></w:rPr>'
+        )
     return f"<w:rPr>{base_fonts}</w:rPr>"
 
 
@@ -10251,7 +12119,6 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:spacing w:before="360" w:after="150" w:line="300" w:lineRule="auto"/>'
             '<w:ind w:left="80" w:right="80"/>'
             '<w:pBdr><w:left w:val="single" w:sz="18" w:space="6" w:color="0F766E"/></w:pBdr>'
-            '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>'
             '</w:pPr>'
         )
     if style == "Heading2":
@@ -10260,7 +12127,6 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:spacing w:before="240" w:after="100" w:line="300" w:lineRule="auto"/>'
             '<w:ind w:left="80" w:right="80"/>'
             '<w:pBdr><w:left w:val="single" w:sz="14" w:space="6" w:color="0F766E"/></w:pBdr>'
-            '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>'
             '</w:pPr>'
         )
     if style == "Heading3":
@@ -10269,7 +12135,6 @@ def _paragraph_properties(style: str | None = None) -> str:
             '<w:spacing w:before="180" w:after="80" w:line="300" w:lineRule="auto"/>'
             '<w:ind w:left="80" w:right="80"/>'
             '<w:pBdr><w:left w:val="single" w:sz="12" w:space="6" w:color="0F766E"/></w:pBdr>'
-            '<w:shd w:val="clear" w:color="auto" w:fill="EAF4F2"/>'
             '</w:pPr>'
         )
     if style == "Caption":
@@ -10408,16 +12273,18 @@ def _advance_asset_counter_from_label(asset: PaperAsset, label: str, counters: d
 def _original_asset_label(asset: PaperAsset) -> str:
     text = _clean_xml_text(" ".join(part for part in (asset.caption, asset.text, asset.latex) if part))
     if asset.kind == "figure":
-        match = re.search(r"(?i)\b(?:figure|fig\.?)\s*([0-9]+[A-Za-z]?)\b", text)
+        match = re.search(r"(?i)\b(?:figure|fig\.?)\s*([0-9]+[A-Za-z]?|[IVXLCDM]+)\b", text)
         if match:
-            return f"图 {match.group(1)}"
+            number = _normalize_asset_number(match.group(1))
+            return f"图 {number}"
         match = re.search(r"图\s*([0-9一二三四五六七八九十]+)", text)
         if match:
             return f"图 {match.group(1)}"
     if asset.kind == "table":
-        match = re.search(r"(?i)\b(?:table|tab\.?)\s*([0-9]+[A-Za-z]?)\b", text)
+        match = re.search(r"(?i)\b(?:table|tab\.?)\s*([0-9]+[A-Za-z]?|[IVXLCDM]+)\b", text)
         if match:
-            return f"表 {match.group(1)}"
+            number = _normalize_asset_number(match.group(1))
+            return f"表 {number}"
         match = re.search(r"表\s*([0-9一二三四五六七八九十]+)", text)
         if match:
             return f"表 {match.group(1)}"
@@ -10446,6 +12313,15 @@ def _original_asset_label(asset: PaperAsset) -> str:
                 if label:
                     return f"公式 {label}"
     return ""
+
+
+def _normalize_asset_number(value: str) -> str:
+    raw = str(value).strip()
+    chinese = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+    if raw in chinese:
+        return chinese[raw]
+    roman = _roman_to_int(raw.upper())
+    return str(roman) if roman is not None else raw
 
 
 def _reasonable_equation_number(value: str) -> str:
@@ -10633,7 +12509,7 @@ def _image_paragraph(path: Path, docpr_id: int, rel_id: str, asset: PaperAsset |
 
 def _image_size_emu(path: Path, kind: str = "", rect: fitz.Rect | None = None) -> tuple[int, int]:
     max_width_emu = int(6.2 * 914400)
-    max_height_emu = int(9.75 * 914400)
+    max_height_emu = int((8.6 if kind == "figure" else 9.75) * 914400)
     min_width_by_kind = {
         "formula": int(3.9 * 914400),
         "table": int(5.7 * 914400),

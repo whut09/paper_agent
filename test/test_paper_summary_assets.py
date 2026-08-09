@@ -9,6 +9,7 @@ from paper_agent.agents.contracts import PaperAgentRole
 from paper_agent.harness import PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
 from paper_agent.schemas.evidence import EvidenceMap
 from paper_agent.schemas.findings import Finding
+from paper_agent.evaluation.visual_validation import VisualMeasurements
 from paper_agent.paper_summary import (
     GenerateReport,
     CorrectionMemory,
@@ -18,6 +19,7 @@ from paper_agent.paper_summary import (
     _add_guard_failures_to_verification,
     _asset_context,
     _apply_verifier_patch_suggestions,
+    _align_referenced_formula_assets,
     _adaptive_visual_recapture,
     _attach_claims_to_grounding_map,
     _build_prompt_patches,
@@ -25,8 +27,13 @@ from paper_agent.paper_summary import (
     _build_knowledge_graph,
     _caption_is_figure,
     _caption_is_table,
+    _expand_composite_table_rect,
+    _caption_row_starts_adjacent_visual,
     _caption_text_and_rect,
+    _completion_content,
+    _compile_report_asset_references,
     _asset_guard,
+    _border_enclosed_table_rect_for_caption,
     _assert_report_ready_for_docx,
     _correction_memory_context,
     _deduplicate_assets,
@@ -35,44 +42,66 @@ from paper_agent.paper_summary import (
     _evidence_guard,
     _ensure_asset_markers,
     _ensure_chinese_report_title,
+    _ensure_formula_evidence_disclosure,
+    _ensure_key_formula_markers,
+    _ensure_primary_result_table_marker,
+    _enrich_core_info_from_pdf,
     _ensure_required_report_sections,
     _enforce_core_original_title,
     _extract_abstract_from_text,
+    _extract_front_matter_metadata,
+    _extract_title_from_pdf,
     _fallback_visual_rect_for_caption,
     _extract_verifiable_claims,
     _format_guard,
     _formula_anchor_score,
     _formula_candidate_is_noise,
+    _formula_block_text,
     _formula_clip_rect,
     _formula_column_bounds,
+    _formula_asset_number,
+    _extract_formula_candidates,
     _load_correction_memories,
+    _looks_like_author_or_affiliation,
     _expand_table_rect_to_borders,
     _figure_caption_continuation_is_body_text,
     _graphic_region_is_page_artifact,
     _image_size_emu,
     _is_formula_continuation_line,
+    _line_is_front_matter_or_body_before_figure,
     _local_visual_asset_issues,
     _memory_guard,
     _postprocess_summary,
+    _quarantine_recoverable_visual_failures,
     _missing_asset_references,
     _normalize_final_sections,
     _normalize_inline_text,
     _original_asset_label,
     _paragraph,
+    _page_text_lines,
     _reflow_markdown_lines,
     _stream_request_allows_partial_content,
     _prompt_patch_context,
+    _section_body,
     _parse_verification_result,
     _parse_visual_asset_guard_response,
     _verification_format_warning,
+    _verification_for_targeted_guard_recheck,
     _resolve_codex_config,
     _row_is_prose_after_table,
     _row_looks_table_section_label,
     _row_looks_table_like,
     _report_substance_issues,
+    _report_draft_contract_errors,
+    _report_rewrite_is_safe,
+    _report_section_repair_is_safe,
+    _replace_report_section_body,
+    _substance_issue_sections,
+    _critical_referenced_asset_keys_in_text,
     _remove_mismatched_asset_markers,
     _recapture_critical_visual_assets,
     _sync_inline_asset_references,
+    _subsection_body,
     _suppress_formula_text_when_assets_present,
     _styles_xml,
     _table_rect_for_caption,
@@ -82,6 +111,8 @@ from paper_agent.paper_summary import (
     _visual_rect_for_caption_direction,
     _visual_asset_guard,
     _visual_asset_measurements,
+    _visual_model_issue_has_independent_support,
+    _visual_caption_identity,
     _visual_guard_assets_to_check,
     _visual_asset_failure_ids,
     _verification_should_block_report,
@@ -510,6 +541,7 @@ def test_asset_guard_fails_when_critical_table_reference_has_no_marker():
 
     assert result.status == "failed"
     assert any("表1" in error and "missing screenshot marker" in error for error in result.errors)
+    assert result.findings[0].reason_code == "missing_asset_marker"
 
 
 def test_asset_guard_fails_when_critical_reference_missing_from_manifest():
@@ -519,6 +551,7 @@ def test_asset_guard_fails_when_critical_reference_missing_from_manifest():
 
     assert result.status == "failed"
     assert any("表2" in error and "missing from asset manifest" in error for error in result.errors)
+    assert result.findings[0].reason_code == "missing_critical_asset"
 
 
 def test_asset_guard_ignores_layout_hint_for_missing_critical_figure():
@@ -906,6 +939,25 @@ def test_core_info_title_uses_original_paper_title():
     assert "text-to-linear-image generation" not in result
 
 
+def test_multiline_title_keeps_collaboration_line(tmp_path):
+    pdf_path = tmp_path / "multiline-title.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    first_line = "Visual Document Understanding and Reasoning: A Multi-Agent Collaboration"
+    second_line = "Framework with Agent-Wise Adaptive Test-Time Scaling"
+    page.insert_text((55, 105), first_line, fontsize=14.0)
+    page.insert_text((125, 125), second_line, fontsize=14.4)
+    page.insert_text((180, 165), "Xinlei Yu1  Chengming Xu2", fontsize=12.0)
+    page.insert_text((180, 195), "National University of Singapore", fontsize=9.0)
+    doc.save(pdf_path)
+    doc.close()
+
+    title = _extract_title_from_pdf(pdf_path)
+
+    assert title == f"{first_line} {second_line}"
+    assert not _looks_like_author_or_affiliation(first_line)
+
+
 def test_core_info_original_title_deduplicates_legacy_title_fields():
     summary = """# 中文标题
 
@@ -947,6 +999,25 @@ def test_english_report_title_gets_chinese_fallback_title():
     assert "- 中文标题: SEAR：面向真实世界图像恢复的慢速规划与快速记忆执行框架" in result
 
 
+def test_truncated_core_chinese_title_reuses_valid_report_title():
+    summary = """# RobustVisRAG：视觉退化条件下具备因果感知能力的视觉检索增强生成
+
+## 核心信息
+- 原文标题: RobustVisRAG: Causality-Aware Vision-Based Retrieval-Augmented Generation under Visual Degradations
+- 中文标题: RobustVisRAG：面向提升 Vision-based Retrieval-Au的论文精读
+- 研究任务: 提升视觉检索增强生成在视觉退化条件下的鲁棒性
+
+## 摘要
+正文。
+"""
+
+    result = _ensure_chinese_report_title(summary)
+
+    assert result.startswith("# RobustVisRAG：视觉退化条件下具备因果感知能力的视觉检索增强生成")
+    assert "- 中文标题: RobustVisRAG：视觉退化条件下具备因果感知能力的视觉检索增强生成" in result
+    assert "Retrieval-Au的论文精读" not in result
+
+
 def test_background_sections_normalize_to_background_and_problem():
     summary = """# Title
 
@@ -965,21 +1036,49 @@ def test_background_sections_normalize_to_background_and_problem():
     assert "## 研究问题" not in result
 
 
-def test_docx_headings_use_legacy_teal_bar_style():
+def test_docx_heading_backgrounds_are_distinct_and_text_only():
     heading1_xml = _paragraph("摘要", "Heading1")
+    heading2_xml = _paragraph("方法主线", "Heading2")
     heading3_xml = _paragraph("机制流程", "Heading3")
     styles_xml = _styles_xml()
     heading1_properties = heading1_xml.split("</w:pPr>", 1)[0]
+    heading2_properties = heading2_xml.split("</w:pPr>", 1)[0]
     heading3_properties = heading3_xml.split("</w:pPr>", 1)[0]
+    heading1_run_properties = heading1_xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
+    heading2_run_properties = heading2_xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
     heading3_run_properties = heading3_xml.split("<w:rPr>", 1)[1].split("</w:rPr>", 1)[0]
 
-    assert '<w:shd w:val="clear" w:color="auto" w:fill="E7F2F0"/>' in heading1_properties
+    assert "<w:shd" not in heading1_properties
+    assert "<w:shd" not in heading2_properties
+    assert "<w:shd" not in heading3_properties
     assert '<w:pBdr><w:left w:val="single"' in heading1_properties
     assert 'w:color="0F766E"' in heading1_properties
-    assert '<w:shd w:val="clear" w:color="auto" w:fill="EAF4F2"/>' in heading3_properties
+    assert 'w:fill="DCEFEA"' in heading1_run_properties
+    assert 'w:fill="E7EDF8"' in heading2_run_properties
+    assert 'w:fill="F4EAD5"' in heading3_run_properties
     assert '<w:color w:val="0F766E"/>' in heading3_run_properties
     assert "2563EB" not in styles_xml
     assert "1D4ED8" not in styles_xml
+
+
+def test_docx_markdown_heading_levels_map_to_distinct_styles():
+    summary = """# 测试报告
+
+## 一级标题
+一级正文。
+
+### 二级标题
+二级正文。
+
+#### 三级标题
+三级正文。
+"""
+
+    xml = _document_xml("paper.pdf", summary, [], [])
+
+    assert '<w:pStyle w:val="Heading1"' in xml
+    assert '<w:pStyle w:val="Heading2"' in xml
+    assert '<w:pStyle w:val="Heading3"' in xml
 
 
 def test_metadata_uses_legacy_light_teal_fill():
@@ -1177,6 +1276,330 @@ def test_captioned_figure_crop_does_not_absorb_left_column_body():
     assert rect.x1 < 570
 
 
+def test_roman_table_number_is_detected_normalized_and_guarded():
+    asset = PaperAsset(
+        "table",
+        6,
+        Path("table-i.png"),
+        "TABLE I PERFORMANCE COMPARISON ACROSS CPU, GPU, AND FPGA.",
+        text="Metric CPU GPU FPGA\nLatency 40.2 6.1 3.5",
+    )
+
+    assert _caption_is_table("TABLE I")
+    assert _original_asset_label(asset) == "表 1"
+    assert _visual_caption_identity(asset)
+    assert ("table", "1") in _critical_referenced_asset_keys_in_text("Table I reports latency.")
+
+
+def test_key_results_table_reference_cannot_pass_without_table_asset():
+    result = _asset_guard(
+        "## 关键结果\nTable I reports the main latency and throughput comparison.",
+        [],
+    )
+
+    assert result.status == "failed"
+    assert any("没有可嵌入的表格截图" in error for error in result.errors)
+
+
+def test_missing_formula_assets_get_explicit_source_evidence_disclosure():
+    summary = (
+        "## 方法主线\n"
+        "### 关键公式\n"
+        "Q-learning 调度依据状态、动作和奖励更新策略。\n\n"
+        "## 关键结果\n结果稳定。"
+    )
+
+    result = _ensure_formula_evidence_disclosure(summary, [], [])
+
+    assert "原文没有给出可独立截取的编号公式或显示方程" in result
+    assert "不把通用 Q-learning 等式补写成论文原始公式" in result
+
+
+def test_formula_candidates_without_screenshot_fail_asset_guard():
+    result = _asset_guard(
+        "## 方法主线\n### 关键公式\n公式1定义训练目标。",
+        [],
+        ["L = x + y (1)"],
+    )
+
+    assert result.status == "failed"
+    assert any("论文存在公式候选" in error for error in result.errors)
+
+
+def test_code_expressions_do_not_become_mandatory_formula_screenshots():
+    text = """
+    for(int i = 0; i < P_SIZE; i++)
+    #pragma HLS LOOP_TRIPCOUNT min=P_SIZE max=P_SIZE
+    result[i*P_SIZE+j] = A[i*P_SIZE+j] + B[i];
+    """
+
+    assert _extract_formula_candidates(text) == []
+
+
+def test_core_info_is_enriched_from_pdf_front_matter(tmp_path):
+    pdf_path = tmp_path / "2601.12345.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((80, 130), "Alice Smith")
+    page.insert_text((80, 150), "Example University")
+    page.insert_text((80, 170), "alice@example.edu")
+    page.insert_text((20, 240), "arXiv:2601.12345v1 [cs.AI] 27 Jan 2026")
+    document.save(pdf_path)
+    document.close()
+    summary = "## 核心信息\n- 原文标题: Test Paper\n- 中文标题: 测试论文\n\n## 摘要\n正文"
+
+    result = _enrich_core_info_from_pdf(summary, pdf_path)
+
+    assert "- 作者: Alice Smith" in result
+    assert "- 机构: Example University" in result
+    assert "- 领域: arXiv cs.AI" in result
+    assert "https://arxiv.org/abs/2601.12345" in result
+
+
+def test_front_matter_metadata_keeps_institution_names_and_excludes_arxiv_from_authors(tmp_path):
+    pdf_path = tmp_path / "2601.19263.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((210, 125), "Talha Coskun")
+    page.insert_text((210, 145), "University of Illinois Urbana-Champaign")
+    page.insert_text((416, 125), "Hiruna Vishwamith")
+    page.insert_text((416, 145), "University of Moratuwa")
+    page.insert_text((20, 225), "arXiv:2601.19263v1 [cs.AR] 27 Jan 2026")
+    document.save(pdf_path)
+    document.close()
+
+    metadata = _extract_front_matter_metadata(pdf_path)
+
+    assert metadata["作者"] == "Talha Coskun、Hiruna Vishwamith"
+    assert metadata["机构"] == "University of Illinois Urbana-Champaign；University of Moratuwa"
+    assert "arXiv" not in metadata["作者"]
+
+
+def test_front_matter_metadata_stops_author_scan_at_abstract(tmp_path):
+    pdf_path = tmp_path / "2605.15226.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((215, 180), "Qingyun Zou1")
+    page.insert_text((300, 180), "Feng Yu1")
+    page.insert_text((215, 195), "Jiahao Cui1")
+    page.insert_text((238, 210), "1National University of Singapore")
+    page.insert_text((284, 245), "Abstract")
+    page.insert_text((143, 268), "We ask whether agentic AI systems built for software engineering transfer to")
+    page.insert_text((20, 225), "arXiv:2605.15226v1 [cs.AR] 13 May 2026")
+    document.save(pdf_path)
+    document.close()
+
+    metadata = _extract_front_matter_metadata(pdf_path)
+
+    assert "Qingyun Zou1" in metadata["作者"]
+    assert "Feng Yu1" in metadata["作者"]
+    assert "Jiahao Cui1" in metadata["作者"]
+    assert "We ask whether" not in metadata["作者"]
+    assert metadata["机构"] == "National University of Singapore"
+
+
+def test_core_info_enrichment_replaces_model_metadata_with_pdf_metadata(tmp_path):
+    pdf_path = tmp_path / "metadata.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((215, 180), "Alice Smith1")
+    page.insert_text((238, 195), "1Example University")
+    page.insert_text((284, 245), "Abstract")
+    page.insert_text((20, 225), "arXiv:2605.15226v1 [cs.AR] 13 May 2026")
+    document.save(pdf_path)
+    document.close()
+
+    result = _enrich_core_info_from_pdf(
+        "## 核心信息\n- 作者: Wrong Author\n- 机构: Wrong Institute\n\n## 摘要\n正文",
+        pdf_path,
+    )
+
+    assert "- 作者: Alice Smith1" in result
+    assert "Wrong Author" not in result
+    assert "- 机构: Example University" in result
+
+
+def test_substance_guard_requires_evidence_rich_background_paragraphs():
+    issues = _report_substance_issues(
+        "## 背景与问题\n只有一段很短的背景。\n\n"
+        "## 摘要\n这是摘要。\n\n## 方法主线\n这是方法。\n\n"
+        "## 关键结果\n这是结果。\n\n## 深度分析\n这是分析。\n\n## 总结\n这是总结。"
+    )
+
+    assert any("背景与问题信息量不足" in issue for issue in issues)
+
+
+def test_substance_repair_targets_only_the_sections_named_by_findings():
+    summary = _valid_test_summary()
+
+    targets = _substance_issue_sections(
+        summary,
+        ["背景与问题信息量不足：至少需要两个证据化自然段"],
+    )
+
+    assert targets == ("背景与问题",)
+    assert "摘要" not in targets
+
+
+def test_replacing_one_report_section_preserves_healthy_neighbors():
+    summary = "## 摘要\n健康摘要。\n\n## 背景与问题\n旧背景。\n\n## 创新点\n健康创新点。"
+
+    result = _replace_report_section_body(
+        summary,
+        "背景与问题",
+        "新背景第一段。\n\n新背景第二段。",
+    )
+
+    assert _section_body(result, "摘要").strip() == "健康摘要。"
+    assert "新背景第一段" in _section_body(result, "背景与问题")
+    assert _section_body(result, "创新点").strip() == "健康创新点。"
+
+
+def test_section_and_full_report_repairs_are_transactional():
+    incumbent = _valid_test_summary()
+    damaged_body = "新背景。\n\n## 总结\n错误地覆盖相邻章节。"
+    damaged = _replace_report_section_body(incumbent, "背景与问题", damaged_body)
+
+    assert not _report_section_repair_is_safe(incumbent, damaged, "背景与问题", damaged_body)
+    assert not _report_rewrite_is_safe(incumbent, "## 方法主线\n只剩一个局部章节。")
+    assert _report_rewrite_is_safe(incumbent, incumbent.replace("测试报告模拟", "论文报告提出", 1))
+
+
+def test_right_column_caption_same_row_does_not_absorb_left_column_prose():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("FPGAs via automated Verilog generation", 49, 350.6, 300, 361.0),
+        line("Fig. 1. Overview of the scheduling agent.", 312, 350.6, 563, 361.0),
+        line("The agent observes state and reward signals.", 312, 363, 555, 374),
+    ]
+
+    caption, rect = _caption_text_and_rect(lines, 1, FakePage(), "figure")
+
+    assert caption.startswith("Fig. 1")
+    assert "Verilog generation" not in caption
+    assert rect.x0 >= 312
+
+
+def test_right_column_caption_crossing_page_midpoint_does_not_absorb_left_figure():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure 4: Repository-application composition", 108, 76, 236, 118),
+        line("Table 2: Benchmark statistics: SWE-bench Verified", 250, 76, 504, 108),
+        line("SWE-bench Phoenix-bench Mean Max", 387, 111, 495, 126),
+    ]
+
+    caption, rect = _caption_text_and_rect(lines, 1, FakePage(), "table")
+
+    assert caption.startswith("Table 2")
+    assert "Figure 4" not in caption
+    assert rect.x0 >= 250
+
+
+def test_fragmented_left_caption_does_not_pollute_adjacent_right_table_caption():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure", 108, 76.1, 134.5, 86.2),
+        line("4:", 150.5, 76.1, 158.4, 86.2),
+        line("Repository-", 188.4, 76.1, 236.4, 86.2),
+        line("Table 2: Benchmark statistics: SWE-bench Verified", 250.3, 76.2, 504, 86.1),
+        line("application", 108, 87, 153.2, 97.1),
+        line("composition", 184.5, 87, 234.7, 97.1),
+        line("instances versus the current Phoenix-bench runner", 250.6, 87.2, 504.2, 97),
+        line("across the repositories", 108, 98, 236.4, 108),
+        line("corpus with 511 Verilog instances.", 250.6, 98, 436, 108),
+    ]
+
+    caption, rect = _caption_text_and_rect(lines, 3, FakePage(), "table")
+
+    assert caption.startswith("Table 2")
+    assert "Figure" not in caption
+    assert "Repository" not in caption
+    assert "application composition" not in caption
+    assert rect.x0 >= 250
+
+
+def test_subfigure_headings_below_caption_start_a_new_visual_object():
+    assert _caption_row_starts_adjacent_visual(
+        [
+            line("(a) Failed Cases by Issue Category", 114, 218, 165, 222),
+            line("(b) Failure Reason by Issue Category", 223, 218, 278, 222),
+        ]
+    )
+    assert not _caption_row_starts_adjacent_visual(
+        [line("(a) single continuation", 114, 218, 210, 222)]
+    )
+
+
+def test_figure_caption_stops_before_adjacent_subfigure_headings():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Figure 6: SWE-bench Verified vs Phoenix-bench", 302, 190, 504, 200),
+        line("for four representative agent and backbone pairs;", 302, 201, 489, 211),
+        line("(a) Failed Cases by Issue Category", 314, 218, 365, 222),
+        line("(b) Failure Reason by Issue Category", 422, 218, 477, 222),
+    ]
+
+    caption, rect = _caption_text_and_rect(lines, 0, FakePage(), "figure")
+
+    assert caption.endswith("pairs;")
+    assert "Failed Cases" not in caption
+    assert rect.y1 <= 211
+
+
+def test_full_width_composite_table_caption_keeps_both_subtables():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    lines = [
+        line("Agent 194/511 (38.0%)", 108, 110, 330, 120),
+        line("No Edit 73/94 77.7%", 362, 110, 488, 120),
+    ]
+    rect, text = _expand_composite_table_rect(
+        FakePage(),
+        "Table 5: (a) resolved rate. (b) rescue rate.",
+        fitz.Rect(108, 70, 504, 92),
+        fitz.Rect(108, 100, 334, 160),
+        "Agent 194/511 (38.0%)",
+        lines,
+    )
+
+    assert rect.x1 >= 488
+    assert "No Edit" in text
+
+
+def test_model_only_identity_findings_need_independent_local_support():
+    measurements = VisualMeasurements(
+        asset_id=1,
+        kind="figure",
+        width=1200,
+        height=800,
+        marker_present=True,
+        caption_identity=True,
+        bbox_valid=True,
+        bbox_within_page=True,
+        table_border_closed=None,
+        numeric_values=0,
+        body_rows=0,
+        text_only=False,
+        overlapping_objects=0,
+        page_number=2,
+    )
+
+    assert not _visual_model_issue_has_independent_support("type_mismatch", measurements)
+    assert _visual_model_issue_has_independent_support(
+        "mixed_objects",
+        measurements,
+    )
+
+
 def test_figure_caption_does_not_absorb_following_body_text():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)
@@ -1351,6 +1774,14 @@ def test_captioned_figure_crop_trims_front_matter_above_first_page_figure():
     assert rect is not None
     assert rect.y0 > 205
     assert rect.y1 < caption.rect.y0
+
+
+def test_figure_labels_are_not_misclassified_as_front_matter():
+    assert not _line_is_front_matter_or_body_before_figure("Retrieval (MRR@10)")
+    assert not _line_is_front_matter_or_body_before_figure(
+        "Patch Token x_i + Non-causal Token z_nc"
+    )
+    assert _line_is_front_matter_or_body_before_figure("author.name@example.com")
 
 
 def test_local_visual_asset_guard_blocks_caption_only_figure():
@@ -1580,6 +2011,97 @@ def test_local_visual_asset_guard_accepts_flattened_table_with_numeric_body():
         issues = _local_visual_asset_issues(7, asset)
 
     assert not any("caption/header" in issue["message"] for issue in issues)
+
+
+def test_large_complete_table_is_warning_not_blocking_error():
+    with TemporaryDirectory() as tmp:
+        table = Path(tmp) / "page-007-table-02.png"
+        Image.new("RGB", (962, 706), "white").save(table)
+        asset = PaperAsset(
+            "table",
+            7,
+            table,
+            "Table 1. Overall retrieval performance",
+            text="BM25 53.34 32.80 38.60\nRobustVisRAG 80.11 73.21 63.82",
+        )
+
+        issues = _local_visual_asset_issues(5, asset)
+
+    size_issue = next(issue for issue in issues if "size alone" in issue["message"])
+    assert size_issue["severity"] == "warning"
+    assert size_issue["confidence"] < 0.7
+    assert not any(issue["severity"] == "error" for issue in issues)
+
+
+def test_report_gate_quarantines_replaceable_bad_key_asset(tmp_path):
+    bad_path = tmp_path / "bad-table-1.png"
+    peer_path = tmp_path / "good-table-3.png"
+    Image.new("RGB", (1200, 180), "white").save(bad_path)
+    Image.new("RGB", (1200, 620), "white").save(peer_path)
+    assets = [
+        PaperAsset("table", 2, bad_path, "Table 1. Context", text="Header only"),
+        PaperAsset(
+            "table",
+            7,
+            peer_path,
+            "Table 3. Main results",
+            text="Method Score Cost\nBaseline 81.2 1.0\nOurs 86.7 0.4",
+        ),
+    ]
+    finding = Finding.create(
+        stage="local_guard",
+        severity="error",
+        confidence=0.98,
+        reason_code="table_body_missing",
+        human_message="Visual Asset Guard: asset 1 table body is missing",
+        asset_id=1,
+        provenance=("local:visual-heuristic", "local:text-consistency"),
+    )
+    verification = VerificationResult(
+        False,
+        errors=[finding.human_message],
+        hard_failures=[
+            {
+                "type": "table_body_missing",
+                "reason_code": "table_body_missing",
+                "asset_id": 1,
+                "reason": finding.human_message,
+            }
+        ],
+        findings=[finding],
+    )
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=8,
+    )
+    context.assets = assets
+    context.summary = (
+        "## 关键结果\n如表1所示，论文给出比较结果。\n[[ASSET:1]]\n\n"
+        "表3给出主要数值结果。\n[[ASSET:2]]"
+    )
+    context.verification = verification
+    context.guard_results = [
+        GuardResult(
+            "Visual Asset Guard",
+            status="failed",
+            errors=[finding.human_message],
+            findings=[finding],
+        )
+    ]
+
+    quarantined = _quarantine_recoverable_visual_failures(context)
+
+    assert quarantined == {1}
+    assert "[[ASSET:1]]" not in context.summary
+    assert "表1" not in context.summary
+    assert "[[ASSET:2]]" in context.summary
+    assert context.verification.hard_failures == []
+    assert context.verification.soft_warnings[0]["type"] == "asset_quarantined"
+    assert context.guard_results[0].status == "warning"
 
 
 def test_local_visual_asset_guard_blocks_formula_with_surrounding_prose():
@@ -1921,6 +2443,180 @@ def test_formula_marker_is_inserted_after_plain_formula_reference():
     assert "公式1用于定义终端恢复结果的 hybrid reward。\n[[ASSET:1]]" in result
 
 
+def test_referenced_formula_alignment_replaces_unused_formula_under_full_budget(tmp_path):
+    assets = [
+        PaperAsset("formula", 1, tmp_path / "formula-4.png", "公式 4 截图", text="x = y (4)"),
+        PaperAsset("formula", 1, tmp_path / "formula-12.png", "公式 12 截图", text="x = y (12)"),
+        PaperAsset("formula", 1, tmp_path / "formula-5.png", "公式 5 截图", text="x = y (5)"),
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "公式4说明前景抑制。公式12说明偏移预测。公式18说明坐标监督。"
+    )
+    replacement = PaperAsset(
+        "formula", 2, tmp_path / "formula-18.png", "公式 18 截图", text="x = y (18)"
+    )
+    with patch(
+        "paper_agent.paper_summary._capture_formula_asset_by_number",
+        return_value=replacement,
+    ):
+        _align_referenced_formula_assets(
+            summary,
+            assets,
+            source_pdf=tmp_path / "paper.pdf",
+            work_dir=tmp_path,
+            max_assets=3,
+        )
+
+    assert [_formula_asset_number(asset) for asset in assets] == ["4", "12", "18"]
+
+
+def test_referenced_formula_alignment_replaces_marked_unnumbered_formula_slot(tmp_path):
+    assets = [
+        PaperAsset(
+            "formula",
+            5,
+            tmp_path / "fragment.png",
+            "关键公式截图：原文公式本体见截图",
+            text="Otherwise, Sstru = 1.",
+        ),
+    ]
+    summary = "## 方法主线\n### 关键公式\n公式1定义光线传播。\n[[ASSET:1]]"
+    replacement = PaperAsset(
+        "formula",
+        5,
+        tmp_path / "formula-1.png",
+        "公式 1 截图：原文公式本体见截图，正文解释变量含义和工程作用",
+        text="u'_i = n_i u_i - y_i(n'_i - n_i)c_i (1)",
+    )
+
+    with patch(
+        "paper_agent.paper_summary._capture_formula_asset_by_number",
+        return_value=replacement,
+    ):
+        result = _align_referenced_formula_assets(
+            summary,
+            assets,
+            source_pdf=tmp_path / "paper.pdf",
+            work_dir=tmp_path,
+            max_assets=1,
+        )
+
+    assert result == summary
+    assert len(assets) == 1
+    assert _formula_asset_number(assets[0]) == "1"
+    assert assets[0].text.endswith("(1)")
+
+
+def test_formula_block_text_ignores_adjacent_column_touching_crop_edge():
+    rect = fitz.Rect(50, 580, 308, 635)
+    lines = [
+        line("u'_i = n_i u_i - y_i phi_i", 74, 583, 178, 604),
+        line("(1)", 278, 592, 290, 602),
+        line("Adjacent-column prose must not be included.", 307.4, 588, 542, 598),
+    ]
+
+    text = _formula_block_text(lines, rect)
+
+    assert "u'_i" in text
+    assert "(1)" in text
+    assert "Adjacent-column" not in text
+
+
+def test_key_formula_markers_are_relocated_from_stale_asset_ids():
+    assets = [
+        PaperAsset("table", 1, Path("table.png"), "Table 1. Main results", text="1 2"),
+        PaperAsset("formula", 1, Path("formula4.png"), "公式 4 截图", text="x = y (4)"),
+        PaperAsset("formula", 1, Path("formula12.png"), "公式 12 截图", text="x = y (12)"),
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "#### 公式4：前景抑制\n公式4用于削弱查询前景响应。\n\n"
+        "#### 公式12：偏移预测\n公式12用于生成候选偏移。\n\n"
+        "## 关键结果\n表1给出主结果。\n[[ASSET:2]]"
+    )
+
+    result = _ensure_key_formula_markers(summary, assets)
+    formula_body = _subsection_body(result, "关键公式")
+
+    assert "[[ASSET:2]]" in formula_body
+    assert "[[ASSET:3]]" in formula_body
+    assert "[[ASSET:2]]" not in _section_body(result, "关键结果")
+
+
+def test_key_results_get_a_table_marker_even_when_model_omits_it():
+    assets = [
+        PaperAsset("table", 1, Path("table1.png"), "Table 1. Main results", text="1 2"),
+        PaperAsset("table", 1, Path("table2.png"), "Table 2. Ablation", text="1 2"),
+    ]
+    summary = "## 关键结果\n主要结果显示方法优于基线。\n"
+
+    result = _ensure_primary_result_table_marker(summary, assets)
+
+    assert "[[ASSET:1]]" in _section_body(result, "关键结果")
+    assert _asset_guard(result, assets).status == "passed"
+
+
+def test_report_asset_compiler_restores_marker_removed_by_model_rewrite():
+    assets = [
+        PaperAsset("table", 4, Path("table1.png"), "Table 1. Benchmark circuits"),
+        PaperAsset("table", 5, Path("table2.png"), "Table 2. Parameters"),
+    ]
+    rewritten = (
+        "## 关键结果\n"
+        "表1列出了评测电路和资源边界。\n\n"
+        "表2给出了搜索参数。\n"
+        "[[ASSET:2]]\n"
+    )
+
+    compiled = _compile_report_asset_references(rewritten, assets)
+
+    assert "表1列出了评测电路和资源边界。\n[[ASSET:1]]" in compiled
+    assert compiled.count("[[ASSET:2]]") == 1
+    assert _asset_guard(compiled, assets).status == "passed"
+
+
+def test_figure_crop_without_lower_candidate_still_trims_front_matter():
+    page = fitz.Page
+    original = fitz.Rect(10, 10, 100, 90)
+    trimmed = fitz.Rect(10, 45, 100, 90)
+    with patch(
+        "paper_agent.paper_summary._visual_rect_for_caption_direction",
+        side_effect=[original, None],
+    ), patch(
+        "paper_agent.paper_summary._trim_figure_region_by_upper_page_text",
+        return_value=trimmed,
+    ) as trim:
+        result = _visual_rect_for_caption(page, fitz.Rect(10, 91, 100, 110), [])
+
+    assert result == trimmed
+    trim.assert_called_once()
+
+
+def test_formula_caption_identity_accepts_generated_chinese_caption():
+    asset = PaperAsset(
+        "formula",
+        4,
+        Path("formula4.png"),
+        "公式 4 截图：原文公式本体见截图，正文解释变量含义和工程作用",
+        text="x = y (4)",
+    )
+
+    assert _visual_caption_identity(asset)
+
+
+def test_formula_caption_identity_can_use_formula_body_syntax():
+    asset = PaperAsset(
+        "formula",
+        4,
+        Path("formula.png"),
+        "关键数学关系截图",
+        text="L = sum_i p_i log(q_i)",
+    )
+
+    assert _visual_caption_identity(asset)
+
+
 def test_formula_text_is_suppressed_when_formula_screenshot_exists():
     assets = [PaperAsset("formula", 3, Path("formula.png"), "关键公式截图：quality score")]
     summary = (
@@ -2145,6 +2841,97 @@ def test_right_column_table_caption_does_not_absorb_left_column_body_text():
     assert "AgenticIR 21.72" in table_text
     assert table_rect is not None
     assert table_rect.x0 >= 340
+
+
+def test_bordered_table_locator_recovers_both_caption_layouts_from_real_pdf(tmp_path):
+    pdf_path = tmp_path / "bordered-tables.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.draw_line((72, 110), (546, 110), width=1)
+    page.draw_line((72, 140), (546, 140), width=1)
+    page.insert_text((90, 125), "Method     Score     Cost")
+    page.insert_text((90, 160), "Ours       92.1      0.4")
+    page.draw_line((72, 210), (546, 210), width=1)
+    page.insert_text((90, 230), "Table 1. Caption below the table.")
+    page.insert_text((90, 270), "Table 2. Caption above the table.")
+    page.draw_line((72, 290), (546, 290), width=1)
+    page.insert_text((90, 310), "Layer      Component      Role")
+    page.insert_text((90, 340), "Agent      Local model     Reasoning")
+    page.draw_line((72, 370), (546, 370), width=1)
+    document.save(pdf_path)
+    document.close()
+
+    document = fitz.open(pdf_path)
+    page = document[0]
+    lines = _page_text_lines(page)
+    first = next(index for index, item in enumerate(lines) if item.text.startswith("Table 1"))
+    second = next(index for index, item in enumerate(lines) if item.text.startswith("Table 2"))
+    _, first_caption_rect = _caption_text_and_rect(lines, first, page, "table")
+    _, second_caption_rect = _caption_text_and_rect(lines, second, page, "table")
+    first_rect, _ = _border_enclosed_table_rect_for_caption(page, first_caption_rect)
+    second_rect, _ = _border_enclosed_table_rect_for_caption(page, second_caption_rect)
+    document.close()
+
+    assert first_rect is not None and first_rect.y0 < 120 and first_rect.y1 >= 205
+    assert second_rect is not None and second_rect.y0 <= 290 and second_rect.y1 >= 365
+
+
+def test_failed_replaceable_key_asset_is_quarantined_instead_of_blocking_report(tmp_path):
+    bad_path = tmp_path / "bad-table.png"
+    good_path = tmp_path / "good-table.png"
+    Image.new("RGB", (1200, 180), "white").save(bad_path)
+    Image.new("RGB", (1200, 600), "white").save(good_path)
+    assets = [
+        PaperAsset("table", 1, bad_path, "Table 1. Positioning", "Method Score"),
+        PaperAsset("table", 2, good_path, "Table 3. Main results", "Method Score Cost\nBase 1 2\nOurs 3 4", rect=fitz.Rect(10, 10, 500, 250)),
+    ]
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="中文",
+        codex_envs={},
+        max_assets=2,
+        summary=(
+            "## 关键结果\n如表1所示，论文给出比较定位。\n[[ASSET:1]]\n"
+            "主实验结果见表3。\n[[ASSET:2]]"
+        ),
+        assets=assets,
+    )
+    context.verification = VerificationResult(
+        passed=False,
+        errors=["Visual Asset Guard: asset 1 table crop appears to contain only caption/header"],
+        hard_failures=[{
+            "type": "table_body_missing",
+            "asset_id": 1,
+            "reason_code": "table_body_missing",
+            "reason": "Visual Asset Guard: asset 1 table crop appears to contain only caption/header",
+        }],
+        findings=[Finding.create(
+            stage="local_guard",
+            severity="error",
+            confidence=0.98,
+            asset_id=1,
+            reason_code="table_body_missing",
+            human_message="asset 1 table crop appears to contain only caption/header",
+            provenance=("local:visual-heuristic",),
+        )],
+    )
+    context.guard_results = [GuardResult(
+        name="Visual Asset Guard",
+        status="failed",
+        errors=list(context.verification.errors),
+        findings=list(context.verification.findings),
+    )]
+
+    quarantined = _quarantine_recoverable_visual_failures(context)
+
+    assert quarantined == {1}
+    assert "[[ASSET:1]]" not in context.summary
+    assert "表1" not in context.summary
+    assert not context.verification.hard_failures
+    assert context.verification.soft_warnings
+    assert context.guard_results[0].status == "warning"
 
 
 def test_table_caption_below_body_recovers_table_without_neighboring_figure():
@@ -2469,6 +3256,120 @@ def test_parse_visual_asset_guard_response_normalizes_bad_json_as_warning():
 
     assert result["issues"][0]["severity"] == "warning"
     assert result["issues"][0]["type"] == "invalid_visual_guard_json"
+
+
+def test_completion_content_accepts_openai_compatible_response_shapes():
+    assert _completion_content("direct text") == "direct text"
+    assert _completion_content({"choices": [{"message": {"content": "dict text"}}]}) == "dict text"
+    assert _completion_content({"output_text": "responses text"}) == "responses text"
+
+
+def test_completion_content_rejects_sse_control_frames_as_model_text():
+    control_only = (
+        'data: {"id":"","choices":[],"usage":{"output_tokens":0}}\n\n'
+        "data: [DONE]"
+    )
+    streamed_text = (
+        'data: {"choices":[{"delta":{"content":"中文"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"报告"}}]}\n\n'
+        "data: [DONE]"
+    )
+
+    assert _completion_content(control_only) == ""
+    assert _completion_content(streamed_text) == "中文报告"
+
+
+def test_final_draft_contract_rejects_partial_and_transport_payloads():
+    assert any(
+        "SSE" in error
+        for error in _report_draft_contract_errors('data: {"choices":[]}\ndata: [DONE]')
+    )
+    errors = _report_draft_contract_errors(
+        "# Test\n\n## 方法主线\n局部方法。\n\n## 关键结果\n局部结果。"
+    )
+    assert any("缺少必需章节" in error for error in errors)
+    assert _report_draft_contract_errors(_valid_test_summary()) == []
+
+
+def test_asset_only_recheck_reuses_prior_claim_verification():
+    prior = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "claim": "",
+                "reason": "Visual Asset Guard: asset 5 needs recapture",
+            }
+        ],
+        soft_warnings=[
+            {"type": "weak_evidence", "claim": "结论", "reason": "证据范围有限"}
+        ],
+        findings=[
+            Finding.create(
+                stage="visual_guard",
+                severity="error",
+                confidence=0.95,
+                reason_code="table_truncated",
+                human_message="asset 5 needs recapture",
+                asset_id=5,
+                provenance=("vision_model",),
+            ),
+            Finding.create(
+                stage="verifier",
+                severity="warning",
+                confidence=0.7,
+                reason_code="weak_evidence",
+                human_message="evidence is narrow",
+                provenance=("verifier",),
+            ),
+        ],
+    )
+
+    reused = _verification_for_targeted_guard_recheck(
+        prior,
+        {"Asset Guard", "Visual Asset Guard"},
+    )
+
+    assert reused is not None
+    assert reused.passed
+    assert reused.hard_failures == []
+    assert reused.soft_warnings == prior.soft_warnings
+    assert all(finding.asset_id is None for finding in reused.findings)
+
+
+def test_report_compiler_keeps_existing_table_marker_beside_its_reference():
+    summary = """# VPR-Evolve
+
+## 方法主线
+### 数据与任务定义
+表1给出了训练数据、评测任务与资源边界。
+
+## 关键结果
+如图2所示，方法在持续演化过程中取得稳定改进。
+[[ASSET:3]]
+表3汇总了主要基准上的结果对比。
+[[ASSET:4]]
+
+## 总结
+实验结果支持论文的主要结论。
+"""
+    assets = [
+        PaperAsset("figure", 1, Path("figure1.png"), "Figure 1. Overview."),
+        PaperAsset("table", 2, Path("table1.png"), "Table 1. Data and task setup."),
+        PaperAsset("figure", 3, Path("figure2.png"), "Figure 2. Evolution process."),
+        PaperAsset("table", 4, Path("table3.png"), "Table 3. Benchmark results."),
+    ]
+
+    compiled = _compile_report_asset_references(summary, assets)
+
+    method_body = _section_body(compiled, "方法主线")
+    result_body = _section_body(compiled, "关键结果")
+    assert "表1给出了" in method_body
+    assert "[[ASSET:2]]" in method_body
+    assert "[[ASSET:2]]" not in result_body
+    assert "[[ASSET:3]]" in result_body
+    assert "[[ASSET:4]]" in result_body
+    assert _asset_guard(compiled, assets).status == "passed"
 
 
 def test_formula_column_bounds_allow_cross_column_equation_overhang():

@@ -22,6 +22,7 @@ from paper_agent.paper_summary import (
     SummarizeContribution,
     VerifyClaims,
     _build_asset_candidate_pools,
+    _commit_selected_asset_candidates,
 )
 from paper_agent.schemas.contracts import (
     CandidateStrategy,
@@ -158,6 +159,80 @@ def test_legacy_asset_adapter_retains_candidate_pools_and_selected_image(tmp_pat
     assert len(pools) == 2
     assert pools[0].selected.image_path == assets[0].path
     assert pools[0].selected.score.explanation.startswith("total=")
+
+
+def test_pdf_candidate_pool_renders_distinct_bitmaps_for_distinct_geometry(tmp_path):
+    import fitz
+    from PIL import Image
+    from paper_agent.paper_summary import PaperAsset, _asset_bitmap_digest
+
+    pdf_path = tmp_path / "source.pdf"
+    document = fitz.open()
+    page = document.new_page(width=400, height=300)
+    page.draw_rect(fitz.Rect(80, 80, 300, 200), color=(0, 0, 0), width=2)
+    page.insert_text((80, 70), "Figure 1. Overview")
+    page.insert_text((55, 140), "left evidence")
+    document.save(pdf_path)
+    document.close()
+
+    image_path = tmp_path / "original.png"
+    Image.new("RGB", (400, 300), "white").save(image_path)
+    asset = PaperAsset(
+        "figure",
+        1,
+        image_path,
+        "Figure 1. Overview",
+        rect=fitz.Rect(80, 80, 300, 200),
+        caption_rect=fitz.Rect(80, 55, 250, 72),
+    )
+    pool = _build_asset_candidate_pools(
+        [asset],
+        source_pdf=pdf_path,
+        work_dir=tmp_path,
+    )[0]
+    paths = {str(candidate.image_path) for candidate in pool.candidates}
+    digests = {
+        _asset_bitmap_digest(candidate.image_path)
+        for candidate in pool.candidates
+        if candidate.image_path is not None
+    }
+    assert len(paths) > 1
+    assert len(digests) > 1
+
+
+def test_selected_candidate_becomes_workflow_asset_incumbent(tmp_path):
+    import fitz
+    from PIL import Image
+    from paper_agent.paper_summary import PaperAsset
+
+    original_path = tmp_path / "original.png"
+    selected_path = tmp_path / "selected.png"
+    Image.new("RGB", (100, 100), "white").save(original_path)
+    Image.new("RGB", (140, 100), "white").save(selected_path)
+    asset = PaperAsset(
+        "figure",
+        2,
+        original_path,
+        "Figure 1. Overview",
+        rect=fitz.Rect(100, 80, 220, 180),
+        caption_rect=fitz.Rect(100, 185, 220, 205),
+    )
+    item = EvidenceBundle(
+        page_number=2,
+        source_bbox=(100.0, 80.0, 220.0, 180.0),
+        caption_text=asset.caption,
+        object_type="figure",
+        table_or_formula_text="",
+        image_path=original_path,
+    )
+    pool = build_asset_candidate_pool(
+        item,
+        ((CandidateStrategy.TEXT_HEURISTIC, (70.0, 80.0, 250.0, 205.0), selected_path),),
+    )
+    committed = _commit_selected_asset_candidates([asset], [pool])
+    assert committed[0].path == selected_path
+    assert tuple(committed[0].rect) == (70.0, 80.0, 250.0, 180.0)
+    assert committed[0].caption_rect == asset.caption_rect
 
 
 @pytest.mark.parametrize(

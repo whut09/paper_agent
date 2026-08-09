@@ -100,6 +100,11 @@ class AssetCandidate:
     def quality(self) -> float:
         return self.score.total
 
+    @property
+    def effective_quality(self) -> float:
+        edge_penalty = 0.35 if any(item.startswith("edge_cutoff:") for item in self.diagnostics) else 0.0
+        return round(self.quality - edge_penalty, 6)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "page_number": self.evidence.page_number,
@@ -109,6 +114,7 @@ class AssetCandidate:
             "bbox": list(self.bbox),
             "image_path": str(self.image_path) if self.image_path else "",
             "score": self.score.to_dict(),
+            "effective_quality": self.effective_quality,
             "diagnostics": list(self.diagnostics),
         }
 
@@ -125,7 +131,7 @@ class AssetCandidatePool:
         order = {strategy: index for index, strategy in enumerate(CandidateStrategy)}
         return max(
             self.candidates,
-            key=lambda item: (item.quality, -order[item.strategy]),
+            key=lambda item: (item.effective_quality, -order[item.strategy]),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,9 +177,9 @@ class GuardResultContract:
 
 
 _CAPTION_PATTERNS = {
-    "table": re.compile(r"(?i)^(?:table|tab\.|表)\s*\d+"),
-    "figure": re.compile(r"(?i)^(?:figure|fig\.?|图)\s*\d+"),
-    "formula": re.compile(r"(?i)^(?:equation|eq\.?|公式)\s*\(?\d+\)?"),
+    "table": re.compile(r"(?i)^(?:(?:table|tab\.)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\b|表\s*\d+)"),
+    "figure": re.compile(r"(?i)^(?:(?:figure|fig\.?)\s*(?:\d+[A-Za-z]?|[IVXLCDM]+)\b|图\s*\d+)"),
+    "formula": re.compile(r"(?i)^(?:(?:equation|eq\.?)\s*\(?\d+\)?|公式\s*\(?\d+\)?)"),
 }
 
 
