@@ -8,6 +8,7 @@ configuration dictionaries are excluded so secrets never reach disk.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import pickle
@@ -22,7 +23,7 @@ from typing import Any
 import paper_agent
 
 
-CHECKPOINT_SCHEMA_VERSION = "paper-agent-checkpoint-v1"
+CHECKPOINT_SCHEMA_VERSION = "paper-agent-checkpoint-v2"
 PROMPT_VERSION = "paper-summary-v5"
 _SECRET_RE = re.compile(r"(?:KEY|SECRET|TOKEN|PASSWORD|AUTH|CREDENTIAL)", re.IGNORECASE)
 _RUNTIME_FIELDS = {
@@ -195,16 +196,35 @@ def node_key(
     node_name: str,
     dependency_keys: dict[str, str],
     required_inputs: tuple[str, ...] = (),
+    implementation_version: str = "",
 ) -> str:
     identity = identity_for_context(context)
     relevant = {name: _context_value(context, name) for name in required_inputs}
     payload = {
         "identity": identity,
         "node": node_name,
+        "implementation_version": implementation_version,
         "dependencies": dict(sorted(dependency_keys.items())),
         "relevant": relevant,
     }
     return stable_digest(payload)
+
+
+def node_implementation_version(node: Any) -> str:
+    """Fingerprint node code and its module-level helper implementation."""
+
+    try:
+        class_source = inspect.getsource(type(node))
+    except (OSError, TypeError):
+        class_source = f"{type(node).__module__}.{type(node).__qualname__}"
+    parts = [class_source.encode("utf-8")]
+    try:
+        module_path = inspect.getsourcefile(type(node))
+        if module_path and Path(module_path).is_file():
+            parts.append(file_sha256(Path(module_path)).encode("ascii"))
+    except (OSError, TypeError):
+        pass
+    return hashlib.sha256(b"\0".join(parts)).hexdigest()
 
 
 class CheckpointStore:
@@ -277,6 +297,7 @@ __all__ = [
     "context_state",
     "file_sha256",
     "identity_for_context",
+    "node_implementation_version",
     "node_key",
     "restore_context",
     "stable_digest",

@@ -73,3 +73,16 @@ def test_global_budget_and_per_asset_budget_stop_new_actions():
     assert len(two_actions) == 2
     attempted = {step.attempt_key: 1 for step in two_actions}
     assert machine.plan([finding_item], attempted=attempted) == []
+
+
+def test_missing_marker_uses_deterministic_reconciliation_only():
+    machine = RepairStateMachine()
+
+    steps = machine.plan(
+        [finding("missing_asset_marker", asset_id=2, message="Table 1 marker is missing")]
+    )
+
+    assert [step.action for step in steps] == [RepairAction.RECONCILE_REPORT_ASSETS]
+    assert steps[0].cost == 0.1
+    assert RepairAction.REWRITE_REPORT not in {step.action for step in steps}
+    assert RepairAction.RETRY_VERIFIER not in {step.action for step in steps}

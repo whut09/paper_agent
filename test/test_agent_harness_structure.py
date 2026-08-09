@@ -389,6 +389,61 @@ def test_repair_planner_classifies_missing_critical_asset(tmp_path):
     assert plan.has_asset_actions
 
 
+def test_missing_marker_is_reconciled_without_report_rewrite_or_verifier_retry(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.work_dir = tmp_path / "assets"
+    context.summary = "## 关键结果\n表1列出了主要评测结果。"
+    context.assets = [
+        PaperAsset("table", 1, tmp_path / "table1.png", "Table 1. Main results")
+    ]
+    marker_finding = Finding.create(
+        stage="asset_guard",
+        severity="error",
+        confidence=0.99,
+        asset_id=1,
+        reason_code="missing_asset_marker",
+        human_message=(
+            "missing screenshot marker for critical referenced asset Table 1 "
+            "([[ASSET:1]])"
+        ),
+        provenance=("local:report-asset-reconciliation",),
+    )
+    transport_finding = Finding.create(
+        stage="verifier",
+        severity="warning",
+        confidence=0.99,
+        reason_code="verifier_invalid_json",
+        human_message="missing JSON object",
+        provenance=("verifier:parser",),
+    )
+    context.verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "guard_failure",
+                "reason": marker_finding.human_message,
+            }
+        ],
+        findings=[marker_finding, transport_finding],
+    )
+
+    plan = _build_repair_plan(context)
+
+    assert [step.action.value for step in plan.steps] == ["reconcile_report_assets"]
+    assert not plan.rewrite_report
+    result = _revise_report_once(context, plan)
+    assert result.status == "warning"
+    assert "[[ASSET:1]]" in context.summary
+    assert context.verification.revision_applied
+
+
 def test_workflow_repairs_missing_critical_asset_and_reverifies(tmp_path):
     class FakeVerify(PaperWorkflowNode):
         name = "VerifyClaims"
@@ -521,3 +576,81 @@ def test_failed_alternate_candidate_discards_noncritical_asset_in_same_repair_at
     assert len(context.assets) == 2
     assert all(asset.caption != "Figure 3: Auxiliary" for asset in context.assets)
     assert "[[ASSET:3]]" not in context.summary
+
+
+def test_repair_planner_never_discards_critical_asset(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.summary = "Figure 1 is the main architecture.\n[[ASSET:1]]"
+    context.assets = [
+        PaperAsset("figure", 2, tmp_path / "figure1.png", "Figure 1: Architecture")
+    ]
+    context.repair_attempts["state:asset:1:select_alternate_candidate"] = 1
+    context.verification = VerificationResult(
+        False,
+        findings=[
+            Finding.create(
+                stage="visual_guard",
+                severity="error",
+                confidence=0.99,
+                reason_code="type_mismatch",
+                human_message="asset 1 model-only type mismatch",
+                asset_id=1,
+                evidence_refs=("asset:1",),
+            )
+        ],
+    )
+
+    plan = _build_repair_plan(context)
+
+    assert plan.remove_asset_ids == set()
+    assert all(step.action.value != "discard_candidate" for step in plan.steps)
+
+
+def test_missing_critical_asset_gets_one_bounded_repair_after_normal_limit(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.output = tmp_path
+    context.paper_name = "paper"
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    context.revision_attempts = 2
+    context.summary = "Figure 1 gives the system overview."
+    context.verification = VerificationResult(
+        False,
+        hard_failures=[
+            {
+                "type": "missing_critical_asset",
+                "reason": "Asset Guard: referenced critical asset Figure 1 is missing from asset manifest",
+            }
+        ],
+    )
+    captured = PaperAsset(
+        "figure",
+        2,
+        tmp_path / "figure1.png",
+        "Figure 1: System overview",
+    )
+
+    with patch("paper_agent.paper_summary._capture_missing_asset_by_label", return_value=captured) as capture:
+        result = ReviseReport().run(context)
+
+    assert result.status == "warning"
+    assert context.gate_decision == "revise"
+    assert context.revision_attempts == 3
+    assert context.assets == [captured]
+    assert capture.call_count == 1

@@ -39,6 +39,7 @@ class RepairAction(str, Enum):
     REWRITE_REPORT = "rewrite_report_section"
     RETRY_VERIFIER = "retry_verifier"
     USE_DETERMINISTIC = "use_deterministic_checks"
+    RECONCILE_REPORT_ASSETS = "reconcile_report_assets"
 
 
 @dataclass(frozen=True)
@@ -138,6 +139,12 @@ REPAIR_LADDERS: Mapping[str, tuple[tuple[RepairAction, RepairState, float], ...]
     FindingReasonCode.MISSING_CRITICAL_ASSET.value: (
         (RepairAction.CAPTURE_MISSING, RepairState.RECAPTURE, 1.0),
     ),
+    FindingReasonCode.MISSING_ASSET_MARKER.value: (
+        (RepairAction.RECONCILE_REPORT_ASSETS, RepairState.RECHECK, 0.1),
+    ),
+    FindingReasonCode.MODEL_REFERENCE_WITHOUT_SOURCE_ANCHOR.value: (
+        (RepairAction.CAPTURE_MISSING, RepairState.RECAPTURE, 1.0),
+    ),
     FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value: (
         (RepairAction.RETRY_VERIFIER, RepairState.RECHECK, 1.0),
         (RepairAction.USE_DETERMINISTIC, RepairState.ACCEPTED, 0.5),
@@ -218,8 +225,10 @@ class RepairStateMachine:
             FindingReasonCode.TABLE_TRUNCATED.value: 4,
             FindingReasonCode.CAPTION_TRUNCATED.value: 5,
             FindingReasonCode.MISSING_CRITICAL_ASSET.value: 6,
-            FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value: 7,
-            FindingReasonCode.VERIFIER_INVALID_JSON.value: 8,
+            FindingReasonCode.MISSING_ASSET_MARKER.value: 7,
+            FindingReasonCode.MODEL_REFERENCE_WITHOUT_SOURCE_ANCHOR.value: 8,
+            FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value: 9,
+            FindingReasonCode.VERIFIER_INVALID_JSON.value: 10,
         }
         classified = sorted(
             classified,
@@ -297,6 +306,7 @@ class RepairStateMachine:
             RepairAction.VISUAL_ARBITRATION,
             RepairAction.RETRY_VERIFIER,
             RepairAction.USE_DETERMINISTIC,
+            RepairAction.RECONCILE_REPORT_ASSETS,
         }
         return RepairTransition(
             target=step.target,
@@ -339,7 +349,10 @@ class RepairStateMachine:
     def _target(finding: Finding) -> str:
         if finding.asset_id is not None:
             return f"asset:{finding.asset_id}"
-        if finding.reason_code == FindingReasonCode.MISSING_CRITICAL_ASSET.value:
+        if finding.reason_code in {
+            FindingReasonCode.MISSING_CRITICAL_ASSET.value,
+            FindingReasonCode.MODEL_REFERENCE_WITHOUT_SOURCE_ANCHOR.value,
+        }:
             match = re.search(
                 r"(?i)(figure|fig\.?|table|图|表)\s*([12一二])",
                 finding.human_message,

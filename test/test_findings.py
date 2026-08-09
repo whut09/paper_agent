@@ -15,8 +15,17 @@ from paper_agent.schemas.findings import (
     FindingReasonCode,
     aggregate_findings,
     finding_from_legacy,
+    infer_reason_code,
     migrate_verification_payload,
 )
+
+
+def test_missing_marker_and_missing_source_anchor_have_distinct_reason_codes():
+    marker = "missing screenshot marker for critical referenced asset Table 1 ([[ASSET:2]])"
+    source = "referenced critical asset Table 2 is missing from asset manifest"
+
+    assert infer_reason_code("", marker) == FindingReasonCode.MISSING_ASSET_MARKER.value
+    assert infer_reason_code("", source) == FindingReasonCode.MISSING_CRITICAL_ASSET.value
 
 
 def make_finding(*, severity="error", confidence=0.6, provenance=("local:geometry",), **kwargs):

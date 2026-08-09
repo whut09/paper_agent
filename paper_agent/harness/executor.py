@@ -18,6 +18,7 @@ from paper_agent.harness.checkpoints import (
     CheckpointValidationError,
     context_state,
     identity_for_context,
+    node_implementation_version,
     node_key,
     restore_context,
 )
@@ -138,7 +139,13 @@ class PaperWorkflow:
                 if any(dep not in completed for dep in node.depends_on):
                     continue
                 dependencies = {dep: context.checkpoint_keys[dep] for dep in node.depends_on if dep in context.checkpoint_keys}
-                key = node_key(context, name, dependencies, tuple(node.requires))
+                key = node_key(
+                    context,
+                    name,
+                    dependencies,
+                    tuple(node.requires),
+                    node_implementation_version(node),
+                )
                 context.checkpoint_keys[name] = key
                 try:
                     loaded = store.load(name, key)
@@ -237,6 +244,13 @@ class PaperWorkflow:
         store = self._checkpoint_store(context)
         try:
             self._restore_ready_nodes(context, store, pending, completed)
+            if "ReviseReport" in context.restored_nodes and context.gate_decision == "block":
+                _write_harness_sidecars(context)
+                return context
+            if "ReviseReport" in context.restored_nodes and context.gate_decision == "revise":
+                completed.discard("VerifyClaims")
+                completed.discard("ReviseReport")
+                pending.update({"VerifyClaims", "ReviseReport"})
             while pending:
                 context.check_cancelled()
                 if context.workflow_timeout_seconds and time.monotonic() - context.workflow_started_at >= context.workflow_timeout_seconds:
@@ -249,7 +263,13 @@ class PaperWorkflow:
                     node = self.nodes[name]
                     context.current_stage = name
                     dependencies = {dep: context.checkpoint_keys[dep] for dep in node.depends_on if dep in context.checkpoint_keys}
-                    key = node_key(context, name, dependencies, tuple(node.requires))
+                    key = node_key(
+                        context,
+                        name,
+                        dependencies,
+                        tuple(node.requires),
+                        node_implementation_version(node),
+                    )
                     context.checkpoint_keys[name] = key
                     started_at = datetime.now(timezone.utc)
                     try:

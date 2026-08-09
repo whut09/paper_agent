@@ -31,6 +31,8 @@ class FindingReasonCode(str, Enum):
     TYPE_MISMATCH = "type_mismatch"
     FORMULA_CONTAMINATION = "formula_contamination"
     MISSING_CRITICAL_ASSET = "missing_critical_asset"
+    MISSING_ASSET_MARKER = "missing_asset_marker"
+    MODEL_REFERENCE_WITHOUT_SOURCE_ANCHOR = "model_reference_without_source_anchor"
     VERIFIER_TRANSPORT_FAILURE = "verifier_transport_failure"
     VERIFIER_INVALID_JSON = "verifier_invalid_json"
     LEGACY_ERROR = "legacy_error"
@@ -180,7 +182,14 @@ def infer_reason_code(value: str, message: str = "") -> str:
         (r"mixed_objects|mixed_figure_table|两个独立对象|图.*表格.*同时", FindingReasonCode.MIXED_OBJECTS.value),
         (r"type_mismatch|declared_type_mismatch|kind mismatch|声明类型.*不符", FindingReasonCode.TYPE_MISMATCH.value),
         (r"formula.*contamin|公式.*正文|surrounding prose", FindingReasonCode.FORMULA_CONTAMINATION.value),
-        (r"critical asset.*missing|referenced critical asset|关键.*资产.*缺失", FindingReasonCode.MISSING_CRITICAL_ASSET.value),
+        (
+            r"missing screenshot marker for critical referenced asset|critical referenced asset.*\[\[asset:\d+\]\]",
+            FindingReasonCode.MISSING_ASSET_MARKER.value,
+        ),
+        (
+            r"critical asset.*missing|referenced critical asset.*missing from asset manifest|关键.*资产.*缺失",
+            FindingReasonCode.MISSING_CRITICAL_ASSET.value,
+        ),
         (r"timeout|timed out|connection|network|transport|超时|连接失败|网络", FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value),
         (r"invalid.*json|not valid json|不是合法 json|missing json object", FindingReasonCode.VERIFIER_INVALID_JSON.value),
     )
@@ -199,6 +208,11 @@ def default_actions(reason_code: str) -> tuple[str, ...]:
         FindingReasonCode.TYPE_MISMATCH.value: ("select_matching_candidate", "discard_candidate"),
         FindingReasonCode.FORMULA_CONTAMINATION.value: ("recapture_formula", "tighten_formula_bbox"),
         FindingReasonCode.MISSING_CRITICAL_ASSET.value: ("capture_missing_asset", "rewrite_asset_marker"),
+        FindingReasonCode.MISSING_ASSET_MARKER.value: ("reconcile_report_assets",),
+        FindingReasonCode.MODEL_REFERENCE_WITHOUT_SOURCE_ANCHOR.value: (
+            "capture_missing_asset",
+            "rewrite_unsupported_reference",
+        ),
         FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value: ("retry_verifier", "use_deterministic_checks"),
         FindingReasonCode.VERIFIER_INVALID_JSON.value: ("retry_structured_verifier", "use_legacy_adapter"),
     }.get(reason_code, ("inspect_finding",))
@@ -278,7 +292,15 @@ def finding_from_legacy(
 def aggregate_findings(findings: Iterable[Finding]) -> list[Finding]:
     grouped: dict[tuple[str, int | None, str | None, str], list[Finding]] = {}
     for finding in findings:
-        message_key = finding.human_message if finding.reason_code == FindingReasonCode.LEGACY_ERROR.value else ""
+        # Findings without an object identity can describe separate missing
+        # requirements (for example a referenced formula and a result table).
+        # Keep those messages distinct so one omission cannot hide another.
+        message_key = (
+            finding.human_message
+            if finding.reason_code == FindingReasonCode.LEGACY_ERROR.value
+            or (finding.asset_id is None and finding.claim_id is None)
+            else ""
+        )
         grouped.setdefault((finding.reason_code, finding.asset_id, finding.claim_id, message_key), []).append(finding)
     result: list[Finding] = []
     for group in grouped.values():

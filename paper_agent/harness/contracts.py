@@ -24,8 +24,8 @@ NODE_CONTRACTS = {
             ("pdf_path", "work_dir", "pages", "max_assets", "output", "paper_name"),
             ("paper_text", "assets", "asset_candidates", "asset_candidate_pools"),
             ("asset-candidates.json",),
-            context_reads=("assets", "max_assets", "output", "pages", "paper_name", "pdf_path", "text", "work_dir"),
-            context_writes=("asset_candidate_pools", "asset_candidates_path", "assets", "text"),
+            context_reads=("asset_candidate_pools", "assets", "legacy_asset_manifest", "max_assets", "output", "pages", "paper_name", "pdf_path", "text", "work_dir"),
+            context_writes=("asset_candidate_pools", "asset_candidates_path", "assets", "legacy_asset_manifest", "text"),
         ),
         WorkflowNodeContract(
             "ExtractSections",
@@ -72,9 +72,10 @@ NODE_CONTRACTS = {
                 "summary_language",
                 "correction_memories",
                 "prompt_patches",
+                "legacy_summary",
             ),
             ("draft_report",),
-            context_reads=("abstract", "assets", "chunk_notes", "correction_memories", "formulas", "paper_title", "partial_summaries", "prompt_patches", "summary_language"),
+            context_reads=("abstract", "assets", "chunk_notes", "correction_memories", "formulas", "legacy_summary", "paper_title", "partial_summaries", "prompt_patches", "summary_language"),
             context_writes=("summary",),
         ),
         WorkflowNodeContract(
@@ -86,12 +87,13 @@ NODE_CONTRACTS = {
                 "abstract",
                 "paper_title",
                 "assets",
+                "formulas",
                 "correction_memories",
                 "prompt_patches",
             ),
             ("verification_report", "verified_report", "guard_results", "knowledge_graph"),
             ("verification.json", "grounding-map.json", "knowledge-graph.json"),
-            context_reads=("abstract", "assets", "correction_memories", "grounding_map", "paper_title", "pdf_path", "prompt_patches", "repair_recheck_guards", "summary", "text"),
+            context_reads=("abstract", "assets", "correction_memories", "formulas", "grounding_map", "max_assets", "paper_title", "pdf_path", "prompt_patches", "repair_recheck_guards", "summary", "text", "verification", "work_dir"),
             context_writes=("guard_results", "knowledge_graph", "summary", "verification"),
         ),
         WorkflowNodeContract(
@@ -112,7 +114,7 @@ NODE_CONTRACTS = {
         ),
         WorkflowNodeContract(
             "GenerateReport",
-            ("verified_report", "assets", "output", "source_path", "paper_name"),
+            ("verified_report", "assets", "formulas", "output", "source_path", "paper_name"),
             ("docx", "summary.md"),
             (
                 "trace.json",
@@ -123,7 +125,7 @@ NODE_CONTRACTS = {
                 "knowledge_graph.json",
                 "asset-candidates.json",
             ),
-            context_reads=("assets", "docx_path", "output", "paper_name", "source_path", "summary", "summary_markdown_path"),
+            context_reads=("assets", "docx_path", "formulas", "max_assets", "output", "paper_name", "pdf_path", "source_path", "summary", "summary_markdown_path", "work_dir"),
             context_writes=("asset_candidates_path", "docx_path", "grounding_map_path", "knowledge_graph_path", "summary", "summary_markdown_path", "trace_path", "verification_path"),
         ),
         WorkflowNodeContract(
