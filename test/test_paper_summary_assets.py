@@ -28,6 +28,7 @@ from paper_agent.paper_summary import (
     _caption_is_figure,
     _caption_is_table,
     _expand_composite_table_rect,
+    _expanded_captioned_figure_body_rect,
     _caption_row_starts_adjacent_visual,
     _caption_text_and_rect,
     _completion_content,
@@ -2102,6 +2103,47 @@ def test_report_gate_quarantines_replaceable_bad_key_asset(tmp_path):
     assert context.verification.hard_failures == []
     assert context.verification.soft_warnings[0]["type"] == "asset_quarantined"
     assert context.guard_results[0].status == "warning"
+    assert context.quarantined_asset_ids == {1}
+
+    compiled = _compile_report_asset_references(
+        context.summary,
+        context.assets,
+        excluded_asset_ids=context.quarantined_asset_ids,
+    )
+    assert "[[ASSET:1]]" not in compiled
+    assert "[[ASSET:2]]" in compiled
+
+
+def test_vertical_figure_recovery_expands_to_vector_body_without_page_artifact(tmp_path):
+    pdf_path = tmp_path / "figure.pdf"
+    document = fitz.open()
+    page = document.new_page(width=400, height=300)
+    page.draw_rect(fitz.Rect(-100, 10, 500, 250), color=(0.9, 0.9, 0.9))
+    page.draw_rect(fitz.Rect(55, 82, 290, 190), color=(0, 0, 0), width=2)
+    page.draw_rect(fitz.Rect(90, 105, 250, 165), color=(0, 0, 0), width=2)
+    page.insert_text((55, 215), "Figure 2: Complete pipeline.")
+    document.save(pdf_path)
+    document.close()
+
+    document = fitz.open(pdf_path)
+    try:
+        page = document[0]
+        asset = PaperAsset(
+            "figure",
+            1,
+            tmp_path / "cropped.png",
+            "Figure 2: Complete pipeline.",
+            rect=fitz.Rect(55, 145, 290, 192),
+            caption_rect=fitz.Rect(55, 204, 290, 225),
+        )
+        recovered = _expanded_captioned_figure_body_rect(page, asset)
+    finally:
+        document.close()
+
+    assert recovered is not None
+    assert recovered.y0 <= 84
+    assert recovered.y0 > 30
+    assert recovered.y1 >= 190
 
 
 def test_local_visual_asset_guard_blocks_formula_with_surrounding_prose():

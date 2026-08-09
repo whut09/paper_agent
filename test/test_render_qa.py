@@ -174,6 +174,33 @@ def test_render_qa_does_not_require_unreferenced_manifest_asset(tmp_path):
     assert "missing_critical_asset" not in result.reason_codes
 
 
+def test_render_qa_ignores_quarantined_source_crop(tmp_path):
+    first = _asset(tmp_path)
+    quarantined = _asset(tmp_path, "quarantined.png", "Figure 2: Detail")
+    image = Image.open(quarantined.path).convert("RGB")
+    pixels = image.load()
+    for y in range(35, 330, 20):
+        for x in range(0, 100):
+            for dy in range(5):
+                pixels[x, y + dy] = (10, 10, 10)
+    image.save(quarantined.path)
+    docx_path = _docx(tmp_path, [first])
+    unavailable = render_qa._RenderAttempt("none", reason_code="renderer_unavailable", message="renderer missing")
+
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(
+            docx_path,
+            [first, quarantined],
+            tmp_path / "render",
+            required_asset_ids={1},
+            excluded_asset_ids={2},
+        )
+
+    assert result.status == "warning"
+    assert "visual_crop_invalid" not in result.reason_codes
+    assert [asset.asset_id for asset in result.assets] == [1]
+
+
 def test_render_qa_accepts_readable_wide_formula(tmp_path):
     formula_path = tmp_path / "formula.png"
     Image.new("RGB", (465, 53), "white").save(formula_path)
