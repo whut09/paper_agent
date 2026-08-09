@@ -1,10 +1,12 @@
 from pathlib import Path
+import subprocess
 from unittest.mock import patch
 
 import fitz
 from PIL import Image
 
 from paper_agent.evaluation import render_qa
+from paper_agent.evaluation.image_integrity import inspect_crop_integrity
 from paper_agent.paper_summary import PaperAsset, _write_docx
 from paper_agent.paper_summary import RenderQA
 from paper_agent.harness.context import PaperWorkflowContext
@@ -47,6 +49,71 @@ def test_render_qa_passes_structural_and_rendered_checks(tmp_path):
     assert result.page_count == 1
     assert result.assets[0].caption_adjacent
     assert result.assets[0].rendered_page == 1
+
+
+def test_crop_integrity_detects_content_cut_off_at_left_edge(tmp_path):
+    path = tmp_path / "clipped.png"
+    image = Image.new("RGB", (640, 360), "white")
+    pixels = image.load()
+    for y in range(40, 320, 18):
+        for x in range(0, 105):
+            for dy in range(5):
+                pixels[x, y + dy] = (20, 20, 20)
+    image.save(path)
+    result = inspect_crop_integrity(path, kind="figure")
+    assert result is not None
+    assert "left" in result.clipped_sides
+
+
+def test_crop_integrity_does_not_reject_single_table_border(tmp_path):
+    path = tmp_path / "table-border.png"
+    image = Image.new("RGB", (640, 360), "white")
+    pixels = image.load()
+    for x in range(640):
+        pixels[x, 359] = (0, 0, 0)
+    image.save(path)
+    result = inspect_crop_integrity(path, kind="table")
+    assert result is not None
+    assert "bottom" not in result.clipped_sides
+
+
+def test_render_qa_blocks_internally_clipped_source_bitmap(tmp_path):
+    asset = _asset(tmp_path)
+    image = Image.open(asset.path).convert("RGB")
+    pixels = image.load()
+    for y in range(35, 330, 20):
+        for x in range(0, 100):
+            for dy in range(5):
+                pixels[x, y + dy] = (10, 10, 10)
+    image.save(asset.path)
+    docx_path = _docx(tmp_path, [asset])
+    unavailable = render_qa._RenderAttempt("none", reason_code="renderer_unavailable", message="renderer missing")
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(docx_path, [asset], tmp_path / "render")
+    assert result.status == "block"
+    assert "visual_crop_invalid" in result.reason_codes
+
+
+def test_word_com_cleanup_failure_keeps_successful_export(tmp_path):
+    docx_path = tmp_path / "report.docx"
+    docx_path.write_bytes(b"docx")
+    render_dir = tmp_path / "render"
+
+    def fake_run(*_args, **_kwargs):
+        render_dir.mkdir(parents=True, exist_ok=True)
+        (render_dir / "report.pdf").write_bytes(b"pdf")
+        return subprocess.CompletedProcess([], 1, "", "Word.Quit RPC unavailable")
+
+    with (
+        patch.object(render_qa, "_soffice_path", return_value=""),
+        patch.object(render_qa, "_windows_word_available", return_value=True),
+        patch.object(render_qa.subprocess, "run", side_effect=fake_run),
+    ):
+        attempt = render_qa._render_docx(docx_path, render_dir)
+
+    assert attempt.renderer == "word-com"
+    assert attempt.pdf_path == render_dir / "report.pdf"
+    assert attempt.reason_code == ""
 
 
 def test_render_qa_warns_when_renderer_is_unavailable(tmp_path):
@@ -105,6 +172,35 @@ def test_render_qa_does_not_require_unreferenced_manifest_asset(tmp_path):
     assert result.status == "warning"
     assert result.downloadable
     assert "missing_critical_asset" not in result.reason_codes
+
+
+def test_render_qa_accepts_readable_wide_formula(tmp_path):
+    formula_path = tmp_path / "formula.png"
+    Image.new("RGB", (465, 53), "white").save(formula_path)
+    formula = PaperAsset("formula", 1, formula_path, "公式 12 截图", text="x = y (12)")
+    docx_path = tmp_path / "formula-report.docx"
+    _write_docx(
+        docx_path,
+        "paper.pdf",
+        "## 方法主线\n### 关键公式\n公式12描述候选偏移。\n[[ASSET:1]]",
+        [formula],
+    )
+    unavailable = render_qa._RenderAttempt(
+        "none",
+        reason_code="renderer_unavailable",
+        message="renderer missing",
+    )
+
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(
+            docx_path,
+            [formula],
+            tmp_path / "render",
+            required_asset_ids={1},
+        )
+
+    assert result.status == "warning"
+    assert "image_too_small" not in result.reason_codes
 
 
 def test_render_qa_renderer_timeout_is_warning_not_content_defect(tmp_path):

@@ -18,6 +18,8 @@ from xml.etree import ElementTree as ET
 import fitz
 from PIL import Image
 
+from paper_agent.evaluation.image_integrity import inspect_crop_integrity
+
 from paper_agent.evaluation.acceptance import suggested_actions
 from paper_agent.schemas.qa import (
     RenderAssetMeasurement,
@@ -149,7 +151,10 @@ def _render_docx(docx_path: Path, render_dir: Path, timeout_seconds: float = 120
                 text=True,
                 timeout=timeout_seconds,
             )
-            if result.returncode == 0 and pdf_path.exists():
+            # Word can finish ExportAsFixedFormat and then fail while closing
+            # a stale COM/RPC object.  The exported PDF is the authoritative
+            # result; RenderQA will open and validate it in the next stage.
+            if pdf_path.exists() and pdf_path.stat().st_size > 0:
                 return _RenderAttempt("word-com", pdf_path)
             return _RenderAttempt("word-com", reason_code="renderer_failed", message=(result.stderr or result.stdout).strip()[:500])
     except subprocess.TimeoutExpired:
@@ -280,7 +285,8 @@ def _inspect_docx(
                         pixel_width, pixel_height = image.size
                 else:
                     findings.append(_finding("missing_critical_asset", "block", f"Asset {asset_id} media relationship is missing", asset_id=asset_id))
-                if pixel_width < 64 or pixel_height < 64:
+                min_width, min_height = (180, 24) if kind == "formula" else (64, 64)
+                if pixel_width < min_width or pixel_height < min_height:
                     findings.append(_finding("image_too_small", "block", f"Asset {asset_id} is too small for a readable report", asset_id=asset_id, width=pixel_width, height=pixel_height))
                 if content_width and cx > content_width + 1000:
                     findings.append(_finding("page_overflow", "block", f"Asset {asset_id} exceeds the document content width", asset_id=asset_id, width_emu=cx, content_width_emu=content_width))
@@ -288,6 +294,17 @@ def _inspect_docx(
                     findings.append(_finding("image_cropped", "block", f"Asset {asset_id} exceeds the document content height", asset_id=asset_id, height_emu=cy, content_height_emu=content_height))
                 if not adjacent:
                     findings.append(_finding("caption_not_adjacent", "warning", f"Asset {asset_id} has no adjacent caption or reference paragraph", asset_id=asset_id))
+                integrity = inspect_crop_integrity(Path(getattr(asset, "path", "")), kind=kind)
+                if integrity is not None and integrity.clipped:
+                    findings.append(
+                        _finding(
+                            "visual_crop_invalid",
+                            "block",
+                            f"Asset {asset_id} source bitmap is internally clipped at the {', '.join(integrity.clipped_sides)} edge",
+                            asset_id=asset_id,
+                            source_crop_integrity=integrity.to_dict(),
+                        )
+                    )
                 measurements.append(
                     RenderAssetMeasurement(
                         asset_id,
