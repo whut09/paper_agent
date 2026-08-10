@@ -213,3 +213,83 @@ progress, and every blocked result identifies a typed reason code and next actio
 The architecture should optimize for **fewer invalid final documents**, not merely
 fewer raised exceptions. A blocked run with a precise recoverable reason is better
 than a fast DOCX containing a wrong table, formula, or claim.
+
+## 2026 Resilience Architecture Review
+
+The current implementation is not failing because one more prompt is missing. It
+has a failure-domain problem: parser output, visual arbitration, report repair,
+and model transport are allowed to share the same blocking path. A visual model
+phrase that is not in the local taxonomy becomes `legacy_error`, which can select
+an unrelated report rewrite; a connection failure during that rewrite then aborts
+the workflow. The repair loop is present, but the routing boundary is too weak.
+
+The following projects were reviewed as architectural references:
+
+- [Docling](https://github.com/docling-project/docling): a unified document IR,
+  layout/reading-order/table/formula understanding, multiple export formats, and
+  local execution. The important idea is that downstream agents consume stable
+  document objects rather than reparsing raw PDF text.
+- [Marker](https://github.com/datalab-to/marker): embedded text first, layout
+  detection second, VLM/OCR only for pages or blocks that need it, CPU table
+  reconstruction with a VLM fallback, and concurrency at the worker layer.
+- [MinerU](https://github.com/opendatalab/MinerU): separate parsing backends,
+  pipeline/API/WebUI entry points, and an explicit benchmark ecosystem. This is
+  a useful model for backend fallback and representative corpus evaluation.
+- [GROBID](https://github.com/kermitt2/grobid): layout tokens, fine-grained
+  scientific-document labels, coordinates, confidence-oriented models, and
+  parallel batch clients. It demonstrates why captions, sections, references,
+  and coordinates should be first-class evidence.
+- [PaperQA2](https://github.com/Future-House/paper-qa): cached indexes,
+  metadata-aware retrieval, contextual re-ranking, agentic query refinement,
+  rate-limit settings, and model-provider abstraction. Its key lesson is to
+  cache expensive evidence construction and spend model calls only on selection
+  and synthesis.
+- [Azure Document Intelligence response model](https://learn.microsoft.com/en-us/azure/ai-services/document-intelligence/concept/analyze-document-response):
+  page/reading-order spans, bounding regions, tables, figures, and sections are
+  returned as linked objects, while analysis is asynchronous and polled through
+  an operation resource. This is the commercial pattern for resumable work and
+  measurable confidence/provenance.
+
+### Target Architecture
+
+```text
+PDF/link
+  -> source resolver (validate, cache, multi-backend download)
+  -> DocumentIR (pages, blocks, spans, captions, figures, tables, formulas)
+  -> deterministic candidate pools (score every geometry, retain alternatives)
+  -> evidence index (claims and assets reference stable source ids)
+  -> parallel chunk notes / local asset QA
+  -> ordered synthesis
+  -> typed verifier findings
+  -> bounded repair controller
+       |-- deterministic recapture/split/alternate candidate
+       |-- optional visual arbitration
+       |-- section-level report rewrite
+       |-- quarantine replaceable asset
+       `-- blocked report with next action
+  -> DOCX
+  -> RenderQA + acceptance sidecars
+```
+
+The controller must use four failure domains:
+
+1. `content`: unsupported claims, missing required sections, and absent critical
+   evidence. These can block delivery.
+2. `asset`: crop contamination, truncation, type mismatch, and missing media.
+   These must try candidate selection, split, recapture, and peer quarantine in
+   that order. They must never jump directly to a full report rewrite.
+3. `transport`: timeout, connection reset, rate limit, or invalid model response.
+   These are warnings with retry/backoff and deterministic fallback. They must
+   never be rewritten as content defects.
+4. `render`: DOCX/PDF clipping, overflow, missing markers, and image placement.
+   RenderQA owns these findings and may rerun only rendering or the affected
+   asset, not the whole paper.
+
+The first implementation slice now enforces this design at the failure boundary:
+caption-below tables select the nearest compatible rule pair; visual contamination
+aliases stay in `visual_crop_invalid`; legacy single-object vision responses are
+adapted into typed issues; and wrapped connection exceptions are classified by
+their complete cause chain. The next slices should move the remaining
+`paper_summary.py` functions behind a `DocumentIR` facade and add a 10-paper
+benchmark with pass rate, asset precision/recall, repair success, transport
+warnings, latency, and final RenderQA as release metrics.

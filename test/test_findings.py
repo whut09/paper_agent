@@ -181,6 +181,16 @@ def test_visual_guard_response_migrates_issue_reason_code():
     assert response["issues"][0]["provenance"] == "vision_model"
 
 
+def test_visual_guard_response_adapts_legacy_single_issue_shape():
+    response = _parse_visual_asset_guard_response(
+        '{"asset_id": 7, "valid": false, "severity": "error", "reason": "surrounding prose above the table"}'
+    )
+
+    assert response["passed"] is False
+    assert response["issues"][0]["reason_code"] == "visual_crop_invalid"
+    assert response["issues"][0]["provenance"] == "vision_model:legacy_adapter"
+
+
 def test_visual_composition_aliases_route_to_mixed_object_repair():
     composition = (
         "asset 6 composition: candidate contains complete Table 1 and Table 2"
@@ -189,3 +199,8 @@ def test_visual_composition_aliases_route_to_mixed_object_repair():
 
     assert infer_reason_code("composition", composition) == "mixed_objects"
     assert infer_reason_code("object_mixing", object_mixing) == "mixed_objects"
+
+
+def test_visual_contamination_aliases_stay_in_crop_repair_domain():
+    assert infer_reason_code("extraneous_content", "asset 7 contains surrounding prose") == "visual_crop_invalid"
+    assert infer_reason_code("irrelevant_text", "asset 7 contains a section heading") == "visual_crop_invalid"

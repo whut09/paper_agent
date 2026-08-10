@@ -3051,6 +3051,41 @@ def test_bordered_table_locator_recovers_both_caption_layouts_from_real_pdf(tmp_
     assert second_rect is not None and second_rect.y0 <= 290 and second_rect.y1 >= 365
 
 
+def test_caption_below_table_uses_nearest_rule_pair_after_intervening_prose(tmp_path):
+    pdf_path = tmp_path / "stacked-caption-below.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    # An earlier table and a prose/heading block share the same column.
+    for y in (110, 140, 210):
+        page.draw_line((319.5, y), (558, y), width=1)
+    page.insert_text((330, 130), "Method   Score")
+    page.insert_text((330, 180), "Old     0.4")
+    page.insert_text((330, 245), "The retrieval procedure uses a separate case library.")
+    page.insert_text((330, 270), "Text-to-CAD Generation")
+    # The target table is below the prose and its caption is below the body.
+    for y in (320, 336, 386):
+        page.draw_line((319.5, y), (558, y), width=1)
+    page.insert_text((330, 334), "Method   IoU   Success")
+    page.insert_text((330, 360), "CADIR   0.30  1.00")
+    page.insert_text((360, 408), "Table 4: Text-to-CAD generation results.")
+    document.save(pdf_path)
+    document.close()
+
+    document = fitz.open(pdf_path)
+    page = document[0]
+    lines = _page_text_lines(page)
+    caption_index = next(index for index, item in enumerate(lines) if item.text.startswith("Table 4"))
+    _, caption_rect = _caption_text_and_rect(lines, caption_index, page, "table")
+    table_rect, table_text = _border_enclosed_table_rect_for_caption(page, caption_rect)
+    document.close()
+
+    assert table_rect is not None
+    assert table_rect.y0 >= 320
+    assert table_rect.y1 <= 386
+    assert "CADIR" in table_text
+    assert "retrieval procedure" not in table_text
+
+
 def test_failed_replaceable_key_asset_is_quarantined_instead_of_blocking_report(tmp_path):
     bad_path = tmp_path / "bad-table.png"
     good_path = tmp_path / "good-table.png"

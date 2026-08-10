@@ -3205,7 +3205,11 @@ def _border_enclosed_table_rect_for_caption(
                 for next_rule in rules
             )
         ]
-        top = min(paired_tops or top_candidates, key=lambda item: item.y0, default=None)
+        # Choose the nearest compatible rule pair.  Picking the earliest pair
+        # merges an upper table and the prose between two tables into the
+        # lower table crop, especially when the lower caption is below its
+        # table.  The nearest pair is the strongest local object boundary.
+        top = max(paired_tops or top_candidates, key=lambda item: item.y0, default=None)
         if top is not None:
             rect = fitz.Rect(
                 max(page.rect.x0, min(top.x0, bottom.x0)),
@@ -9328,8 +9332,23 @@ def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
         payload = json.loads(str(text).strip())
         if not isinstance(payload, dict):
             raise ValueError("visual guard response must be a JSON object")
+        # Older OpenAI-compatible vision gateways sometimes return one issue
+        # object (valid/severity/reason) even when response_format was sent.
+        # Adapt that shape locally instead of turning a useful visual finding
+        # into verifier_invalid_json.
         if not isinstance(payload.get("passed"), bool) or not isinstance(payload.get("issues"), list):
-            raise ValueError("visual guard response does not match the required schema")
+            if isinstance(payload.get("valid"), bool) or "reason" in payload or "issue_type" in payload:
+                valid = payload.get("valid", payload.get("passed", True))
+                issue = {
+                    "severity": str(payload.get("severity", "error" if valid is False else "warning")),
+                    "type": str(payload.get("reason_code") or payload.get("issue_type") or payload.get("type") or "visual_crop_invalid"),
+                    "reason": str(payload.get("reason") or payload.get("message") or "visual guard returned a single issue"),
+                    "confidence": payload.get("confidence", 0.9),
+                    "provenance": payload.get("provenance", "vision_model:legacy_adapter"),
+                }
+                payload = {"passed": bool(valid), "issues": [] if valid else [issue]}
+            else:
+                raise ValueError("visual guard response does not match the required schema")
     except Exception:
         return {
             "passed": True,

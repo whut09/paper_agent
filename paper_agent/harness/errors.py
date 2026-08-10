@@ -34,27 +34,45 @@ class WorkflowTimeoutError(RecoverableWorkflowError):
 
 
 def is_recoverable_error(exc: BaseException) -> bool:
-    if isinstance(exc, BaseExceptionGroup):
-        return any(is_recoverable_error(item) for item in exc.exceptions)
-    if isinstance(exc, (RecoverableWorkflowError, TimeoutError, ConnectionError, OSError)):
-        return True
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "timeout",
-            "timed out",
-            "connection",
-            "temporarily unavailable",
-            "server disconnected",
-            "rate limit",
-            "429",
-            "502",
-            "503",
-            "504",
-            "transport",
-        )
-    )
+    # Nodes often wrap an SDK exception in a user-facing RuntimeError.  The
+    # old classifier only inspected the wrapper text, so a Chinese wrapper
+    # around APIConnectionError was incorrectly treated as non-recoverable.
+    # Walk the complete exception chain before applying message heuristics.
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if isinstance(current, (RecoverableWorkflowError, TimeoutError, ConnectionError, OSError)):
+            return True
+        text = str(current).lower()
+        if any(
+            marker in text
+            for marker in (
+                "timeout",
+                "timed out",
+                "connection",
+                "连接失败",
+                "服务端断开",
+                "temporarily unavailable",
+                "server disconnected",
+                "rate limit",
+                "429",
+                "502",
+                "503",
+                "504",
+                "transport",
+            )
+        ):
+            return True
+    return False
 
 
 def classify_error(exc: BaseException) -> str:

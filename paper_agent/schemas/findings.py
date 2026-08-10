@@ -166,6 +166,15 @@ def normalize_reason_code(value: str) -> str:
         "verifier_timeout_warning": FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value,
         "api_connection_error": FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value,
         "timeout": FindingReasonCode.VERIFIER_TRANSPORT_FAILURE.value,
+        # Visual models use several equivalent descriptions for a crop that
+        # contains surrounding prose, headings, or page furniture.  Keep this
+        # in the visual-repair domain instead of falling back to legacy_error,
+        # which previously routed it into an unrelated report rewrite.
+        "extraneous_content": FindingReasonCode.VISUAL_CROP_INVALID.value,
+        "irrelevant_content": FindingReasonCode.VISUAL_CROP_INVALID.value,
+        "irrelevant_text": FindingReasonCode.VISUAL_CROP_INVALID.value,
+        "surrounding_prose": FindingReasonCode.VISUAL_CROP_INVALID.value,
+        "page_furniture": FindingReasonCode.VISUAL_CROP_INVALID.value,
     }
     return aliases.get(lowered, lowered if lowered in KNOWN_REASON_CODES else FindingReasonCode.LEGACY_ERROR.value)
 
@@ -181,6 +190,7 @@ def infer_reason_code(value: str, message: str = "") -> str:
         (r"caption_truncated|caption_cropped|caption.*truncat|caption.*截断", FindingReasonCode.CAPTION_TRUNCATED.value),
         (r"mixed_objects|mixed_figure_table|两个独立对象|图.*表格.*同时", FindingReasonCode.MIXED_OBJECTS.value),
         (r"object_mixing|asset\s+\d+\s+composition|composition:.*(?:table|figure)|candidate.*(?:two|multiple).*table", FindingReasonCode.MIXED_OBJECTS.value),
+        (r"extraneous_content|irrelevant_content|irrelevant_text|surrounding_prose|surrounding prose|unrelated (?:text|content)|大段正文|无关内容|章节标题", FindingReasonCode.VISUAL_CROP_INVALID.value),
         (r"type_mismatch|declared_type_mismatch|kind mismatch|声明类型.*不符", FindingReasonCode.TYPE_MISMATCH.value),
         (r"formula.*contamin|公式.*正文|surrounding prose", FindingReasonCode.FORMULA_CONTAMINATION.value),
         (

@@ -19,11 +19,23 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from paper_agent.harness import NodeResult, PaperContext, PaperWorkflow, PaperWorkflowContext, PaperWorkflowNode
+from paper_agent.harness.errors import classify_error, is_recoverable_error
 from paper_agent.memory import get_self_improving_prompt_patches, record_summary_correction
 from paper_agent.schemas import PaperAsset, VerificationResult
 from paper_agent.schemas.findings import Finding
 from paper_agent.paper_summary import _build_repair_plan, _revise_report_once
 from paper_agent.tools.grounding import _build_grounding_map
+
+
+def test_wrapped_api_transport_error_is_recoverable():
+    try:
+        try:
+            raise ConnectionError("server disconnected")
+        except ConnectionError as cause:
+            raise RuntimeError("Codex 接口连接失败") from cause
+    except RuntimeError as exc:
+        assert is_recoverable_error(exc)
+        assert classify_error(exc) == "recoverable"
 
 
 def test_app_facades_import_without_optional_runtime_dependencies():
