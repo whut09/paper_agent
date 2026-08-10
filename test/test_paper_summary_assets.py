@@ -33,11 +33,14 @@ from paper_agent.paper_summary import (
     _caption_text_and_rect,
     _completion_content,
     _compile_report_asset_references,
+    _capture_formula_asset_by_number,
+    _capture_missing_asset_by_label,
     _asset_guard,
     _border_enclosed_table_rect_for_caption,
     _assert_report_ready_for_docx,
     _correction_memory_context,
     _deduplicate_assets,
+    _deduplicate_formula_evidence_disclosures,
     _document_xml,
     _drop_assets_and_rewrite_markers,
     _evidence_guard,
@@ -2548,6 +2551,112 @@ def test_referenced_formula_alignment_replaces_marked_unnumbered_formula_slot(tm
     assert len(assets) == 1
     assert _formula_asset_number(assets[0]) == "1"
     assert assets[0].text.endswith("(1)")
+
+
+def test_missing_formula_capture_routes_to_numbered_formula_scanner(tmp_path):
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=tmp_path,
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+    context.pdf_path = tmp_path / "paper.pdf"
+    context.work_dir = tmp_path / "assets"
+    expected = PaperAsset(
+        "formula",
+        3,
+        tmp_path / "formula-2.png",
+        "公式 2 截图",
+        text="y = x (2)",
+    )
+
+    with (
+        patch("paper_agent.paper_summary._capture_formula_asset_by_number", return_value=expected) as capture,
+        patch("paper_agent.paper_summary._capture_captioned_tables") as tables,
+    ):
+        result = _capture_missing_asset_by_label(context, ("formula", "2"))
+
+    assert result is expected
+    capture.assert_called_once_with(context.pdf_path, tmp_path / "assets" / "repair-assets" / "formula-2", "2")
+    tables.assert_not_called()
+
+
+def test_numbered_formula_scanner_captures_real_source_equation(tmp_path):
+    source = tmp_path / "paper.pdf"
+    document = fitz.open()
+    page = document.new_page()
+    page.insert_text((72, 120), "y = x + 1                                      (1)")
+    document.save(source)
+    document.close()
+
+    asset = _capture_formula_asset_by_number(source, tmp_path / "assets", "1")
+
+    assert asset is not None
+    assert asset.kind == "formula"
+    assert _formula_asset_number(asset) == "1"
+    assert asset.path.exists()
+
+
+def test_unanchored_formula_number_is_reconciled_before_asset_guard(tmp_path):
+    source = tmp_path / "paper.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(source)
+    document.close()
+    assets = [
+        PaperAsset(
+            "formula",
+            1,
+            tmp_path / "metric-header.png",
+            "关键公式截图",
+            text="k-ball coverage, k=5 ↑",
+        )
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "公式1定义旋转不变 IoU。\n\n"
+        "[[ASSET:1]]\n\n"
+        "公式1的工程含义是消除全局旋转歧义。\n\n"
+        "## 关键结果\n正文结果。"
+    )
+
+    with patch("paper_agent.paper_summary._capture_formula_asset_by_number", return_value=None):
+        result = _compile_report_asset_references(
+            summary,
+            assets,
+            source_pdf=source,
+            work_dir=tmp_path / "assets",
+            max_assets=1,
+            formula_candidates=["k-ball coverage, k=5 ↑"],
+        )
+
+    assert "公式1" not in result
+    assert "[[ASSET:1]]" not in _subsection_body(result, "关键公式")
+    assert "原文没有给出可独立截取的编号公式或显示方程" not in result
+    assert "未给出可核验的对应编号公式" in result
+    assert _asset_guard(result, assets, ["k-ball coverage, k=5 ↑"]).status == "passed"
+
+
+def test_table_metric_header_is_not_a_formula_candidate():
+    metric_header = "k-ball coverage, k=5 ↑"
+
+    assert _formula_candidate_is_noise(metric_header)
+    assert _extract_formula_candidates(metric_header) == []
+
+
+def test_formula_evidence_disclosures_are_deduplicated():
+    summary = (
+        "### 关键公式\n"
+        "原文没有给出可独立截取的编号公式或显示方程。\n"
+        "原文在正文中说明上述指标，但未给出可核验的对应编号公式，因此不展示公式截图。"
+    )
+
+    result = _deduplicate_formula_evidence_disclosures(summary)
+
+    assert "原文没有给出可独立截取的编号公式或显示方程" in result
+    assert "原文在正文中说明上述指标" not in result
 
 
 def test_formula_block_text_ignores_adjacent_column_touching_crop_edge():

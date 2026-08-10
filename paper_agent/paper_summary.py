@@ -2231,6 +2231,20 @@ def _ensure_formula_evidence_disclosure(
     return "\n".join(lines)
 
 
+def _deduplicate_formula_evidence_disclosures(summary: str) -> str:
+    """Keep one source-evidence disclosure when an incumbent draft has both forms."""
+
+    generic = "原文没有给出可独立截取的编号公式或显示方程"
+    specific = "未给出可核验的对应编号公式，因此不展示公式截图"
+    if generic not in summary or specific not in summary:
+        return summary
+    return "\n".join(
+        line
+        for line in summary.splitlines()
+        if specific not in line
+    )
+
+
 def _formula_asset_number(asset: PaperAsset) -> str:
     label = _compact_asset_label(_original_asset_label(asset))
     match = re.match(r"^公式([0-9]+[A-Za-z]?)$", label)
@@ -2260,7 +2274,7 @@ def _capture_formula_asset_by_number(
                 if rect.is_empty or rect.width < 45 or rect.height < 8 or not text:
                     continue
                 math_text = re.sub(r"[\(\[（]\s*\d+[A-Za-z]?\s*[\)\]）]", "", text)
-                if not _line_has_formula_syntax(math_text):
+                if not (_line_has_formula_syntax(math_text) or _formula_anchor_score(math_text) > 0):
                     # Parenthesized list items such as "validation: (1)" are
                     # not equation anchors.
                     continue
@@ -2355,12 +2369,14 @@ def _align_referenced_formula_assets(
     budget = max_assets if max_assets is not None else len(assets) + len(numbers)
     budget = max(1, int(budget))
     changed = False
+    unresolved: list[str] = []
     for number in numbers:
         current = existing.get(number)
         if current is not None and current.path.exists():
             continue
         candidate = _capture_formula_asset_by_number(source_pdf, work_dir, number)
         if candidate is None:
+            unresolved.append(number)
             continue
         # Formula extraction often finds an unnumbered continuation or a
         # nearby prose fragment first.  Reuse that formula slot when the
@@ -2407,7 +2423,96 @@ def _align_referenced_formula_assets(
         existing[number] = candidate
         changed = True
 
-    return _ensure_asset_markers(summary, assets) if changed else summary
+    reconciled = summary
+    if unresolved and _formula_source_is_scannable(source_pdf):
+        reconciled = _reconcile_unanchored_formula_references(
+            summary,
+            assets,
+            unresolved,
+        )
+    return _ensure_asset_markers(reconciled, assets) if changed else reconciled
+
+
+def _formula_source_is_scannable(source_pdf: Path) -> bool:
+    """Distinguish an absent equation from an unreadable source file."""
+
+    try:
+        with fitz.open(source_pdf) as document:
+            return document.page_count > 0
+    except Exception:
+        return False
+
+
+def _reconcile_unanchored_formula_references(
+    summary: str,
+    assets: list[PaperAsset],
+    unresolved_numbers: list[str],
+) -> str:
+    """Remove invented equation numbers after a complete source scan misses them."""
+
+    unresolved = {str(number).strip() for number in unresolved_numbers if str(number).strip()}
+    if not unresolved:
+        return summary
+    lines = summary.splitlines()
+    heading_index = next(
+        (
+            index
+            for index, line in enumerate(lines)
+            if re.match(r"^#{2,4}\s*关键公式\s*$", line.strip())
+        ),
+        None,
+    )
+    if heading_index is None:
+        return summary
+    heading_level = len(lines[heading_index]) - len(lines[heading_index].lstrip("#"))
+    end_index = len(lines)
+    for index in range(heading_index + 1, len(lines)):
+        stripped = lines[index].strip()
+        if not stripped.startswith("#"):
+            continue
+        level = len(stripped) - len(stripped.lstrip("#"))
+        if level <= heading_level:
+            end_index = index
+            break
+
+    formula_asset_numbers = {
+        asset_id: _formula_asset_number(asset)
+        for asset_id, asset in enumerate(assets, 1)
+        if asset.kind == "formula"
+    }
+    body = lines[heading_index + 1 : end_index]
+    revised: list[str] = []
+    for line in body:
+        if "原文没有给出可独立截取的编号公式或显示方程" in line:
+            continue
+        marker = re.fullmatch(r"\s*\[\[ASSET:(\d+)\]\]\s*", line)
+        if marker:
+            asset_number = formula_asset_numbers.get(int(marker.group(1)))
+            if asset_number == "" or asset_number in unresolved:
+                continue
+        for number in unresolved:
+            reference = (
+                rf"(?:公式|方程)\s*[（(]?\s*{re.escape(number)}\s*[）)]?"
+                rf"|(?:equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}\s*[）)]?"
+            )
+            line = re.sub(rf"如\s*(?:{reference})\s*所示", "按原文正文定义", line, flags=re.IGNORECASE)
+            line = re.sub(rf"(?:{reference})\s*的", "该定义的", line, flags=re.IGNORECASE)
+            line = re.sub(
+                rf"(?:{reference})\s*(定义|给出|描述|表示|用于|刻画)",
+                lambda match: f"原文正文{match.group(1)}",
+                line,
+                flags=re.IGNORECASE,
+            )
+            line = re.sub(rf"(?:{reference})", "该定义", line, flags=re.IGNORECASE)
+        revised.append(line)
+
+    disclosure = "原文在正文中说明上述指标或机制，但未给出可核验的对应编号公式，因此不展示公式截图。"
+    if disclosure not in revised:
+        while revised and not revised[-1].strip():
+            revised.pop()
+        revised.extend(["", disclosure, ""])
+    lines[heading_index + 1 : end_index] = revised
+    return "\n".join(lines)
 
 
 def _page_text_lines(page: fitz.Page) -> list[TextLine]:
@@ -2528,6 +2633,15 @@ def _formula_candidate_is_noise(text: str) -> bool:
     if len(numeric_tokens) >= 8 and not _equation_number_token(cleaned):
         return True
     if re.search(r"\b(?:total|recall|accuracy|baseline|method)\b", lowered) and len(numeric_tokens) >= 4:
+        return True
+    if (
+        re.search(
+            r"\b(?:coverage|accuracy|precision|recall|f1|iou|chamfer|latency|throughput)\b",
+            lowered,
+        )
+        and re.search(r"[↑↓]", cleaned)
+        and not _equation_number_token(cleaned)
+    ):
         return True
     return False
 
@@ -4503,6 +4617,8 @@ def _extract_formula_candidates(text: str, limit: int = 8) -> list[str]:
         if _formula_line_is_prose_fragment(line):
             continue
         normalized = _textualize_latex(line)
+        if _formula_candidate_is_noise(normalized):
+            continue
         if len(normalized) < 4 or normalized in candidates:
             continue
         candidates.append(normalized)
@@ -6018,6 +6134,7 @@ def _compile_report_asset_references(
         work_dir=work_dir,
         max_assets=max_assets,
     )
+    summary = _deduplicate_formula_evidence_disclosures(summary)
     summary = _remove_mismatched_asset_markers(summary, assets)
     excluded = excluded_asset_ids or set()
     summary = _remove_excluded_asset_markers(summary, excluded)
@@ -7259,6 +7376,14 @@ def _capture_missing_asset_by_label(
 
     repair_dir = context.work_dir / "repair-assets" / f"{key[0]}-{key[1]}"
     repair_dir.mkdir(parents=True, exist_ok=True)
+    if key[0] == "formula":
+        return _capture_formula_asset_by_number(
+            context.pdf_path,
+            repair_dir,
+            key[1],
+        )
+    if key[0] not in {"figure", "table"}:
+        return None
     doc = fitz.open(context.pdf_path)
     try:
         preferred_pages = [
@@ -8089,7 +8214,11 @@ def _asset_guard(
             )
         )
     formula_errors = _referenced_formula_asset_errors(summary, assets)
-    if formula_candidates and not any(asset.kind == "formula" for asset in assets):
+    if (
+        formula_candidates
+        and _formula_reference_numbers(summary)
+        and not any(asset.kind == "formula" for asset in assets)
+    ):
         formula_errors.append("论文存在公式候选，但没有可嵌入的公式截图")
     errors.extend(formula_errors)
     result_table_errors = _key_results_table_errors(summary, assets)
