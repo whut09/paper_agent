@@ -180,6 +180,7 @@ def infer_reason_code(value: str, message: str = "") -> str:
         (r"truncated_table|table_cropped|table.*truncat|表格.*截断|表格.*不完整", FindingReasonCode.TABLE_TRUNCATED.value),
         (r"caption_truncated|caption_cropped|caption.*truncat|caption.*截断", FindingReasonCode.CAPTION_TRUNCATED.value),
         (r"mixed_objects|mixed_figure_table|两个独立对象|图.*表格.*同时", FindingReasonCode.MIXED_OBJECTS.value),
+        (r"object_mixing|asset\s+\d+\s+composition|composition:.*(?:table|figure)|candidate.*(?:two|multiple).*table", FindingReasonCode.MIXED_OBJECTS.value),
         (r"type_mismatch|declared_type_mismatch|kind mismatch|声明类型.*不符", FindingReasonCode.TYPE_MISMATCH.value),
         (r"formula.*contamin|公式.*正文|surrounding prose", FindingReasonCode.FORMULA_CONTAMINATION.value),
         (

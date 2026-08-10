@@ -3079,14 +3079,52 @@ def _table_rect_for_caption(
     # caption-below layouts without guessing from numeric density.
     bordered_rect, bordered_text = _border_enclosed_table_rect_for_caption(page, caption_rect)
     if bordered_rect is not None:
-        return bordered_rect, bordered_text[:2500]
+        return _isolate_stacked_table_rect(page, caption_rect, bordered_rect, bordered_text, lines)
     detected_rect, detected_text = _detected_table_rect_for_caption(page, caption_rect)
     if detected_rect is not None:
-        return detected_rect, detected_text
+        return _isolate_stacked_table_rect(page, caption_rect, detected_rect, detected_text, lines)
     below_rect, below_text = _table_rect_below_caption(page, caption_rect, lines)
     if below_rect is not None:
-        return below_rect, below_text
+        return _isolate_stacked_table_rect(page, caption_rect, below_rect, below_text, lines)
     return _table_rect_above_caption(page, caption_rect, lines)
+
+
+def _isolate_stacked_table_rect(
+    page: fitz.Page,
+    caption_rect: fitz.Rect,
+    table_rect: fitz.Rect,
+    table_text: str,
+    lines: list[TextLine],
+) -> tuple[fitz.Rect, str]:
+    """Prevent a lower table caption from inheriting the table above it."""
+
+    # This applies to the common ``body -> caption`` layout.  A previous
+    # caption in the same column is a stronger boundary than the broad rule
+    # pairing used to recover borderless tables.
+    if table_rect.y1 > caption_rect.y0 + 4:
+        return table_rect, table_text
+    left, right = _caption_column_bounds(page, caption_rect)
+    previous_bottoms: list[float] = []
+    for index, line in enumerate(lines):
+        if not _caption_is_table(line.text) and not _caption_is_figure(line.text):
+            continue
+        if line.rect.y1 >= caption_rect.y0 - 3:
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0:
+            continue
+        kind = "table" if _caption_is_table(line.text) else "figure"
+        _text, previous_rect = _caption_text_and_rect(lines, index, page, kind)
+        if previous_rect.y1 < caption_rect.y0 - 3:
+            previous_bottoms.append(previous_rect.y1)
+    if not previous_bottoms:
+        return table_rect, table_text
+    boundary = max(previous_bottoms) + 4.0
+    if not table_rect.y0 < boundary < table_rect.y1 - 20:
+        return table_rect, table_text
+    isolated = fitz.Rect(table_rect.x0, boundary, table_rect.x1, table_rect.y1)
+    if isolated.is_empty or isolated.height < 20:
+        return table_rect, table_text
+    return isolated, table_text
 
 
 def _border_enclosed_table_rect_for_caption(

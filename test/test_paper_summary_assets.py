@@ -71,6 +71,7 @@ from paper_agent.paper_summary import (
     _figure_caption_continuation_is_body_text,
     _graphic_region_is_page_artifact,
     _image_size_emu,
+    _isolate_stacked_table_rect,
     _is_formula_continuation_line,
     _line_is_front_matter_or_body_before_figure,
     _local_visual_asset_issues,
@@ -2644,6 +2645,29 @@ def test_table_metric_header_is_not_a_formula_candidate():
 
     assert _formula_candidate_is_noise(metric_header)
     assert _extract_formula_candidates(metric_header) == []
+
+
+def test_stacked_table_capture_stops_after_previous_multiline_caption():
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    lines = [
+        line("Table 1: Reliability Metrics: Execution Success", 54, 415, 297, 424),
+        line("Success (R2) and Simulation Success (R3).", 54, 425, 211, 434),
+        line("Table 2: Design Quality Metrics: Safety Factor", 54, 509, 297, 518),
+        line("and Constraint Compliance.", 54, 519, 220, 528),
+    ]
+
+    isolated, _text = _isolate_stacked_table_rect(
+        page,
+        fitz.Rect(54, 509, 297, 528),
+        fitz.Rect(54, 339, 297, 497),
+        "table text",
+        lines,
+    )
+    document.close()
+
+    assert isolated.y0 == 438
+    assert isolated.y1 == 497
 
 
 def test_formula_evidence_disclosures_are_deduplicated():

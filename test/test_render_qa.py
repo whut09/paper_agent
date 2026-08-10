@@ -174,6 +174,27 @@ def test_render_qa_does_not_require_unreferenced_manifest_asset(tmp_path):
     assert "missing_critical_asset" not in result.reason_codes
 
 
+def test_render_qa_does_not_count_unembedded_optional_asset_as_missing(tmp_path):
+    first = _asset(tmp_path)
+    unused = _asset(tmp_path, "unused-formula.png", "Formula screenshot")
+    unused.kind = "formula"
+    docx_path = _docx(tmp_path, [first])
+    pdf_path = _rendered_pdf(tmp_path, first.path)
+
+    with patch.object(render_qa, "_render_docx", return_value=render_qa._RenderAttempt("fixture", pdf_path)):
+        result = render_qa.run_render_qa(
+            docx_path,
+            [first, unused],
+            tmp_path / "render",
+            required_asset_ids={1},
+        )
+
+    assert result.status == "pass"
+    assert "rendered_asset_count_mismatch" not in result.reason_codes
+    assert result.assets[0].rendered_page == 1
+    assert result.assets[1].rendered_page is None
+
+
 def test_render_qa_ignores_quarantined_source_crop(tmp_path):
     first = _asset(tmp_path)
     quarantined = _asset(tmp_path, "quarantined.png", "Figure 2: Detail")

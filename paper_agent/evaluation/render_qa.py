@@ -386,18 +386,28 @@ def _inspect_rendered_pdf(
         document.close()
 
     updated = list(assets)
-    for index, measurement in enumerate(updated):
-        if index >= len(rendered_images):
+    embedded_indices = [
+        index
+        for index, measurement in enumerate(updated)
+        if measurement.media_path
+    ]
+    for rendered_index, asset_index in enumerate(embedded_indices):
+        if rendered_index >= len(rendered_images):
             break
-        page_number, bbox, cropped = rendered_images[index]
-        updated[index] = replace(measurement, rendered_page=page_number, rendered_bbox=bbox, cropped=cropped)
-    if assets and len(rendered_images) < len(assets):
+        page_number, bbox, cropped = rendered_images[rendered_index]
+        updated[asset_index] = replace(
+            updated[asset_index],
+            rendered_page=page_number,
+            rendered_bbox=bbox,
+            cropped=cropped,
+        )
+    if embedded_indices and len(rendered_images) < len(embedded_indices):
         findings.append(
             _finding(
                 "rendered_asset_count_mismatch",
                 "warning",
                 "Rendered PDF exposes fewer raster images than the DOCX asset manifest",
-                expected=len(assets),
+                expected=len(embedded_indices),
                 rendered=len(rendered_images),
             )
         )

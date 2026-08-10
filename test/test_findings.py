@@ -179,3 +179,13 @@ def test_visual_guard_response_migrates_issue_reason_code():
     )
     assert response["issues"][0]["reason_code"] == "mixed_objects"
     assert response["issues"][0]["provenance"] == "vision_model"
+
+
+def test_visual_composition_aliases_route_to_mixed_object_repair():
+    composition = (
+        "asset 6 composition: candidate contains complete Table 1 and Table 2"
+    )
+    object_mixing = "asset 7 object_mixing: two independent table objects"
+
+    assert infer_reason_code("composition", composition) == "mixed_objects"
+    assert infer_reason_code("object_mixing", object_mixing) == "mixed_objects"
