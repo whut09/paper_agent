@@ -104,6 +104,7 @@ from paper_agent.paper_summary import (
     _replace_report_section_body,
     _substance_issue_sections,
     _critical_referenced_asset_keys_in_text,
+    _critical_referenced_asset_keys,
     _critical_asset_key_map,
     _remove_mismatched_asset_markers,
     _recapture_critical_visual_assets,
@@ -2586,6 +2587,14 @@ def test_critical_asset_references_cover_all_explicit_numbered_objects():
     )
 
     assert {("figure", "6"), ("table", "4"), ("formula", "21"), ("formula", "18")} <= keys
+
+
+def test_key_sections_require_recall_for_all_explicit_figures_and_tables():
+    keys = _critical_referenced_asset_keys(
+        "## 关键结果\n如表3所示，图4进一步显示了批大小实验。"
+    )
+
+    assert {("table", "3"), ("figure", "4")} <= keys
 
 
 def test_formula_assets_are_available_to_critical_asset_reconciliation(tmp_path):

@@ -8402,16 +8402,40 @@ def _asset_label_key(asset: PaperAsset) -> tuple[str, str] | None:
 
 def _critical_referenced_asset_keys(summary: str) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
+    current_section = ""
     for line in summary.splitlines():
         stripped = _clean_xml_text(line.strip())
+        heading = re.match(r"^#{1,6}\s+(.+?)\s*$", stripped)
+        if heading:
+            current_section = re.sub(r"\s+", "", heading.group(1))
+            continue
         if not stripped or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
             continue
+        require_full_recall = _critical_reference_scope_requires_full_recall(current_section)
         keys.update(
             key
             for key in _critical_referenced_asset_keys_in_text(stripped)
-            if key[0] == "formula" or key[1] in {"1", "2"}
+            if key[0] == "formula" or key[1] in {"1", "2"} or require_full_recall
         )
     return keys
+
+
+def _critical_reference_scope_requires_full_recall(section: str) -> bool:
+    """Require every explicit visual reference in evidence-bearing sections."""
+
+    compact = re.sub(r"\s+", "", section or "")
+    return any(
+        token in compact
+        for token in (
+            "关键结果",
+            "方法主线",
+            "实验结果",
+            "实验分析",
+            "消融实验",
+            "背景与问题",
+            "数据与任务定义",
+        )
+    )
 
 
 def _critical_referenced_asset_keys_in_text(text: str) -> set[tuple[str, str]]:
