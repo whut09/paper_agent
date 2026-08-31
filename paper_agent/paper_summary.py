@@ -2378,6 +2378,14 @@ def _align_referenced_formula_assets(
         if candidate is None:
             unresolved.append(number)
             continue
+        if _formula_asset_number(candidate) != number:
+            logger.warning(
+                "Formula capture returned mismatched equation %s for requested %s; ignoring it",
+                _formula_asset_number(candidate) or "<unlabeled>",
+                number,
+            )
+            unresolved.append(number)
+            continue
         # Formula extraction often finds an unnumbered continuation or a
         # nearby prose fragment first.  Reuse that formula slot when the
         # report already references it, so max_assets cannot prevent a real
@@ -2416,6 +2424,15 @@ def _align_referenced_formula_assets(
                 None,
             )
             if replace_index is None:
+                # `max_assets` limits optional evidence.  An explicitly
+                # discussed numbered equation is mandatory evidence, so do
+                # not silently drop it merely because every existing formula
+                # is mentioned in the draft.  Critical overflow is preferable
+                # to a report that claims to explain an equation without its
+                # source screenshot.
+                assets.append(candidate)
+                existing[number] = candidate
+                changed = True
                 continue
             assets[replace_index] = candidate
         else:
@@ -7191,7 +7208,9 @@ def _report_rewrite_is_safe(previous: str, candidate: str) -> bool:
 
 def _is_critical_asset(asset: PaperAsset) -> bool:
     key = _asset_label_key(asset)
-    return bool(key and key[1] in {"1", "2"})
+    # Numbered formulas are evidence-bearing whenever they are present in the
+    # report; only optional figures/tables may be quarantined with a peer.
+    return bool(key and (key[0] == "formula" or key[1] in {"1", "2"}))
 
 
 def _asset_report_role(summary: str, asset_id: int) -> str:
@@ -7313,6 +7332,7 @@ def _quarantine_recoverable_visual_failures(context: _PaperWorkflowContext) -> s
         asset_id
         for asset_id in candidates
         if 1 <= asset_id <= len(context.assets)
+        and context.assets[asset_id - 1].kind != "formula"
         and _has_usable_peer_evidence(context, asset_id)
     }
     if not quarantined:
@@ -8363,17 +8383,17 @@ def _critical_asset_key_map(assets: list[PaperAsset]) -> dict[tuple[str, str], i
     key_map: dict[tuple[str, str], int] = {}
     for asset_id, asset in enumerate(assets, 1):
         key = _asset_label_key(asset)
-        if key and key[1] in {"1", "2"}:
+        if key:
             key_map.setdefault(key, asset_id)
     return key_map
 
 
 def _asset_label_key(asset: PaperAsset) -> tuple[str, str] | None:
     label = _compact_asset_label(_original_asset_label(asset))
-    match = re.match(r"^(图|表)([0-9一二三四五六七八九十]+[A-Za-z]?)$", label)
+    match = re.match(r"^(图|表|公式)([0-9一二三四五六七八九十]+[A-Za-z]?)$", label)
     if not match:
         return None
-    kind = "figure" if match.group(1) == "图" else "table"
+    kind = {"图": "figure", "表": "table", "公式": "formula"}[match.group(1)]
     number = _critical_asset_number(match.group(2))
     if not number:
         return None
@@ -8386,15 +8406,20 @@ def _critical_referenced_asset_keys(summary: str) -> set[tuple[str, str]]:
         stripped = _clean_xml_text(line.strip())
         if not stripped or re.fullmatch(r"\[\[ASSET:\d+\]\]", stripped):
             continue
-        keys.update(_critical_referenced_asset_keys_in_text(stripped))
+        keys.update(
+            key
+            for key in _critical_referenced_asset_keys_in_text(stripped)
+            if key[0] == "formula" or key[1] in {"1", "2"}
+        )
     return keys
 
 
 def _critical_referenced_asset_keys_in_text(text: str) -> set[tuple[str, str]]:
     keys: set[tuple[str, str]] = set()
     chinese_patterns = [
-        ("table", r"表\s*([12一二])(?![0-9A-Za-z一二三四五六七八九十])"),
-        ("figure", r"图\s*([12一二])(?![0-9A-Za-z一二三四五六七八九十])"),
+        ("table", r"表\s*([0-9一二三四五六七八九十]+[A-Za-z]?)(?![0-9A-Za-z一二三四五六七八九十])"),
+        ("figure", r"图\s*([0-9一二三四五六七八九十]+[A-Za-z]?)(?![0-9A-Za-z一二三四五六七八九十])"),
+        ("formula", r"(?:公式|方程)\s*[（(]?\s*([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[）)]?"),
     ]
     for kind, pattern in chinese_patterns:
         for match in re.finditer(pattern, text):
@@ -8404,8 +8429,9 @@ def _critical_referenced_asset_keys_in_text(text: str) -> set[tuple[str, str]]:
             if number:
                 keys.add((kind, number))
     english_patterns = [
-        ("table", r"(?i)\b(?:table|tab\.)\s*([12]|I{1,2})\b"),
-        ("figure", r"(?i)\b(?:figure|fig\.?)\s*([12]|I{1,2})\b"),
+        ("table", r"(?i)\b(?:table|tab\.)\s*([0-9]+[A-Za-z]?|[IVXLCDM]+)\b"),
+        ("figure", r"(?i)\b(?:figure|fig\.?)\s*([0-9]+[A-Za-z]?|[IVXLCDM]+)\b"),
+        ("formula", r"(?i)\b(?:equation|eq\.?|formula)\s*[（(]?\s*([0-9]+[A-Za-z]?|[IVXLCDM]+)\s*[）)]?"),
     ]
     for kind, pattern in english_patterns:
         for match in re.finditer(pattern, text):
@@ -8424,11 +8450,22 @@ def _asset_reference_is_layout_hint(text: str, end: int) -> bool:
 
 def _critical_asset_number(value: str) -> str:
     raw = str(value).strip().upper()
-    normalized = {"一": "1", "二": "2"}.get(raw, raw)
+    normalized = {
+        "一": "1",
+        "二": "2",
+        "三": "3",
+        "四": "4",
+        "五": "5",
+        "六": "6",
+        "七": "7",
+        "八": "8",
+        "九": "9",
+        "十": "10",
+    }.get(raw, raw)
     roman = _roman_to_int(normalized)
     if roman is not None:
         normalized = str(roman)
-    return normalized if normalized in {"1", "2"} else ""
+    return normalized if re.fullmatch(r"[0-9]{1,3}[A-Z]?", normalized) else ""
 
 
 def _roman_to_int(value: str) -> int | None:
@@ -8445,14 +8482,15 @@ def _roman_to_int(value: str) -> int | None:
 
 
 def _critical_asset_label(key: tuple[str, str]) -> str:
-    prefix = "图" if key[0] == "figure" else "表"
+    prefix = {"figure": "图", "table": "表", "formula": "公式"}.get(key[0], key[0])
     return f"{prefix}{key[1]}"
 
 
 def _critical_asset_sort_key(key: tuple[str, str]) -> tuple[int, int]:
-    kind_rank = 0 if key[0] == "figure" else 1
+    kind_rank = {"figure": 0, "table": 1, "formula": 2}.get(key[0], 3)
     number = _critical_asset_number(key[1])
-    return kind_rank, int(number) if number else 999
+    numeric_part = re.match(r"\d+", number)
+    return kind_rank, int(numeric_part.group(0)) if numeric_part else 999
 
 
 def _remove_mismatched_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
@@ -9075,8 +9113,6 @@ def _formula_asset_text_looks_contaminated(text: str) -> bool:
     if not cleaned or not _line_has_formula_syntax(cleaned):
         return False
     words = re.findall(r"[A-Za-z]{3,}", cleaned)
-    if len(words) >= 7:
-        return True
     lowered = f" {cleaned.lower()} "
     prose_fragments = (
         " as shown",
@@ -11714,11 +11750,11 @@ def _ensure_key_formula_markers(
     insertions: dict[int, list[str]] = {}
     for asset_id, number in sorted(formula_ids.items(), key=lambda item: int(re.match(r"\d+", item[1]).group(0))):
         number_pattern = re.compile(
-            rf"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}\b"
+            rf"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}(?![0-9A-Za-z])"
         )
         matching_heading = None
         for index in range(heading_index + 1, end_index):
-            if re.match(r"^#{3,4}\s*公式\s*" + re.escape(number) + r"\b", lines[index].strip(), re.IGNORECASE):
+            if re.match(r"^#{3,4}\s*公式\s*" + re.escape(number) + r"(?![0-9A-Za-z])", lines[index].strip(), re.IGNORECASE):
                 matching_heading = index
                 break
         if matching_heading is None:

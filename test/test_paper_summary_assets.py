@@ -72,6 +72,7 @@ from paper_agent.paper_summary import (
     _graphic_region_is_page_artifact,
     _image_size_emu,
     _isolate_stacked_table_rect,
+    _is_critical_asset,
     _is_formula_continuation_line,
     _line_is_front_matter_or_body_before_figure,
     _local_visual_asset_issues,
@@ -103,6 +104,7 @@ from paper_agent.paper_summary import (
     _replace_report_section_body,
     _substance_issue_sections,
     _critical_referenced_asset_keys_in_text,
+    _critical_asset_key_map,
     _remove_mismatched_asset_markers,
     _recapture_critical_visual_assets,
     _sync_inline_asset_references,
@@ -2167,6 +2169,22 @@ def test_local_visual_asset_guard_blocks_formula_with_surrounding_prose():
     assert any("surrounding prose" in issue["message"] for issue in issues)
 
 
+def test_local_visual_asset_guard_accepts_latex_command_fragments_in_formula_text(tmp_path):
+    formula = tmp_path / "formula.png"
+    Image.new("RGB", (662, 49), "white").save(formula)
+    asset = PaperAsset(
+        "formula",
+        5,
+        formula,
+        "Formula screenshot (18)",
+        text=r"\operatorname {Quantile}_{\gamma }(s^c_{i,k}), (18)",
+    )
+
+    issues = _local_visual_asset_issues(1, asset)
+
+    assert not any("surrounding prose" in issue["message"] for issue in issues)
+
+
 def test_trim_formula_edge_fragments_removes_bottom_text_sliver():
     with TemporaryDirectory() as tmp:
         formula = Path(tmp) / "formula.png"
@@ -2489,6 +2507,23 @@ def test_formula_marker_is_inserted_after_plain_formula_reference():
     assert "公式1用于定义终端恢复结果的 hybrid reward。\n[[ASSET:1]]" in result
 
 
+def test_key_formula_markers_match_compact_chinese_references():
+    assets = [
+        PaperAsset("formula", 1, Path("formula-4.png"), "公式 4 截图", text="x = y (4)"),
+        PaperAsset("formula", 1, Path("formula-8.png"), "公式 8 截图", text="x = y (8)"),
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "公式4说明前景抑制。\n\n公式8说明坐标监督。"
+    )
+
+    result = _ensure_key_formula_markers(summary, assets)
+
+    body = _subsection_body(result, "关键公式")
+    assert body.count("[[ASSET:1]]") == 1
+    assert body.count("[[ASSET:2]]") == 1
+
+
 def test_referenced_formula_alignment_replaces_unused_formula_under_full_budget(tmp_path):
     assets = [
         PaperAsset("formula", 1, tmp_path / "formula-4.png", "公式 4 截图", text="x = y (4)"),
@@ -2515,6 +2550,54 @@ def test_referenced_formula_alignment_replaces_unused_formula_under_full_budget(
         )
 
     assert [_formula_asset_number(asset) for asset in assets] == ["4", "12", "18"]
+
+
+def test_referenced_formula_alignment_keeps_all_explicit_evidence_when_budget_is_full(tmp_path):
+    assets = [
+        PaperAsset("formula", 1, tmp_path / "formula-4.png", "公式 4 截图", text="x = y (4)"),
+        PaperAsset("formula", 1, tmp_path / "formula-12.png", "公式 12 截图", text="x = y (12)"),
+        PaperAsset("formula", 1, tmp_path / "formula-5.png", "公式 5 截图", text="x = y (5)"),
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "公式4说明前景抑制。公式12说明偏移预测。公式5说明置信度。公式18说明坐标监督。"
+    )
+    replacement = PaperAsset(
+        "formula", 2, tmp_path / "formula-18.png", "公式 18 截图", text="x = y (18)"
+    )
+    with patch(
+        "paper_agent.paper_summary._capture_formula_asset_by_number",
+        return_value=replacement,
+    ):
+        _align_referenced_formula_assets(
+            summary,
+            assets,
+            source_pdf=tmp_path / "paper.pdf",
+            work_dir=tmp_path,
+            max_assets=3,
+        )
+
+    assert [_formula_asset_number(asset) for asset in assets] == ["4", "12", "5", "18"]
+
+
+def test_critical_asset_references_cover_all_explicit_numbered_objects():
+    keys = _critical_referenced_asset_keys_in_text(
+        "如图6所示，表4给出结果；Equation 21 定义阈值，公式18用于相似度计算。"
+    )
+
+    assert {("figure", "6"), ("table", "4"), ("formula", "21"), ("formula", "18")} <= keys
+
+
+def test_formula_assets_are_available_to_critical_asset_reconciliation(tmp_path):
+    asset = PaperAsset("formula", 1, tmp_path / "formula-18.png", "公式 18 截图", text="x = y (18)")
+
+    assert _critical_asset_key_map([asset]) == {("formula", "18"): 1}
+
+
+def test_numbered_formula_is_never_treated_as_quarantinable_optional_asset(tmp_path):
+    asset = PaperAsset("formula", 1, tmp_path / "formula-18.png", "公式 18 截图", text="x = y (18)")
+
+    assert _is_critical_asset(asset)
 
 
 def test_referenced_formula_alignment_replaces_marked_unnumbered_formula_slot(tmp_path):
