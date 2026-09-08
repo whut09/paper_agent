@@ -768,7 +768,7 @@ class GenerateReport(_PaperWorkflowNode):
     depends_on = ("ReviseReport",)
     agent_role = _PaperAgentRole.SYNTHESIZER
     agent_contract = _SYNTHESIZER_AGENT_CONTRACT
-    requires = ["verified_report", "asset_manifest", "formulas"]
+    requires = ["verified_report", "asset_manifest", "formulas", "paper_url"]
     produces = [
         "docx",
         "summary.md",
@@ -792,7 +792,11 @@ class GenerateReport(_PaperWorkflowNode):
         context.knowledge_graph_path = context.output / f"{context.paper_name}-knowledge-graph.json"
         context.asset_candidates_path = context.output / f"{context.paper_name}-asset-candidates.json"
         context.summary = _ensure_chinese_report_title(context.summary)
-        context.summary = _enrich_core_info_from_pdf(context.summary, context.pdf_path)
+        context.summary = _enrich_core_info_from_pdf(
+            context.summary,
+            context.pdf_path,
+            context.paper_url,
+        )
         context.summary = _compile_report_asset_references(
             context.summary,
             context.assets,
@@ -1361,6 +1365,7 @@ def summarize_paper(
     summary_language: str = "中文",
     codex_envs: dict[str, str] | None = None,
     max_assets: int = DEFAULT_MAX_ASSETS,
+    paper_url: str = "",
     progress: _ProgressCallback | None = None,
     cancellation_event: asyncio.Event | None = None,
     workflow: _PaperWorkflow | None = None,
@@ -1373,6 +1378,7 @@ def summarize_paper(
         summary_language=summary_language,
         codex_envs=codex_envs,
         max_assets=max_assets,
+        paper_url=paper_url,
         progress=progress,
         cancellation_event=cancellation_event,
         workflow=workflow,
@@ -1392,6 +1398,7 @@ def summarize_paper_detailed(
     summary_language: str = "中文",
     codex_envs: dict[str, str] | None = None,
     max_assets: int = DEFAULT_MAX_ASSETS,
+    paper_url: str = "",
     progress: _ProgressCallback | None = None,
     cancellation_event: asyncio.Event | None = None,
     workflow: _PaperWorkflow | None = None,
@@ -1405,6 +1412,7 @@ def summarize_paper_detailed(
         summary_language=summary_language,
         codex_envs=codex_envs or {},
         max_assets=max_assets,
+        paper_url=str(paper_url or "").strip(),
         progress=progress,
         cancellation_event=cancellation_event,
     )
@@ -1434,8 +1442,18 @@ def _summary_run_result(
                 reason_codes.append(_infer_reason_code(reason, str(failure.get("reason") or "")))
     if exc is not None:
         lowered = str(exc).lower()
-        if any(token in lowered for token in ("timeout", "timed out", "connection", "transport", "429", "502", "503", "504")):
+        timeout_tokens = ("timeout", "timed out", "连接超时", "transport", "429", "502", "503", "504")
+        connection_tokens = (
+            "connection",
+            "连接失败",
+            "网络链路",
+            "服务端断开",
+            "server disconnected",
+        )
+        if any(token in lowered for token in timeout_tokens):
             reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "network_timeout")
+        elif any(token in lowered for token in connection_tokens):
+            reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "model_connection_failure")
         else:
             reason_codes.append("workflow_failure")
     reason_codes = list(dict.fromkeys(code for code in reason_codes if code))
@@ -11899,12 +11917,23 @@ def _ensure_primary_result_table_marker(
     return "\n".join(lines)
 
 
-def _enrich_core_info_from_pdf(summary: str, source_pdf: Path | None) -> str:
-    """Add only deterministic front-matter metadata that is present in the PDF."""
+def _enrich_core_info_from_pdf(
+    summary: str,
+    source_pdf: Path | None,
+    paper_url: str = "",
+) -> str:
+    """Add deterministic PDF metadata and the caller-provided paper URL."""
 
-    if source_pdf is None or not source_pdf.exists():
-        return summary
-    metadata = _extract_front_matter_metadata(source_pdf)
+    metadata = {}
+    if source_pdf is not None and source_pdf.exists():
+        metadata = _extract_front_matter_metadata(source_pdf)
+    supplied_url = str(paper_url or "").strip()
+    if supplied_url:
+        # The URL entered in the link workflow is authoritative for the
+        # report. PDF front matter may contain an arXiv URL for a different
+        # version, or no URL at all, while the caller may have used a venue
+        # PDF/translation address.
+        metadata["论文链接"] = supplied_url
     if not metadata:
         return summary
     pattern = re.compile(r"(?ms)(^##\s*核心信息\s*\n)(.*?)(?=^## |\Z)")
@@ -11919,7 +11948,9 @@ def _enrich_core_info_from_pdf(summary: str, source_pdf: Path | None) -> str:
             replacement = f"- {label}: {value}"
             replaced = False
             for index, line in enumerate(lines):
-                if _core_info_line_key(line) == label:
+                line_key = _core_info_line_key(line)
+                is_paper_link_alias = label == "论文链接" and line_key in {"论文链接", "论文地址"}
+                if line_key == label or is_paper_link_alias:
                     lines[index] = replacement
                     replaced = True
                     break

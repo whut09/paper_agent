@@ -30,6 +30,7 @@ class PaperWorkflowContext:
     summary_language: str
     codex_envs: dict[str, str]
     max_assets: int
+    paper_url: str = ""
     progress: ProgressCallback | None = None
     cancellation_event: asyncio.Event | None = None
     run_id: str = field(default_factory=_default_run_id)

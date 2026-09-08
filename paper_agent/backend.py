@@ -87,6 +87,7 @@ def summarize_task(
             summary_language=args.get("summary_language", "中文"),
             codex_envs=args.get("codex_envs", {}),
             max_assets=int(args.get("max_assets", DEFAULT_MAX_ASSETS)),
+            paper_url=str(args.get("paper_url") or args.get("source_url") or "").strip(),
             progress=progress_bar,
         )
         sidecars = {
