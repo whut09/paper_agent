@@ -947,6 +947,11 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     elif "invalid_paper_url" in result.reason_codes:
         issue = "输入的内容不是有效的论文链接。"
         cause = "请粘贴以 http:// 或 https:// 开头的论文 PDF 链接；论文标题需要先在浏览器中打开对应 PDF 后再粘贴链接。"
+    elif "model_connection_failure" in result.reason_codes or any(
+        token in message for token in ("连接失败", "服务端断开", "网络链路")
+    ):
+        issue = "模型服务连接失败。"
+        cause = "Codex 接口已自动重试，但服务端仍断开连接；请检查 CODEX_BASE_URL、CODEX_USE_PROXY/CODEX_PROXY 和接口服务状态后重试。"
     elif result.status == "timeout" or any(
         code in {"network_timeout", "verifier_transport_failure"} for code in result.reason_codes
     ):
@@ -1014,7 +1019,8 @@ def summarize_file(
         else:
             if not link_input:
                 raise gr.Error("No input")
-            paper_url = _validate_paper_url(link_input)
+            entered_paper_url = str(link_input).strip()
+            paper_url = _validate_paper_url(entered_paper_url)
             progress(0.01, desc="正在下载论文...")
 
             def download_progress(downloaded: int, total: int | None) -> None:
@@ -1078,6 +1084,7 @@ def summarize_file(
                 "CODEX_PROXY": get_config_or_env("CODEX_PROXY"),
             },
             max_assets=max_assets_value,
+            paper_url=entered_paper_url if file_type != "File" else "",
             progress=progress_bar,
             cancellation_event=cancellation_event,
         )

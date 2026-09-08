@@ -90,6 +90,22 @@ def test_gradio_network_timeout_has_plain_language_explanation():
     assert "retry_verifier" not in markdown
 
 
+def test_gradio_model_connection_failure_has_plain_language_explanation():
+    result = SummaryRunResult(
+        status="failed",
+        message="总结失败：Codex 接口连接失败，服务端断开。",
+        current_stage="SummarizeContribution",
+        progress=0.52,
+        reason_codes=["model_connection_failure"],
+    )
+
+    markdown = _format_summary_diagnostics(result)
+
+    assert "模型服务连接失败" in markdown
+    assert "最终检查" not in markdown
+    assert "CODEX_BASE_URL" in markdown
+
+
 def test_gradio_callback_returns_diagnostics_for_download_timeout():
     state = {"session_id": None}
     with patch("paper_agent.gui.download_with_limit", side_effect=requests.exceptions.ReadTimeout("connection timed out")):
@@ -108,6 +124,38 @@ def test_gradio_callback_returns_diagnostics_for_download_timeout():
     assert response[0]["visible"] is False
     assert "连接超时" in response[4]["value"]
     assert "network_timeout" not in response[4]["value"]
+    assert state["session_id"] is None
+
+
+def test_link_summary_passes_entered_url_to_workflow(tmp_path):
+    downloaded = tmp_path / "paper.pdf"
+    downloaded.write_bytes(b"%PDF-1.7")
+    state = {"session_id": None}
+    captured = {}
+    result = _result(tmp_path, "success", downloadable=True)
+
+    def fake_summary(*_args, **kwargs):
+        captured.update(kwargs)
+        return result
+
+    with (
+        patch("paper_agent.gui.download_with_limit", return_value=str(downloaded)),
+        patch("paper_agent.gui.summarize_paper_detailed", side_effect=fake_summary),
+    ):
+        response = summarize_file(
+            "Link",
+            None,
+            "  https://example.test/translation/paper.pdf  ",
+            "All",
+            "",
+            13,
+            "",
+            state,
+            progress=lambda *args, **kwargs: None,
+        )
+
+    assert captured["paper_url"] == "https://example.test/translation/paper.pdf"
+    assert response[0]["visible"] is True
     assert state["session_id"] is None
 
 

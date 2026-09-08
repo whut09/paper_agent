@@ -310,6 +310,7 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         context.output = Path(tmp)
         context.source_path = Path("paper.pdf")
         context.paper_name = "paper"
+        context.paper_url = "https://example.test/translation/paper.pdf"
         context.summary = _valid_test_summary()
         context.knowledge_graph = {
             "nodes": [{"id": "paper:paper", "label": "Paper", "type": "paper", "source_section": ""}],
@@ -334,6 +335,7 @@ def test_generate_report_writes_knowledge_graph_sidecar():
         assert "guards" in verification_text
         assert "paper:paper" in graph_text
         assert "agent_trace" in graph_text
+        assert "- 论文链接: https://example.test/translation/paper.pdf" in context.summary_markdown_path.read_text(encoding="utf-8")
 
 
 def test_correction_memory_records_and_loads_by_paper_id():
@@ -945,6 +947,22 @@ def test_core_info_title_uses_original_paper_title():
 
     assert "- 原文标题: Linear Image Generation by Synthesizing Exposure Brackets" in result
     assert "text-to-linear-image generation" not in result
+
+
+def test_supplied_paper_url_is_added_to_core_info_without_pdf_metadata():
+    summary = """# 测试论文
+
+## 核心信息
+- 原文标题: Test Paper
+
+## 摘要
+测试。
+"""
+    url = "https://example.test/translation/test-paper.pdf"
+
+    result = _enrich_core_info_from_pdf(summary, None, url)
+
+    assert f"- 论文链接: {url}" in result
 
 
 def test_multiline_title_keeps_collaboration_line(tmp_path):
