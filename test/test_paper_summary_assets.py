@@ -58,6 +58,7 @@ from paper_agent.paper_summary import (
     _fallback_visual_rect_for_caption,
     _extract_verifiable_claims,
     _format_guard,
+    _contains_process_preface,
     _formula_anchor_score,
     _formula_candidate_is_noise,
     _formula_block_text,
@@ -629,6 +630,17 @@ def test_format_guard_blocks_incomplete_report_and_process_preface():
     assert any("model process preface" in error for error in result.errors)
     assert any("missing required section" in error for error in result.errors)
     assert any("required section is too short: 方法主线" in error for error in result.errors)
+
+
+def test_format_guard_does_not_treat_processing_in_affiliation_as_process_preface():
+    summary = (
+        "# 论文精读笔记\n\n"
+        "## 核心信息\n"
+        "- 原文标题: Example Paper\n"
+        "- 机构: Guangdong Key Laboratory of Intelligent Information Processing, Shenzhen University\n"
+    )
+
+    assert not _contains_process_preface(summary)
 
 
 def test_format_guard_does_not_mark_parent_section_empty_when_it_has_children():

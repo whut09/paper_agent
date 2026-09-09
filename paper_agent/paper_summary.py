@@ -9593,7 +9593,7 @@ def _contains_process_preface(summary: str) -> bool:
     first_lines = "\n".join(line.strip() for line in summary.splitlines()[:8] if line.strip())
     return bool(
         re.search(
-            r"(我先|接着我|然后我|下面我|我会|我将|先把|补齐缺失|整合成完整|避免把未证实信息|校对公式|process|I will|I'll)",
+            r"(我先|接着我|然后我|下面我|我会|我将|先把|补齐缺失|整合成完整|避免把未证实信息|校对公式|\bprocess\b|\bI\s+will\b|\bI'll\b)",
             first_lines,
             flags=re.IGNORECASE,
         )
