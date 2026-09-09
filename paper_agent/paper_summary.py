@@ -11799,8 +11799,9 @@ def _ensure_key_formula_markers(
             if re.match(r"^#{3,4}\s*公式\s*" + re.escape(number) + r"(?![0-9A-Za-z])", lines[index].strip(), re.IGNORECASE):
                 matching_heading = index
                 break
-        if matching_heading is None:
-            matching_heading = next(
+        matching_reference = matching_heading
+        if matching_reference is None:
+            matching_reference = next(
                 (
                     index
                     for index in range(heading_index + 1, end_index)
@@ -11808,17 +11809,16 @@ def _ensure_key_formula_markers(
                 ),
                 None,
             )
-        if matching_heading is None:
+        if matching_reference is None:
             continue
-        block_end = end_index
-        for index in range(matching_heading + 1, end_index):
-            stripped = lines[index].strip()
-            if re.match(r"^#{3,4}\s*公式\s*\d+", stripped, re.IGNORECASE):
-                block_end = index
-                break
-        insert_at = block_end
-        while insert_at > matching_heading + 1 and not lines[insert_at - 1].strip():
-            insert_at -= 1
+        # Keep the marker adjacent to the line that names the equation.  If
+        # markers for several flat paragraphs are all placed at the end of
+        # the subsection, the previous line can describe an image or table;
+        # the kind-reconciliation pass then removes the valid formula marker
+        # as a false mismatch.  A formula subsection heading is already a
+        # reliable semantic anchor, so place its marker immediately below the
+        # heading as well.
+        insert_at = matching_reference + 1
         insertions.setdefault(insert_at, []).append(f"[[ASSET:{asset_id}]]")
 
     if not insertions:

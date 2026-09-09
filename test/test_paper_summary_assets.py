@@ -2543,6 +2543,26 @@ def test_key_formula_markers_match_compact_chinese_references():
     assert body.count("[[ASSET:2]]") == 1
 
 
+def test_compiler_keeps_formula_markers_next_to_equation_references():
+    assets = [
+        PaperAsset("formula", 6, Path("formula-1.png"), "公式 1 截图"),
+        PaperAsset("formula", 6, Path("formula-2.png"), "公式 2 截图"),
+    ]
+    summary = (
+        "## 方法主线\n### 关键公式\n"
+        "论文的 Equation 1 定义文本生成目标。\n"
+        "其工程含义是把质量分析接入图像处理链路。\n\n"
+        "论文的 Equation 2 定义图像复原目标。\n"
+        "其工程含义是从噪声状态恢复图像。\n"
+    )
+
+    compiled = _compile_report_asset_references(summary, assets)
+
+    assert "Equation 1 定义文本生成目标。\n[[ASSET:1]]" in compiled
+    assert "Equation 2 定义图像复原目标。\n[[ASSET:2]]" in compiled
+    assert _asset_guard(compiled, assets).status == "passed"
+
+
 def test_referenced_formula_alignment_replaces_unused_formula_under_full_budget(tmp_path):
     assets = [
         PaperAsset("formula", 1, tmp_path / "formula-4.png", "公式 4 截图", text="x = y (4)"),

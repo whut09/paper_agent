@@ -936,8 +936,13 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     if "text-only" in lowered or "只有文字" in message or "图像主体" in message:
         issue = f"{asset_name}没有识别到有效的图像主体。"
         cause = "系统自动重新定位并复检后，仍无法确认截图完整，因此停止生成，避免把错误截图写入 Word。"
+    elif "missing_asset_marker" in result.reason_codes or "missing screenshot marker" in lowered:
+        label_match = re.search(r"(?:图|表|公式)\s*\d+", message)
+        label = label_match.group(0).replace(" ", "") if label_match else "关键资源"
+        issue = f"论文引用的{label}截图标记没有保留。"
+        cause = "系统已找到对应资源，但最终报告中的占位符没有与资源清单对齐，因此停止生成，避免输出缺少证据的 Word。"
     elif "missing critical asset" in lowered or "missing_critical_asset" in result.reason_codes:
-        label_match = re.search(r"(?:图|表)\s*\d+", message)
+        label_match = re.search(r"(?:图|表|公式)\s*\d+", message)
         label = label_match.group(0).replace(" ", "") if label_match else "关键图表"
         issue = f"论文引用的{label}没有成功提取。"
         cause = "系统尝试重新定位该图表后仍未得到完整截图，因此停止生成，避免输出缺少关键信息的 Word。"

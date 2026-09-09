@@ -71,6 +71,22 @@ def test_gradio_block_hides_word_and_shows_only_problem_and_cause(tmp_path):
     assert response[5]["visible"] is False
 
 
+def test_gradio_explains_missing_formula_marker_instead_of_generic_chart_failure():
+    result = SummaryRunResult(
+        status="blocked",
+        message="Asset Guard: missing screenshot marker for critical referenced asset 公式1 ([[ASSET:9]])",
+        current_stage="VerifyClaims",
+        progress=0.78,
+        reason_codes=["missing_asset_marker", "missing_critical_asset"],
+    )
+
+    markdown = _format_summary_diagnostics(result)
+
+    assert "公式1截图标记没有保留" in markdown
+    assert "关键图表没有成功提取" not in markdown
+    assert "资源清单对齐" in markdown
+
+
 def test_gradio_network_timeout_has_plain_language_explanation():
     result = SummaryRunResult(
         status="timeout",
