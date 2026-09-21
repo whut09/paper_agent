@@ -1442,7 +1442,7 @@ def _summary_run_result(
                 reason_codes.append(_infer_reason_code(reason, str(failure.get("reason") or "")))
     if exc is not None:
         lowered = str(exc).lower()
-        timeout_tokens = ("timeout", "timed out", "连接超时", "transport", "429", "502", "503", "504")
+        timeout_tokens = ("timeout", "timed out", "连接超时", "transport", "429", "502", "503", "504", "524")
         connection_tokens = (
             "connection",
             "连接失败",
@@ -5466,6 +5466,7 @@ def _summarize_chunks_with_codex(
                 _write_partial_integration_cache(partial_cache_path, partial_records, total)
             submit_ready_partials()
             submit_more_chunks()
+    retry_errors: list[tuple[int, Exception]] = []
     for idx in sorted(failed_chunks):
         if cancellation_check:
             cancellation_check()
@@ -5473,12 +5474,16 @@ def _summarize_chunks_with_codex(
             _idx, note = summarize_one(idx, chunks_by_idx[idx])
             idx = _idx
         except Exception as exc:
-            raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
+            retry_errors.append((idx, exc))
+            continue
         results[idx - 1] = note
         completed += 1
         _write_chunk_notes_cache(cache_path, results, total)
         if progress_callback:
             progress_callback(completed, total)
+    if retry_errors:
+        idx, exc = retry_errors[0]
+        raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
     if group_specs and partial_integrator:
         _run_missing_partial_integrations(
             group_specs,
@@ -10713,7 +10718,8 @@ def _chat(
             time.sleep(_chat_retry_delay(attempt))
         except openai.APIStatusError as exc:
             last_error = exc
-            if not _is_retryable_openai_status(exc) or attempt + 1 >= max_attempts:
+            retry_limit = _openai_status_retry_limit(exc, max_attempts)
+            if not _is_retryable_openai_status(exc) or attempt + 1 >= retry_limit:
                 break
             time.sleep(_chat_retry_delay(attempt))
         except openai.APITimeoutError as exc:
@@ -10727,7 +10733,9 @@ def _chat(
                 break
             time.sleep(_chat_retry_delay(attempt))
     if isinstance(last_error, openai.APIStatusError):
-        raise RuntimeError(_openai_status_error_message(last_error, max_attempts)) from last_error
+        raise RuntimeError(
+            _openai_status_error_message(last_error, _openai_status_retry_limit(last_error, max_attempts))
+        ) from last_error
     if isinstance(last_error, openai.APITimeoutError):
         raise RuntimeError(
             f"Codex 接口响应超时，已重试 {max_attempts} 次仍未成功。"
@@ -10810,7 +10818,16 @@ def _stream_request_allows_partial_content(stream_request: dict, content: str) -
 
 
 def _is_retryable_openai_status(exc: openai.APIStatusError) -> bool:
-    return int(getattr(exc, "status_code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504}
+    return int(getattr(exc, "status_code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504, 524}
+
+
+def _openai_status_retry_limit(exc: openai.APIStatusError, max_attempts: int) -> int:
+    # 524 is commonly emitted by a proxy when the upstream model is still
+    # processing.  One bounded retry helps transient cases without turning a
+    # long request timeout into an unexpectedly long retry storm.
+    if int(getattr(exc, "status_code", 0) or 0) == 524:
+        return min(max_attempts, 2)
+    return max_attempts
 
 
 def _chat_retry_delay(attempt: int) -> float:

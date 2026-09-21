@@ -38,6 +38,13 @@ def test_wrapped_api_transport_error_is_recoverable():
         assert classify_error(exc) == "recoverable"
 
 
+def test_upstream_524_timeout_is_recoverable():
+    exc = RuntimeError("Codex 接口返回 HTTP 524，上游响应超时")
+
+    assert is_recoverable_error(exc)
+    assert classify_error(exc) == "recoverable"
+
+
 def test_app_facades_import_without_optional_runtime_dependencies():
     import paper_agent.app.backend
     import paper_agent.app.cli

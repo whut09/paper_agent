@@ -68,6 +68,7 @@ def is_recoverable_error(exc: BaseException) -> bool:
                 "502",
                 "503",
                 "504",
+                "524",
                 "transport",
             )
         ):

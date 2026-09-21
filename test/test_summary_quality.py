@@ -1,6 +1,7 @@
 import threading
 
 import paper_agent.paper_summary as ps
+from paper_agent.harness.context import PaperWorkflowContext
 
 
 def _complete_test_report() -> str:
@@ -150,6 +151,71 @@ def test_parallel_chunk_summary_retries_failed_chunk_after_batch():
         ps._chat = original_chat
         ps._chunk_text = original_chunk_text
         ps._codex_summary_concurrency = original_concurrency
+
+
+def test_parallel_chunk_summary_retries_all_failed_chunks_before_raising():
+    original_chat = ps._chat
+    original_chunk_text = ps._chunk_text
+    original_concurrency = ps._codex_summary_concurrency
+    calls = {1: 0, 2: 0, 3: 0}
+    lock = threading.Lock()
+
+    def fake_chat(_client, _model, prompt, **_kwargs):
+        idx = next(i for i in calls if f"第 {i}/3" in prompt)
+        with lock:
+            calls[idx] += 1
+        if idx in {2, 3}:
+            raise RuntimeError(f"mock failure {idx}")
+        return f"note {idx}"
+
+    try:
+        ps._chat = fake_chat
+        ps._chunk_text = lambda _text, _chars: ["chunk one", "chunk two", "chunk three"]
+        ps._codex_summary_concurrency = lambda: 3
+
+        _assert_raises_runtime_error(
+            lambda: ps._summarize_chunks_with_codex(
+                None,
+                "fake-model",
+                "paper text",
+                [],
+                "Chinese",
+            ),
+            "第 2/3 段",
+        )
+
+        assert calls == {1: 1, 2: 2, 3: 2}
+    finally:
+        ps._chat = original_chat
+        ps._chunk_text = original_chunk_text
+        ps._codex_summary_concurrency = original_concurrency
+
+
+def test_http_524_is_retryable_with_a_bounded_retry_limit():
+    class StatusError:
+        status_code = 524
+
+    assert ps._is_retryable_openai_status(StatusError())
+    assert ps._openai_status_retry_limit(StatusError(), 4) == 2
+
+
+def test_http_524_summary_failure_is_reported_as_timeout():
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=".",
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+
+    result = ps._summary_run_result(
+        context,
+        RuntimeError("分段笔记生成失败：Codex 接口返回 HTTP 524，上游响应超时"),
+    )
+
+    assert result.status == "timeout"
+    assert "network_timeout" in result.reason_codes
 
 
 def test_fast_integration_uses_single_bounded_chat_attempt():
