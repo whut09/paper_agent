@@ -1,7 +1,10 @@
 import threading
+from pathlib import Path
 
+import fitz
 import paper_agent.paper_summary as ps
 from paper_agent.harness.context import PaperWorkflowContext
+from paper_agent.paper_summary import PaperAsset
 
 
 def _complete_test_report() -> str:
@@ -216,6 +219,27 @@ def test_http_524_summary_failure_is_reported_as_timeout():
 
     assert result.status == "timeout"
     assert "network_timeout" in result.reason_codes
+
+
+def test_adjacent_tables_do_not_turn_neighbor_pixels_into_crop_failures():
+    left = PaperAsset(
+        "table",
+        13,
+        Path("left.png"),
+        "Table 2: Ablation",
+        rect=fitz.Rect(34.016, 78.05, 215.216, 134.835),
+    )
+    right = PaperAsset(
+        "table",
+        13,
+        Path("right.png"),
+        "Table 3: Ablation",
+        rect=fitz.Rect(216.536, 78.448, 374.665, 135.434),
+    )
+
+    assert ps._adjacent_table_edge_sides(left, [left, right]) == {"right"}
+    assert ps._adjacent_table_edge_sides(right, [left, right]) == {"left"}
+    assert ps._is_critical_asset(right)
 
 
 def test_fast_integration_uses_single_bounded_chat_attempt():

@@ -1973,9 +1973,15 @@ def _build_asset_candidate_pool(
                     path = candidate_dir / f"{strategy.value}-{geometry_key}.png"
                     _save_clip(page, rect, path, padding=2, scale=4)
                     integrity = _inspect_crop_integrity(path, kind=asset.kind)
-                    if integrity and integrity.clipped_sides:
+                    expected_adjacent_sides = _adjacent_table_edge_sides(asset, assets)
+                    unexpected_sides = (
+                        set(integrity.clipped_sides) - expected_adjacent_sides
+                        if integrity
+                        else set()
+                    )
+                    if unexpected_sides:
                         diagnostics[strategy] = tuple(
-                            f"edge_cutoff:{side}" for side in integrity.clipped_sides
+                            f"edge_cutoff:{side}" for side in sorted(unexpected_sides)
                         )
                     rendered_candidates.append((strategy, tuple(float(value) for value in rect), path))
                     if asset.kind == "table":
@@ -2679,6 +2685,39 @@ def _formula_candidate_is_noise(text: str) -> bool:
     ):
         return True
     return False
+
+
+def _adjacent_table_edge_sides(
+    asset: PaperAsset,
+    peers: Iterable[PaperAsset],
+    *,
+    max_gap: float = 4.0,
+) -> set[str]:
+    """Return crop edges that touch a separate table on the same page.
+
+    Two-column papers often place tables directly beside one another. Text or
+    border pixels from the neighboring table can therefore reach the bitmap
+    edge even when the current table has a complete body and border. Those
+    edges are expected adjacency, not evidence that the current crop is cut
+    off.
+    """
+
+    if asset.kind != "table" or asset.rect is None:
+        return set()
+    result: set[str] = set()
+    rect = fitz.Rect(asset.rect)
+    for peer in peers:
+        if peer is asset or peer.kind != "table" or peer.page_number != asset.page_number or peer.rect is None:
+            continue
+        peer_rect = fitz.Rect(peer.rect)
+        vertical_overlap = max(0.0, min(rect.y1, peer_rect.y1) - max(rect.y0, peer_rect.y0))
+        if vertical_overlap / max(1.0, min(rect.height, peer_rect.height)) < 0.25:
+            continue
+        if abs(peer_rect.x0 - rect.x1) <= max_gap:
+            result.add("right")
+        if abs(rect.x0 - peer_rect.x1) <= max_gap:
+            result.add("left")
+    return result
 
 
 def _line_has_formula_syntax(text: str) -> bool:
@@ -7231,9 +7270,10 @@ def _report_rewrite_is_safe(previous: str, candidate: str) -> bool:
 
 def _is_critical_asset(asset: PaperAsset) -> bool:
     key = _asset_label_key(asset)
-    # Numbered formulas are evidence-bearing whenever they are present in the
-    # report; only optional figures/tables may be quarantined with a peer.
-    return bool(key and (key[0] == "formula" or key[1] in {"1", "2"}))
+    # Numbered tables and formulas are evidence-bearing whenever they are
+    # present in the report. Removing an explicitly numbered table leaves a
+    # textual reference that the Asset Guard cannot reconcile later.
+    return bool(key and (key[0] in {"formula", "table"} or key[1] in {"1", "2"}))
 
 
 def _asset_report_role(summary: str, asset_id: int) -> str:
@@ -7251,7 +7291,12 @@ def _asset_is_locally_usable(context: _PaperWorkflowContext, asset_id: int) -> b
     asset = context.assets[asset_id - 1]
     if not asset.path.exists():
         return False
-    issues = _local_visual_asset_issues(asset_id, asset, source_pdf=context.pdf_path)
+    issues = _local_visual_asset_issues(
+        asset_id,
+        asset,
+        source_pdf=context.pdf_path,
+        expected_adjacent_sides=_adjacent_table_edge_sides(asset, context.assets),
+    )
     if any(str(issue.get("severity", "warning")) == "error" for issue in issues):
         return False
     measurements = _visual_asset_measurements(
@@ -7650,6 +7695,7 @@ def _replacement_passes_visual_recheck(
         asset_id,
         replacement,
         source_pdf=context.pdf_path,
+        expected_adjacent_sides=_adjacent_table_edge_sides(replacement, candidate_assets),
     )
     text_issues = _ocr_text_consistency_issues(asset_id, replacement, measurements)
     decision = _decide_visual_layers(
@@ -8586,7 +8632,12 @@ def _visual_asset_guard(
     selected_by_id = {asset_id: asset for asset_id, asset in selected}
     for asset_id, asset in local_selected:
         measurements = _visual_asset_measurements(asset_id, asset, summary, assets, source_pdf)
-        deterministic_issues = _local_visual_asset_issues(asset_id, asset, source_pdf=source_pdf)
+        deterministic_issues = _local_visual_asset_issues(
+            asset_id,
+            asset,
+            source_pdf=source_pdf,
+            expected_adjacent_sides=_adjacent_table_edge_sides(asset, assets),
+        )
         text_issues = _ocr_text_consistency_issues(asset_id, asset, measurements)
         measurement_payloads[str(asset_id)] = measurements.to_dict()
         for issue in deterministic_issues:
@@ -9034,6 +9085,7 @@ def _local_visual_asset_issues(
     asset: PaperAsset,
     *,
     source_pdf: Path | None = None,
+    expected_adjacent_sides: set[str] | None = None,
 ) -> list[dict[str, object]]:
     if not asset.path.exists():
         return [
@@ -9048,8 +9100,13 @@ def _local_visual_asset_issues(
     width, height = _image_pixel_size(asset.path)
     issues: list[dict[str, object]] = []
     integrity = _inspect_crop_integrity(asset.path, kind=asset.kind)
-    if integrity is not None and integrity.clipped:
-        sides = ", ".join(integrity.clipped_sides)
+    clipped_sides = (
+        set(integrity.clipped_sides) - (expected_adjacent_sides or set())
+        if integrity is not None
+        else set()
+    )
+    if clipped_sides:
+        sides = ", ".join(sorted(clipped_sides))
         issues.append(
             {
                 "severity": "error",
