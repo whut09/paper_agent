@@ -930,8 +930,13 @@ def _format_summary_diagnostics(result: SummaryRunResult) -> str:
 def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     message = str(result.message or "").strip()
     lowered = message.lower()
-    asset_match = re.search(r"\basset\s+(\d+)\b", lowered)
-    asset_name = f"第 {asset_match.group(1)} 个图表截图" if asset_match else "论文内容"
+    asset_ids = list(dict.fromkeys(re.findall(r"\basset\s+(\d+)\b", lowered)))
+    if len(asset_ids) == 1:
+        asset_name = f"第 {asset_ids[0]} 个图表截图"
+    elif asset_ids:
+        asset_name = "资源 " + "、".join(f"Asset {asset_id}" for asset_id in asset_ids)
+    else:
+        asset_name = "论文内容"
 
     if "text-only" in lowered or "只有文字" in message or "图像主体" in message:
         issue = f"{asset_name}没有识别到有效的图像主体。"
@@ -946,6 +951,18 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
         label = label_match.group(0).replace(" ", "") if label_match else "关键图表"
         issue = f"论文引用的{label}没有成功提取。"
         cause = "系统尝试重新定位该图表后仍未得到完整截图，因此停止生成，避免输出缺少关键信息的 Word。"
+    elif (
+        "visual_crop_invalid" in result.reason_codes
+        and "image_too_small" in result.reason_codes
+    ):
+        issue = f"{asset_name}存在边缘截断或分辨率不足。"
+        cause = "RenderQA 检查到部分截图边缘不完整，或像素尺寸不足以保证 Word 中清晰阅读，已停止提供不可靠的文档。"
+    elif "image_too_small" in result.reason_codes or "too small for a readable report" in lowered:
+        issue = f"{asset_name}分辨率不足。"
+        cause = "RenderQA 检查到截图像素尺寸不足以保证 Word 中清晰阅读，已停止提供不可靠的文档。"
+    elif "visual_crop_invalid" in result.reason_codes or "source bitmap is internally clipped" in lowered:
+        issue = f"{asset_name}存在边缘截断。"
+        cause = "RenderQA 检查到截图边缘包含被截断的内容，已停止提供不完整的 Word。"
     elif "table" in lowered and any(token in lowered for token in ("crop", "truncated", "body", "表格")):
         issue = f"{asset_name}不完整或混入了其他内容。"
         cause = "系统自动重裁并复检后仍未找到可靠的完整表格，因此停止生成。"

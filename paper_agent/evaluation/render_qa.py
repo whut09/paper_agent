@@ -18,7 +18,7 @@ from xml.etree import ElementTree as ET
 import fitz
 from PIL import Image
 
-from paper_agent.evaluation.image_integrity import inspect_crop_integrity
+from paper_agent.evaluation.image_integrity import adjacent_table_edge_sides, inspect_crop_integrity
 
 from paper_agent.evaluation.acceptance import suggested_actions
 from paper_agent.schemas.qa import (
@@ -289,7 +289,7 @@ def _inspect_docx(
                         pixel_width, pixel_height = image.size
                 else:
                     findings.append(_finding("missing_critical_asset", "block", f"Asset {asset_id} media relationship is missing", asset_id=asset_id))
-                min_width, min_height = (180, 24) if kind == "formula" else (64, 64)
+                min_width, min_height = (120, 24) if kind == "formula" else (64, 64)
                 if pixel_width < min_width or pixel_height < min_height:
                     findings.append(_finding("image_too_small", "block", f"Asset {asset_id} is too small for a readable report", asset_id=asset_id, width=pixel_width, height=pixel_height))
                 if content_width and cx > content_width + 1000:
@@ -299,14 +299,23 @@ def _inspect_docx(
                 if not adjacent:
                     findings.append(_finding("caption_not_adjacent", "warning", f"Asset {asset_id} has no adjacent caption or reference paragraph", asset_id=asset_id))
                 integrity = inspect_crop_integrity(Path(getattr(asset, "path", "")), kind=kind)
-                if integrity is not None and integrity.clipped:
+                expected_adjacent_sides = adjacent_table_edge_sides(asset, assets)
+                clipped_sides = (
+                    set(integrity.clipped_sides) - expected_adjacent_sides
+                    if integrity is not None
+                    else set()
+                )
+                if clipped_sides:
+                    integrity_payload = integrity.to_dict()
+                    integrity_payload["clipped_sides"] = sorted(clipped_sides)
+                    integrity_payload["clipped"] = True
                     findings.append(
                         _finding(
                             "visual_crop_invalid",
                             "block",
-                            f"Asset {asset_id} source bitmap is internally clipped at the {', '.join(integrity.clipped_sides)} edge",
+                            f"Asset {asset_id} source bitmap is internally clipped at the {', '.join(sorted(clipped_sides))} edge",
                             asset_id=asset_id,
-                            source_crop_integrity=integrity.to_dict(),
+                            source_crop_integrity=integrity_payload,
                         )
                     )
                 measurements.append(

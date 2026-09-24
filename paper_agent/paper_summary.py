@@ -62,7 +62,10 @@ from paper_agent.evaluation.visual_validation import (
     VisualMeasurements as _VisualMeasurements,
     decide_visual_layers as _decide_visual_layers,
 )
-from paper_agent.evaluation.image_integrity import inspect_crop_integrity as _inspect_crop_integrity
+from paper_agent.evaluation.image_integrity import (
+    adjacent_table_edge_sides as _adjacent_table_edge_sides,
+    inspect_crop_integrity as _inspect_crop_integrity,
+)
 from paper_agent.evaluation.acceptance import (
     build_acceptance_result as _build_acceptance_result,
     compare_asset_manifests as _compare_asset_manifests,
@@ -1493,7 +1496,14 @@ def _summary_run_result(
     elif qa_result is not None and qa_result.status == "block":
         status = "blocked"
         downloadable = False
-        message = f"RenderQA 未通过，Word 已隔离且不会提供下载。详情：{context.qa_path}"
+        blockers = [
+            str(finding.message)
+            for finding in qa_result.findings
+            if str(finding.severity).lower() == "block"
+        ]
+        details = "；".join(blockers[:4])
+        detail_text = f"失败项：{details}\n" if details else ""
+        message = f"RenderQA 未通过，Word 已隔离且不会提供下载。{detail_text}详情：{context.qa_path}"
     elif qa_result is not None and qa_result.status == "warning":
         status = "warning"
         warning = True
@@ -2192,7 +2202,7 @@ def _capture_formula_blocks_from_doc(
         selected_rects.append((page_no, rect))
         formula_index_by_page[page_no] = formula_index_by_page.get(page_no, 0) + 1
         path = work_dir / f"page-{page_no:03d}-formula-{formula_index_by_page[page_no]:02d}.png"
-        _save_clip(doc[page_index], rect, path, padding=0)
+        _save_clip(doc[page_index], rect, path, padding=0, scale=4)
         _trim_formula_edge_fragments(path)
         latex = _recognize_formula_latex(path)
         caption = _formula_caption(text, latex)
@@ -2317,7 +2327,7 @@ def _capture_formula_asset_by_number(
         target_dir = work_dir / "referenced-formulas"
         target_dir.mkdir(parents=True, exist_ok=True)
         path = target_dir / f"page-{page_no:03d}-formula-{number}.png"
-        _save_clip(doc[page_index], rect, path, padding=0)
+        _save_clip(doc[page_index], rect, path, padding=0, scale=4)
         _trim_formula_edge_fragments(path)
         return PaperAsset(
             "formula",
@@ -2685,39 +2695,6 @@ def _formula_candidate_is_noise(text: str) -> bool:
     ):
         return True
     return False
-
-
-def _adjacent_table_edge_sides(
-    asset: PaperAsset,
-    peers: Iterable[PaperAsset],
-    *,
-    max_gap: float = 4.0,
-) -> set[str]:
-    """Return crop edges that touch a separate table on the same page.
-
-    Two-column papers often place tables directly beside one another. Text or
-    border pixels from the neighboring table can therefore reach the bitmap
-    edge even when the current table has a complete body and border. Those
-    edges are expected adjacency, not evidence that the current crop is cut
-    off.
-    """
-
-    if asset.kind != "table" or asset.rect is None:
-        return set()
-    result: set[str] = set()
-    rect = fitz.Rect(asset.rect)
-    for peer in peers:
-        if peer is asset or peer.kind != "table" or peer.page_number != asset.page_number or peer.rect is None:
-            continue
-        peer_rect = fitz.Rect(peer.rect)
-        vertical_overlap = max(0.0, min(rect.y1, peer_rect.y1) - max(rect.y0, peer_rect.y0))
-        if vertical_overlap / max(1.0, min(rect.height, peer_rect.height)) < 0.25:
-            continue
-        if abs(peer_rect.x0 - rect.x1) <= max_gap:
-            result.add("right")
-        if abs(rect.x0 - peer_rect.x1) <= max_gap:
-            result.add("left")
-    return result
 
 
 def _line_has_formula_syntax(text: str) -> bool:

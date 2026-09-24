@@ -251,6 +251,79 @@ def test_render_qa_accepts_readable_wide_formula(tmp_path):
     assert "image_too_small" not in result.reason_codes
 
 
+def test_render_qa_accepts_compact_formula_at_readable_document_size(tmp_path):
+    formula_path = tmp_path / "compact-formula.png"
+    Image.new("RGB", (134, 45), "white").save(formula_path)
+    formula = PaperAsset("formula", 1, formula_path, "公式 2 截图", text="x = y (2)")
+    docx_path = tmp_path / "compact-formula-report.docx"
+    _write_docx(
+        docx_path,
+        "paper.pdf",
+        "## 方法主线\n### 关键公式\n公式2描述候选偏移。\n[[ASSET:1]]",
+        [formula],
+    )
+    unavailable = render_qa._RenderAttempt(
+        "none",
+        reason_code="renderer_unavailable",
+        message="renderer missing",
+    )
+
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(
+            docx_path,
+            [formula],
+            tmp_path / "render",
+            required_asset_ids={1},
+        )
+
+    assert result.status == "warning"
+    assert "image_too_small" not in result.reason_codes
+
+
+def test_render_qa_ignores_expected_edges_between_adjacent_tables(tmp_path):
+    left_path = tmp_path / "table-2.png"
+    right_path = tmp_path / "table-3.png"
+    left = Image.new("RGB", (640, 360), "white")
+    right = Image.new("RGB", (640, 360), "white")
+    left_pixels = left.load()
+    right_pixels = right.load()
+    for y in range(40, 320, 18):
+        for x in range(535, 640):
+            for dy in range(5):
+                left_pixels[x, y + dy] = (20, 20, 20)
+        for x in range(0, 105):
+            for dy in range(5):
+                right_pixels[x, y + dy] = (20, 20, 20)
+    left.save(left_path)
+    right.save(right_path)
+    assets = [
+        PaperAsset("table", 13, left_path, "Table 2: Ablation", rect=fitz.Rect(34, 78, 215, 135)),
+        PaperAsset("table", 13, right_path, "Table 3: Ablation", rect=fitz.Rect(216, 78, 375, 135)),
+    ]
+    docx_path = tmp_path / "adjacent-tables.docx"
+    _write_docx(
+        docx_path,
+        "paper.pdf",
+        "## 关键结果\n[[ASSET:1]]\n[[ASSET:2]]",
+        assets,
+    )
+    unavailable = render_qa._RenderAttempt(
+        "none",
+        reason_code="renderer_unavailable",
+        message="renderer missing",
+    )
+
+    with patch.object(render_qa, "_render_docx", return_value=unavailable):
+        result = render_qa.run_render_qa(
+            docx_path,
+            assets,
+            tmp_path / "render",
+            required_asset_ids={1, 2},
+        )
+
+    assert "visual_crop_invalid" not in result.reason_codes
+
+
 def test_render_qa_renderer_timeout_is_warning_not_content_defect(tmp_path):
     asset = _asset(tmp_path)
     docx_path = _docx(tmp_path, [asset])

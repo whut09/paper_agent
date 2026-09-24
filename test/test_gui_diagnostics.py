@@ -122,6 +122,27 @@ def test_gradio_model_connection_failure_has_plain_language_explanation():
     assert "CODEX_BASE_URL" in markdown
 
 
+def test_gradio_render_qa_failure_exposes_specific_asset_findings():
+    result = SummaryRunResult(
+        status="blocked",
+        message=(
+            "RenderQA 未通过，Word 已隔离且不会提供下载。"
+            "失败项：Asset 6 source bitmap is internally clipped at the right edge；"
+            "Asset 9 is too small for a readable report。"
+        ),
+        current_stage="RenderQA",
+        reason_codes=["visual_crop_invalid", "image_too_small"],
+    )
+
+    markdown = _format_summary_diagnostics(result)
+
+    assert "Asset 6" in markdown
+    assert "Asset 9" in markdown
+    assert "边缘截断" in markdown
+    assert "分辨率不足" in markdown
+    assert "最终检查" not in markdown
+
+
 def test_gradio_callback_returns_diagnostics_for_download_timeout():
     state = {"session_id": None}
     with patch("paper_agent.gui.download_with_limit", side_effect=requests.exceptions.ReadTimeout("connection timed out")):

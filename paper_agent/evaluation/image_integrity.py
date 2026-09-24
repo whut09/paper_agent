@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Iterable
 
 from PIL import Image
 
@@ -127,4 +128,55 @@ def inspect_crop_integrity(path: Path, *, kind: str = "") -> CropIntegrityResult
     return CropIntegrityResult(width, height, tuple(measurements))
 
 
-__all__ = ["CropIntegrityResult", "EdgeMeasurement", "inspect_crop_integrity"]
+def adjacent_table_edge_sides(
+    asset: object,
+    peers: Iterable[object],
+    *,
+    max_gap: float = 4.0,
+) -> set[str]:
+    """Return bitmap edges that touch a neighboring table on the same page."""
+
+    if str(getattr(asset, "kind", "")) != "table":
+        return set()
+    rect = _rect_tuple(getattr(asset, "rect", None))
+    if rect is None:
+        return set()
+    result: set[str] = set()
+    for peer in peers:
+        if peer is asset or str(getattr(peer, "kind", "")) != "table":
+            continue
+        if int(getattr(peer, "page_number", 0) or 0) != int(getattr(asset, "page_number", 0) or 0):
+            continue
+        peer_rect = _rect_tuple(getattr(peer, "rect", None))
+        if peer_rect is None:
+            continue
+        vertical_overlap = max(0.0, min(rect[3], peer_rect[3]) - max(rect[1], peer_rect[1]))
+        shorter_height = max(1.0, min(rect[3] - rect[1], peer_rect[3] - peer_rect[1]))
+        if vertical_overlap / shorter_height < 0.25:
+            continue
+        if abs(peer_rect[0] - rect[2]) <= max_gap:
+            result.add("right")
+        if abs(rect[0] - peer_rect[2]) <= max_gap:
+            result.add("left")
+    return result
+
+
+def _rect_tuple(value: object) -> tuple[float, float, float, float] | None:
+    if value is None:
+        return None
+    try:
+        return tuple(float(getattr(value, name)) for name in ("x0", "y0", "x1", "y1"))  # type: ignore[return-value]
+    except (AttributeError, TypeError, ValueError):
+        try:
+            values = tuple(float(item) for item in value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+        return values if len(values) == 4 else None
+
+
+__all__ = [
+    "CropIntegrityResult",
+    "EdgeMeasurement",
+    "adjacent_table_edge_sides",
+    "inspect_crop_integrity",
+]
