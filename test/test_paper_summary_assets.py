@@ -1783,6 +1783,45 @@ def test_captioned_figure_prefers_graphic_region_above_caption_over_body_below()
     assert rect.y1 < caption.rect.y0
 
 
+def test_captioned_figure_crop_includes_text_labels_tightly_above_graphic():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+        def get_text(self, kind):
+            assert kind == "dict"
+            return {
+                "blocks": [
+                    {"type": 1, "bbox": (144, 119, 228, 163)},
+                    {"type": 1, "bbox": (228, 119, 481, 163)},
+                    {"type": 1, "bbox": (144, 148, 229, 192)},
+                    {"type": 1, "bbox": (228, 148, 481, 192)},
+                    {"type": 1, "bbox": (144, 174, 229, 218)},
+                    {"type": 1, "bbox": (228, 174, 481, 218)},
+                ]
+            }
+
+        def get_drawings(self):
+            return []
+
+    caption = line("Fig. 4: Qualitative comparison.", 135, 228, 481, 261)
+    lines = [
+        line("Input", 178, 115, 195, 124),
+        line("DADAOD [16]", 246, 116, 296, 124),
+        line("DA-F2F (Ours)", 330, 116, 379, 124),
+        line("Ground-Truth", 416, 116, 460, 124),
+        line("Foggy.", 135, 129, 143, 150),
+        line("BDD. SIM.", 135, 162, 143, 211),
+        caption,
+    ]
+
+    rect = _visual_rect_for_caption(FakePage(), caption.rect, lines)
+
+    assert rect is not None
+    assert rect.y0 <= 115
+    assert rect.y0 > 105
+    assert rect.y1 < caption.rect.y0
+
+
 def test_captioned_figure_crop_trims_front_matter_above_first_page_figure():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)

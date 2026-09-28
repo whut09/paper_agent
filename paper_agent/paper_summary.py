@@ -4159,17 +4159,61 @@ def _visual_rect_for_caption(
     above = _visual_rect_for_caption_direction(page, caption_rect, lines, "above")
     below = _visual_rect_for_caption_direction(page, caption_rect, lines, "below")
     if above is None:
-        return below
+        return _expand_figure_region_with_adjacent_labels(page, below, caption_rect, lines)
     if below is None:
-        return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+        trimmed = _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+        return _expand_figure_region_with_adjacent_labels(page, trimmed, caption_rect, lines)
 
     above_gap = max(0.0, caption_rect.y0 - above.y1)
     below_gap = max(0.0, below.y0 - caption_rect.y1)
     if above_gap <= 25:
-        return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+        trimmed = _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+        return _expand_figure_region_with_adjacent_labels(page, trimmed, caption_rect, lines)
     if below_gap <= 70 and (above_gap > 70 or below.height > above.height * 0.75):
-        return below
-    return _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+        return _expand_figure_region_with_adjacent_labels(page, below, caption_rect, lines)
+    trimmed = _trim_figure_region_by_upper_page_text(page, above, caption_rect, lines)
+    return _expand_figure_region_with_adjacent_labels(page, trimmed, caption_rect, lines)
+
+
+def _expand_figure_region_with_adjacent_labels(
+    page: fitz.Page,
+    region: fitz.Rect | None,
+    caption_rect: fitz.Rect,
+    lines: list[TextLine],
+) -> fitz.Rect | None:
+    """Include text-layer labels that belong to the top edge of a figure.
+
+    Many PDFs place column headings or legend labels in a text layer immediately
+    above an embedded image.  The graphic detector cannot see those labels, so
+    using its bounding box alone produces a crop with the label tops clipped.
+    Only short, nearby lines are eligible; page-header and prose heuristics keep
+    unrelated text out of the recovered figure rectangle.
+    """
+
+    if region is None or region.is_empty or not lines:
+        return region
+    left, right = _caption_column_bounds(page, caption_rect)
+    label_lines: list[TextLine] = []
+    for line in lines:
+        if line.rect.y0 > region.y0 + 10:
+            continue
+        if region.y0 - line.rect.y1 > 8:
+            continue
+        if _horizontal_overlap_fraction(line.rect, left, right) <= 0.08:
+            continue
+        text = _clean_xml_text(line.text).strip()
+        if not text or _caption_is_figure(text) or _caption_is_table(text):
+            continue
+        if _line_is_front_matter_or_body_before_figure(text):
+            continue
+        if len(text) > 80 or re.search(r"[.!?。！？;；]$", text):
+            continue
+        label_lines.append(line)
+    if not label_lines:
+        return region
+    top = min(region.y0, min(line.rect.y0 for line in label_lines))
+    expanded = fitz.Rect(region.x0, top, region.x1, region.y1) & page.rect
+    return expanded if expanded.width >= 40 and expanded.height >= 30 else region
 
 
 def _trim_figure_region_by_upper_page_text(
