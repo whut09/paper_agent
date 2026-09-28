@@ -108,6 +108,7 @@ from paper_agent.paper_summary import (
     _critical_referenced_asset_keys,
     _critical_asset_key_map,
     _remove_mismatched_asset_markers,
+    _rewrite_asset_markers_after_asset_mutation,
     _recapture_critical_visual_assets,
     _sync_inline_asset_references,
     _subsection_body,
@@ -2572,6 +2573,58 @@ def test_compiler_keeps_formula_markers_next_to_equation_references():
 
     assert "Equation 1 定义文本生成目标。\n[[ASSET:1]]" in compiled
     assert "Equation 2 定义图像复原目标。\n[[ASSET:2]]" in compiled
+    assert _asset_guard(compiled, assets).status == "passed"
+
+
+def test_compiler_keeps_formula_markers_when_report_has_no_key_formula_section():
+    assets = [
+        PaperAsset("formula", 7, Path("formula-4.png"), "公式 4 截图", text="x = y (4)"),
+        PaperAsset("formula", 8, Path("formula-8.png"), "公式 8 截图", text="x = y (8)"),
+        PaperAsset("formula", 9, Path("formula-9.png"), "公式 9 截图", text="x = y (9)"),
+        PaperAsset("formula", 9, Path("formula-10.png"), "公式 10 截图", text="x = y (10)"),
+        PaperAsset("formula", 9, Path("formula-11.png"), "公式 11 截图", text="x = y (11)"),
+    ]
+    summary = (
+        "## 方法主线\n"
+        "Equation (4) controls style injection.\n"
+        "Equation (8) converts the proposal map to a bounded weight.\n"
+        "Equation (9) weights the spatial discriminator.\n"
+        "Equation (10) combines source and target alignment.\n"
+        "Equation (11) defines the joint objective.\n"
+        "## 关键结果\n结果稳定。"
+    )
+
+    compiled = _compile_report_asset_references(summary, assets)
+
+    for asset_id in range(1, 6):
+        assert f"[[ASSET:{asset_id}]]" in compiled
+    assert _asset_guard(compiled, assets).status == "passed"
+
+
+def test_asset_markers_are_rewritten_by_stable_identity_after_reordering():
+    previous = [
+        PaperAsset("table", 11, Path("table1.png"), "Table 1. Main results"),
+        PaperAsset("formula", 8, Path("formula4.png"), "公式 4 截图", text="x = y (4)"),
+    ]
+    current = [previous[1], previous[0]]
+    summary = "## 关键结果\n[[ASSET:1]]\n## 方法主线\n公式4说明方法。\n[[ASSET:2]]"
+
+    rewritten = _rewrite_asset_markers_after_asset_mutation(summary, previous, current)
+
+    assert "[[ASSET:2]]" in rewritten
+    assert "[[ASSET:1]]" in rewritten
+    assert rewritten.count("[[ASSET:") == 2
+
+
+def test_invalid_asset_markers_are_removed_before_asset_guard():
+    assets = [PaperAsset("figure", 1, Path("figure.png"), "Figure 1. Overview")]
+
+    compiled = _compile_report_asset_references(
+        "## 方法主线\n图1展示框架。\n[[ASSET:1]]\n[[ASSET:15]]",
+        assets,
+    )
+
+    assert "[[ASSET:15]]" not in compiled
     assert _asset_guard(compiled, assets).status == "passed"
 
 

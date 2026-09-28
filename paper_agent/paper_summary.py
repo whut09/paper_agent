@@ -1867,6 +1867,75 @@ def _deduplicate_assets(assets: list[PaperAsset]) -> list[PaperAsset]:
     return result
 
 
+def _asset_marker_identity(asset: PaperAsset) -> tuple:
+    """Return the stable identity used when an asset list is mutated.
+
+    Asset ids are positional and therefore cannot be used as durable
+    references when formula crops are replaced or new evidence is captured.
+    Printed labels are the strongest identity available across recaptures;
+    unlabeled assets fall back to their physical crop and bitmap.
+    """
+
+    label = _compact_asset_label(_original_asset_label(asset))
+    if label:
+        return ("label", asset.kind, label)
+    rect = tuple(round(value, 2) for value in asset.rect) if asset.rect is not None else None
+    return (
+        "physical",
+        asset.kind,
+        asset.page_number,
+        rect,
+        _asset_bitmap_digest(asset.path),
+    )
+
+
+def _rewrite_asset_markers_after_asset_mutation(
+    summary: str,
+    previous_assets: list[PaperAsset],
+    current_assets: list[PaperAsset],
+) -> str:
+    """Rewrite positional markers after assets are replaced or appended.
+
+    The report stores only ``[[ASSET:n]]`` while the manifest stores the
+    semantic asset identity.  Reconcile the two at every mutation boundary so
+    a newly appended formula or recaptured figure cannot inherit a stale id.
+    Unknown and out-of-range markers are removed instead of being deferred to
+    the final Asset Guard.
+    """
+
+    if not summary or "[[ASSET:" not in summary:
+        return summary
+
+    current_by_identity: dict[tuple, int] = {}
+    for asset_id, asset in enumerate(current_assets, 1):
+        current_by_identity.setdefault(_asset_marker_identity(asset), asset_id)
+
+    mapping: dict[int, int] = {}
+    for old_id, old_asset in enumerate(previous_assets, 1):
+        identity = _asset_marker_identity(old_asset)
+        new_id = current_by_identity.get(identity)
+        if new_id is None and old_id <= len(current_assets):
+            # Preserve unlabeled positional assets across in-place recaptures;
+            # labeled assets should only map through their semantic identity.
+            current_asset = current_assets[old_id - 1]
+            if (
+                not _original_asset_label(old_asset)
+                and old_asset.kind == current_asset.kind
+                and old_asset.page_number == current_asset.page_number
+            ):
+                new_id = old_id
+        if new_id is not None:
+            mapping[old_id] = new_id
+
+    def replace_marker(match: re.Match[str]) -> str:
+        old_id = int(match.group(1))
+        new_id = mapping.get(old_id)
+        return f"[[ASSET:{new_id}]]" if new_id is not None else ""
+
+    result = re.sub(r"\[\[ASSET:(\d+)\]\]", replace_marker, summary)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
+
+
 def _build_asset_candidate_pools(
     assets: list[PaperAsset],
     *,
@@ -2419,6 +2488,7 @@ def _align_referenced_formula_assets(
     if not numbers or source_pdf is None or work_dir is None:
         return summary
 
+    previous_assets = list(assets)
     existing = {
         _formula_asset_number(asset): asset
         for asset in assets
@@ -2499,9 +2569,15 @@ def _align_referenced_formula_assets(
         changed = True
 
     reconciled = summary
+    if changed:
+        reconciled = _rewrite_asset_markers_after_asset_mutation(
+            reconciled,
+            previous_assets,
+            assets,
+        )
     if unresolved and _formula_source_is_scannable(source_pdf):
         reconciled = _reconcile_unanchored_formula_references(
-            summary,
+            reconciled,
             assets,
             unresolved,
         )
@@ -6289,6 +6365,9 @@ def _compile_report_asset_references(
     report rewrite or asset mutation before any guard evaluates the artifact.
     """
 
+    # A repair may have removed or appended assets since the previous draft;
+    # never carry an out-of-range positional marker into a guard.
+    summary = _remove_mismatched_asset_markers(summary, assets)
     summary = _ensure_formula_evidence_disclosure(summary, assets, formula_candidates)
     summary = _align_referenced_formula_assets(
         summary,
@@ -6306,7 +6385,10 @@ def _compile_report_asset_references(
     summary = _ensure_key_formula_markers(summary, assets, excluded_asset_ids=excluded)
     summary = _remove_excluded_asset_markers(summary, excluded)
     summary = _remove_mismatched_asset_markers(summary, assets)
-    return _suppress_formula_text_when_assets_present(summary, assets)
+    return _remove_mismatched_asset_markers(
+        _suppress_formula_text_when_assets_present(summary, assets),
+        assets,
+    )
 
 
 def _verification_for_targeted_guard_recheck(
@@ -7124,6 +7206,7 @@ def _revise_report_once(
 
     revised_summary = context.summary
     assets_changed = False
+    previous_assets = list(context.assets)
     captured_keys: list[str] = []
     step_before: dict[str, str] = {
         step.attempt_key: _repair_step_signature(context, step)
@@ -7157,6 +7240,22 @@ def _revise_report_once(
             captured = _capture_missing_asset_by_label(context, missing_key)
             if captured is None:
                 logger.warning("Unable to capture missing critical asset %s", _critical_asset_label(missing_key))
+                continue
+            duplicate_index = next(
+                (
+                    index
+                    for index, existing_asset in enumerate(context.assets)
+                    if _asset_marker_identity(existing_asset) == _asset_marker_identity(captured)
+                    or _asset_capture_signature(existing_asset) == _asset_capture_signature(captured)
+                ),
+                None,
+            )
+            if duplicate_index is not None:
+                logger.info(
+                    "Skipped duplicate capture of %s; existing asset id is %s",
+                    _critical_asset_label(missing_key),
+                    duplicate_index + 1,
+                )
                 continue
             context.assets.append(captured)
             assets_changed = True
@@ -7196,6 +7295,14 @@ def _revise_report_once(
     if legacy_recaptures:
         repaired = _recapture_critical_visual_assets(context, legacy_recaptures)
         assets_changed = assets_changed or bool(repaired)
+
+    if assets_changed:
+        revised_summary = _rewrite_asset_markers_after_asset_mutation(
+            revised_summary,
+            previous_assets,
+            context.assets,
+        )
+
     all_removals = {
         asset_id
         for asset_id in plan.remove_asset_ids | executed_removals
@@ -8630,24 +8737,36 @@ def _critical_asset_sort_key(key: tuple[str, str]) -> tuple[int, int]:
 
 def _remove_mismatched_asset_markers(summary: str, assets: list[PaperAsset]) -> str:
     if not assets or "[[ASSET:" not in summary:
+        if not assets:
+            return re.sub(r"\[\[ASSET:\d+\]\]", "", summary)
         return summary
+
+    def remove_out_of_range(match: re.Match[str]) -> str:
+        asset_id = int(match.group(1))
+        return "" if asset_id < 1 or asset_id > len(assets) else match.group(0)
+
     spans_to_remove: list[tuple[int, int]] = []
     for match in re.finditer(r"(?m)^[ \t]*\[\[ASSET:(\d+)\]\][ \t]*(?:\r?\n)?", summary):
         asset_id = int(match.group(1))
         if asset_id < 1 or asset_id > len(assets):
+            spans_to_remove.append(match.span())
             continue
         nearby = _asset_reference_text_for_marker(summary, match.start())
         if _asset_reference_kind_mismatch(nearby, assets[asset_id - 1]):
             spans_to_remove.append(match.span())
     if not spans_to_remove:
-        return summary
+        # Markers are required to occupy their own line, but also scrub an
+        # invalid inline token left by a model rewrite.
+        return re.sub(r"\[\[ASSET:(\d+)\]\]", remove_out_of_range, summary)
     result_parts: list[str] = []
     cursor = 0
     for start, end in spans_to_remove:
         result_parts.append(summary[cursor:start])
         cursor = end
     result_parts.append(summary[cursor:])
-    return re.sub(r"\n{3,}", "\n\n", "".join(result_parts)).strip()
+    result = "".join(result_parts)
+    result = re.sub(r"\[\[ASSET:(\d+)\]\]", remove_out_of_range, result)
+    return re.sub(r"\n{3,}", "\n\n", result).strip()
 
 
 def _visual_asset_guard(
@@ -11869,82 +11988,66 @@ def _ensure_key_formula_markers(
     *,
     excluded_asset_ids: set[int] | None = None,
 ) -> str:
-    """Place real formula screenshots inside the report's key-formula subsection."""
+    """Place each referenced formula screenshot beside its first report use.
 
-    formula_numbers = set(_formula_reference_numbers(summary))
-    if not formula_numbers:
-        return summary
-    formula_ids = {
-        index: _formula_asset_number(asset)
-        for index, asset in enumerate(assets, 1)
-        if asset.kind == "formula"
-        and index not in (excluded_asset_ids or set())
-        and _formula_asset_number(asset) in formula_numbers
-    }
-    if not formula_ids:
+    Formula explanations are often written in ``方法主线`` or ``关键结果``
+    instead of a dedicated ``关键公式`` subsection.  Searching the whole
+    report keeps the marker contract independent of the model's section
+    choice and also supports several equation references on one line.
+    """
+
+    excluded = excluded_asset_ids or set()
+    formula_ids_by_number: dict[str, int] = {}
+    formula_ids: set[int] = set()
+    for asset_id, asset in enumerate(assets, 1):
+        if asset.kind != "formula" or asset_id in excluded:
+            continue
+        number = _formula_asset_number(asset)
+        if not number:
+            continue
+        formula_ids_by_number.setdefault(number, asset_id)
+        formula_ids.add(asset_id)
+
+    formula_numbers = _all_formula_reference_numbers(summary)
+    if not formula_numbers or not formula_ids_by_number:
         return summary
 
-    # A previous draft may have assigned these ids to a table or figure.  The
-    # manifest is authoritative after recapture, so move formula markers out
-    # of their old location before inserting them next to the matching text.
-    formula_id_tokens = {f"[[ASSET:{asset_id}]]" for asset_id in formula_ids}
-    lines = [line for line in summary.splitlines() if line.strip() not in formula_id_tokens]
-    heading_index = next(
-        (
-            index
-            for index, line in enumerate(lines)
-            if re.match(r"^#{2,4}\s*关键公式\s*$", line.strip())
-        ),
-        None,
+    # Formula markers are rebuilt from semantic references below.  This drops
+    # stale ids that previously pointed at a different crop or asset kind.
+    formula_tokens = {f"[[ASSET:{asset_id}]]" for asset_id in formula_ids}
+    lines: list[str] = []
+    for line in summary.splitlines():
+        if line.strip() in formula_tokens:
+            continue
+        lines.append(line)
+
+    reference_pattern = re.compile(
+        r"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*"
+        r"([0-9一二三四五六七八九十]+[A-Za-z]?)\s*[）)]?"
     )
-    if heading_index is None:
-        return summary
-
-    heading_level = len(lines[heading_index]) - len(lines[heading_index].lstrip("#"))
-    end_index = len(lines)
-    for index in range(heading_index + 1, len(lines)):
-        stripped = lines[index].strip()
-        if not stripped.startswith("#"):
-            continue
-        level = len(stripped) - len(stripped.lstrip("#"))
-        if level <= heading_level:
-            end_index = index
-            break
-
+    inserted_numbers: set[str] = set()
     insertions: dict[int, list[str]] = {}
-    for asset_id, number in sorted(formula_ids.items(), key=lambda item: int(re.match(r"\d+", item[1]).group(0))):
-        number_pattern = re.compile(
-            rf"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}(?![0-9A-Za-z])"
-        )
-        matching_heading = None
-        for index in range(heading_index + 1, end_index):
-            if re.match(r"^#{3,4}\s*公式\s*" + re.escape(number) + r"(?![0-9A-Za-z])", lines[index].strip(), re.IGNORECASE):
-                matching_heading = index
-                break
-        matching_reference = matching_heading
-        if matching_reference is None:
-            matching_reference = next(
-                (
-                    index
-                    for index in range(heading_index + 1, end_index)
-                    if number_pattern.search(lines[index])
-                ),
-                None,
-            )
-        if matching_reference is None:
-            continue
-        # Keep the marker adjacent to the line that names the equation.  If
-        # markers for several flat paragraphs are all placed at the end of
-        # the subsection, the previous line can describe an image or table;
-        # the kind-reconciliation pass then removes the valid formula marker
-        # as a false mismatch.  A formula subsection heading is already a
-        # reliable semantic anchor, so place its marker immediately below the
-        # heading as well.
-        insert_at = matching_reference + 1
-        insertions.setdefault(insert_at, []).append(f"[[ASSET:{asset_id}]]")
+    for line_index, line in enumerate(lines):
+        if not line.strip() or line.lstrip().startswith("#") and not reference_pattern.search(line):
+            # A heading such as ``### 公式4`` is still a valid anchor; other
+            # headings cannot carry a formula reference.
+            if not reference_pattern.search(line):
+                continue
+        numbers_on_line: list[str] = []
+        for match in reference_pattern.finditer(line):
+            raw_number = str(match.group(1)).strip()
+            number = _critical_asset_number(raw_number)
+            if number and number not in numbers_on_line:
+                numbers_on_line.append(number)
+        for number in numbers_on_line:
+            asset_id = formula_ids_by_number.get(number)
+            if asset_id is None or number in inserted_numbers:
+                continue
+            insertions.setdefault(line_index + 1, []).append(f"[[ASSET:{asset_id}]]")
+            inserted_numbers.add(number)
 
     if not insertions:
-        return summary
+        return "\n".join(lines)
     result: list[str] = []
     for index, line in enumerate(lines):
         if index in insertions:
