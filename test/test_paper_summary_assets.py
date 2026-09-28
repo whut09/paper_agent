@@ -2782,6 +2782,47 @@ def test_unanchored_formula_number_is_reconciled_before_asset_guard(tmp_path):
     assert _asset_guard(result, assets, ["k-ball coverage, k=5 ↑"]).status == "passed"
 
 
+def test_unresolved_formula_reference_in_method_section_is_reconciled(tmp_path):
+    source = tmp_path / "paper.pdf"
+    document = fitz.open()
+    document.new_page()
+    document.save(source)
+    document.close()
+    assets = [
+        PaperAsset("formula", 1, tmp_path / "formula-4.png", "公式 4 截图", text="x = y (4)"),
+    ]
+    summary = (
+        "## 方法主线\n"
+        "公式5描述运行时特征，并用于后续预测。\n\n"
+        "## 关键结果\n结果支持论文结论。"
+    )
+
+    with patch("paper_agent.paper_summary._capture_formula_asset_by_number", return_value=None):
+        result = _compile_report_asset_references(
+            summary,
+            assets,
+            source_pdf=source,
+            work_dir=tmp_path / "assets",
+            max_assets=13,
+        )
+
+    assert "公式5" not in result
+    assert "该定义描述运行时特征" in result or "原文正文描述运行时特征" in result
+    assert _asset_guard(result, assets).status == "passed"
+
+
+def test_result_table_marker_is_added_when_table_was_marked_in_another_section():
+    assets = [PaperAsset("table", 1, Path("table1.png"), "Table 1. Detector settings")]
+    summary = (
+        "## 数据与任务定义\n表1给出检测器配置。\n[[ASSET:1]]\n\n"
+        "## 关键结果\n表1中的配置用于比较不同检测器。\n"
+    )
+
+    result = _compile_report_asset_references(summary, assets)
+
+    assert "[[ASSET:1]]" in _section_body(result, "关键结果")
+
+
 def test_table_metric_header_is_not_a_formula_candidate():
     metric_header = "k-ball coverage, k=5 ↑"
 

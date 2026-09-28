@@ -946,7 +946,11 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
         label = label_match.group(0).replace(" ", "") if label_match else "关键资源"
         issue = f"论文引用的{label}截图标记没有保留。"
         cause = "系统已找到对应资源，但最终报告中的占位符没有与资源清单对齐，因此停止生成，避免输出缺少证据的 Word。"
-    elif "missing critical asset" in lowered or "missing_critical_asset" in result.reason_codes:
+    elif (
+        "missing critical asset" in lowered
+        or "missing_critical_asset" in lowered
+        or "missing_critical_asset" in result.reason_codes
+    ):
         label_match = re.search(r"(?:图|表|公式)\s*\d+", message)
         label = label_match.group(0).replace(" ", "") if label_match else "关键图表"
         issue = f"论文引用的{label}没有成功提取。"
@@ -960,7 +964,12 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     elif "image_too_small" in result.reason_codes or "too small for a readable report" in lowered:
         issue = f"{asset_name}分辨率不足。"
         cause = "RenderQA 检查到截图像素尺寸不足以保证 Word 中清晰阅读，已停止提供不可靠的文档。"
-    elif "visual_crop_invalid" in result.reason_codes or "source bitmap is internally clipped" in lowered:
+    elif (
+        "visual_crop_invalid" in result.reason_codes
+        or "source bitmap is internally clipped" in lowered
+        or "table bitmap contains meaningful content cut off" in lowered
+        or "visual asset guard" in lowered
+    ):
         issue = f"{asset_name}存在边缘截断。"
         cause = "RenderQA 检查到截图边缘包含被截断的内容，已停止提供不完整的 Word。"
     elif "table" in lowered and any(token in lowered for token in ("crop", "truncated", "body", "表格")):

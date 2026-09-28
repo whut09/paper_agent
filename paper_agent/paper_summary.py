@@ -1682,7 +1682,9 @@ def _capture_captioned_tables(
             page, caption_text, caption_rect, table_rect, table_text, lines
         )
         clip_rect = _captioned_object_clip_rect(page, caption_rect, table_rect)
-        if clip_rect.width < 80 or clip_rect.height < 55:
+        # Narrow one-column tables can be less than 80 pt wide; reject only
+        # genuinely tiny crops so a valid detector-index table is retained.
+        if clip_rect.width < 55 or clip_rect.height < 55:
             continue
         key = _box_key(page_no, clip_rect)
         if key in seen_boxes:
@@ -2229,6 +2231,28 @@ def _formula_reference_numbers(summary: str) -> list[str]:
     return numbers
 
 
+def _all_formula_reference_numbers(summary: str) -> list[str]:
+    """Return every explicit formula number, including references in methods.
+
+    A report may explain a numbered equation next to the method paragraph
+    instead of inside ``### 关键公式``. Reconciliation must inspect the whole
+    report so an invented number such as ``公式5`` can be removed when the
+    source PDF contains no equation 5.
+    """
+
+    numbers: list[str] = []
+    pattern = re.compile(
+        r"(?i)(?:公式|方程|equation|eq\.?|formula)\s*[（(]?\s*"
+        r"([0-9一二三四五六七八九十]+[A-Za-z]?)"
+    )
+    for match in pattern.finditer(summary):
+        value = str(match.group(1)).strip()
+        value = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}.get(value, value)
+        if value not in numbers and re.fullmatch(r"[0-9]{1,2}[A-Za-z]?", value):
+            numbers.append(value)
+    return numbers
+
+
 def _ensure_formula_evidence_disclosure(
     summary: str,
     assets: list[PaperAsset],
@@ -2391,7 +2415,7 @@ def _align_referenced_formula_assets(
 ) -> str:
     """Make explicit formula references point to real, embeddable screenshots."""
 
-    numbers = _formula_reference_numbers(summary)
+    numbers = _all_formula_reference_numbers(summary)
     if not numbers or source_pdf is None or work_dir is None:
         return summary
 
@@ -2513,27 +2537,26 @@ def _reconcile_unanchored_formula_references(
         ),
         None,
     )
-    if heading_index is None:
-        return summary
-    heading_level = len(lines[heading_index]) - len(lines[heading_index].lstrip("#"))
+    body_start = heading_index + 1 if heading_index is not None else 0
     end_index = len(lines)
-    for index in range(heading_index + 1, len(lines)):
-        stripped = lines[index].strip()
-        if not stripped.startswith("#"):
-            continue
-        level = len(stripped) - len(stripped.lstrip("#"))
-        if level <= heading_level:
-            end_index = index
-            break
+    if heading_index is not None:
+        heading_level = len(lines[heading_index]) - len(lines[heading_index].lstrip("#"))
+        for index in range(heading_index + 1, len(lines)):
+            stripped = lines[index].strip()
+            if not stripped.startswith("#"):
+                continue
+            level = len(stripped) - len(stripped.lstrip("#"))
+            if level <= heading_level:
+                end_index = index
+                break
 
     formula_asset_numbers = {
         asset_id: _formula_asset_number(asset)
         for asset_id, asset in enumerate(assets, 1)
         if asset.kind == "formula"
     }
-    body = lines[heading_index + 1 : end_index]
-    revised: list[str] = []
-    for line in body:
+    body: list[str] = []
+    for line in lines[body_start:end_index]:
         if "原文没有给出可独立截取的编号公式或显示方程" in line:
             continue
         marker = re.fullmatch(r"\s*\[\[ASSET:(\d+)\]\]\s*", line)
@@ -2555,14 +2578,41 @@ def _reconcile_unanchored_formula_references(
                 flags=re.IGNORECASE,
             )
             line = re.sub(rf"(?:{reference})", "该定义", line, flags=re.IGNORECASE)
-        revised.append(line)
+        body.append(line)
 
     disclosure = "原文在正文中说明上述指标或机制，但未给出可核验的对应编号公式，因此不展示公式截图。"
-    if disclosure not in revised:
-        while revised and not revised[-1].strip():
-            revised.pop()
-        revised.extend(["", disclosure, ""])
-    lines[heading_index + 1 : end_index] = revised
+    if heading_index is not None and disclosure not in body:
+        while body and not body[-1].strip():
+            body.pop()
+        body.extend(["", disclosure, ""])
+    lines[body_start:end_index] = body
+
+    # The invalid reference may have been written in 方法主线 or 关键结果,
+    # outside the dedicated 关键公式 subsection. Reconcile those lines too.
+    for index, line in enumerate(lines):
+        if body_start <= index < body_start + len(body):
+            continue
+        if re.fullmatch(r"\s*\[\[ASSET:(\d+)\]\]\s*", line):
+            marker_id = int(re.search(r"\d+", line).group(0))
+            asset_number = formula_asset_numbers.get(marker_id)
+            if asset_number == "" or asset_number in unresolved:
+                lines[index] = ""
+                continue
+        for number in unresolved:
+            reference = (
+                rf"(?:公式|方程)\s*[（(]?\s*{re.escape(number)}\s*[）)]?"
+                rf"|(?:equation|eq\.?|formula)\s*[（(]?\s*{re.escape(number)}\s*[）)]?"
+            )
+            line = re.sub(rf"如\s*(?:{reference})\s*所示", "按原文正文定义", line, flags=re.IGNORECASE)
+            line = re.sub(rf"(?:{reference})\s*的", "该定义的", line, flags=re.IGNORECASE)
+            line = re.sub(
+                rf"(?:{reference})\s*(定义|给出|描述|表示|用于|刻画)",
+                lambda match: f"原文正文{match.group(1)}",
+                line,
+                flags=re.IGNORECASE,
+            )
+            line = re.sub(rf"(?:{reference})", "该定义", line, flags=re.IGNORECASE)
+        lines[index] = line
     return "\n".join(lines)
 
 
@@ -3820,6 +3870,19 @@ def _caption_text_and_rect(
         if kind == "table":
             if len(caption_lines) >= max_rows:
                 break
+            # Rotated table headers and the first table row often appear as
+            # separate text lines immediately after a caption. Their tall
+            # glyph boxes or explicit header tokens must not be absorbed into
+            # the caption rectangle, otherwise the table detector loses the
+            # actual object bounds.
+            if previous is not None and (
+                row_rect.height > max(18.0, previous.rect.height * 1.8)
+                or (
+                    len(row_text) <= 80
+                    and re.search(r"(?i)^\s*(?:input\s+size|yolo\d|model\b|method\b|metrics?\b)", row_text)
+                )
+            ):
+                break
             if previous is not None and _figure_caption_continuation_is_body_text(previous.text, row_text):
                 break
             if len(caption_lines) >= 2 and not _line_looks_caption_continuation(row_text):
@@ -3876,10 +3939,12 @@ def _caption_same_row_indices(
             left_column_anchor = anchor_center < page_mid - 18
             if (
                 right_column_anchor
-                and line.rect.x1 <= page_mid
+                and line.rect.x1 <= anchor.rect.x0 + 2
+                and line.rect.x0 < page_mid + 12
             ) or (
                 left_column_anchor
-                and line.rect.x0 >= page_mid
+                and line.rect.x0 >= anchor.rect.x1 - 2
+                and line.rect.x0 > page_mid - 12
             ):
                 continue
             if _caption_is_figure(line.text) or _caption_is_table(line.text):
@@ -9130,7 +9195,13 @@ def _local_visual_asset_issues(
                 "message": f"asset {asset_id} generic table crop is large ({width}x{height}); size alone is insufficient to reject it",
             }
         )
-    if asset.kind == "table" and width < 460:
+    narrow_table_with_native_detail = (
+        asset.kind == "table"
+        and asset.rect is not None
+        and asset.rect.width < 100
+        and width >= 300
+    )
+    if asset.kind == "table" and width < 460 and not narrow_table_with_native_detail:
         issues.append(
             {
                 "severity": "error",
@@ -11909,18 +11980,6 @@ def _ensure_primary_result_table_marker(
     if result_marker_ids.intersection(table_ids):
         return summary
 
-    # Existing markers are semantic references established by the report
-    # compiler. Never move one merely to satisfy a preferred section: doing so
-    # can place a table beside an unrelated figure paragraph, after which the
-    # mismatch guard correctly removes it. Only add an unused table here.
-    used_ids = {
-        int(match)
-        for match in re.findall(r"\[\[ASSET:(\d+)\]\]", summary)
-    }
-    unused_table_ids = [index for index in table_ids if index not in used_ids]
-    if not unused_table_ids:
-        return summary
-
     result_terms = (
         "result",
         "performance",
@@ -11936,13 +11995,13 @@ def _ensure_primary_result_table_marker(
     preferred = next(
         (
             index
-            for index in unused_table_ids
+            for index in table_ids
             if any(
                 term in f"{assets[index - 1].caption} {assets[index - 1].text}".lower()
                 for term in result_terms
             )
         ),
-        unused_table_ids[0],
+        table_ids[0],
     )
     marker = f"[[ASSET:{preferred}]]"
 
@@ -11953,6 +12012,28 @@ def _ensure_primary_result_table_marker(
     )
     if heading_index is None:
         return summary
+    end_index = len(lines)
+    for index in range(heading_index + 1, len(lines)):
+        if re.match(r"^##\s+", lines[index].strip()):
+            end_index = index
+            break
+    preferred_asset = assets[preferred - 1]
+    reference_line = next(
+        (
+            index
+            for index in range(heading_index + 1, end_index)
+            if _line_mentions_asset_label(
+                lines[index].strip(),
+                _compact_asset_label(_original_asset_label(preferred_asset)),
+                _asset_reference_pattern(_compact_asset_label(_original_asset_label(preferred_asset))),
+                preferred_asset,
+            )
+        ),
+        None,
+    )
+    if reference_line is not None:
+        lines[reference_line + 1 : reference_line + 1] = [marker]
+        return "\n".join(lines)
     insert_at = heading_index + 1
     while insert_at < len(lines):
         stripped = lines[insert_at].strip()
