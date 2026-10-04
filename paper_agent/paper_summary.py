@@ -2441,34 +2441,34 @@ def _numbered_formula_clip(
 ) -> tuple[fitz.Rect, str]:
     """Return a tight equation crop anchored by its printed number token."""
 
-    left, right = _column_bounds(page, number_line.rect)
+    anchor_mid = (number_line.rect.y0 + number_line.rect.y1) / 2
     # Keep the band tight enough to exclude the preceding prose and the next
-    # displayed equation in a numbered stack, while retaining superscripts
-    # and subscripts around the number row.
-    top = number_line.rect.y0 - 11.0
-    bottom = number_line.rect.y1 + 7.0
+    # displayed equation in a numbered stack, while retaining superscripts,
+    # subscripts, and spans split out by PDF font extraction.
+    top = number_line.rect.y0 - 24.0
+    bottom = number_line.rect.y1 + 24.0
     selected: list[TextLine] = []
     formula_parts: list[str] = []
     for line in lines:
         if line.rect.y1 < top or line.rect.y0 > bottom:
             continue
-        overlap = min(line.rect.x1, right) - max(line.rect.x0, left)
-        if overlap < 2.0:
+        is_formula = (
+            line is number_line
+            or _line_has_formula_syntax(line.text)
+            or _is_formula_continuation_line(line.text)
+            or _is_nearby_formula_fragment(line, anchor_mid)
+        )
+        if not is_formula:
             continue
         selected.append(line)
-        if (
-            line is number_line
-            or _is_formula_continuation_line(line.text)
-            or _line_has_formula_syntax(line.text)
-        ):
-            formula_parts.append(_clean_xml_text(line.text).strip())
+        formula_parts.append(_clean_xml_text(line.text).strip())
     if not selected:
         return fitz.Rect(), ""
     rect = _merge_rects([line.rect for line in selected])
     rect = fitz.Rect(
-        max(page.rect.x0, left, rect.x0 - 18.0),
+        max(page.rect.x0, rect.x0 - 18.0),
         max(page.rect.y0, rect.y0 - 4.0),
-        min(page.rect.x1, right, rect.x1 + 18.0),
+        min(page.rect.x1, rect.x1 + 18.0),
         min(page.rect.y1, rect.y1 + 8.0),
     )
     return rect, " ".join(part for part in formula_parts if part)
@@ -2904,7 +2904,8 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
             and _line_has_standalone_formula_marker(line.text)
             and not _formula_line_looks_like_inline_prose(line.text)
         )
-        if not in_formula_column and not same_row_formula_fragment:
+        nearby_formula_fragment = _is_nearby_formula_fragment(line, anchor_mid)
+        if not in_formula_column and not same_row_formula_fragment and not nearby_formula_fragment:
             continue
         line_is_anchor = _rect_overlap_fraction(anchor, line.rect) > 0.65
         line_is_formula = (
@@ -2912,6 +2913,7 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
             or same_row_formula_fragment
             or _is_formula_continuation_line(line.text)
             or _line_has_formula_syntax(line.text)
+            or nearby_formula_fragment
         )
         if line_is_formula:
             y0 = min(y0, line.rect.y0)
@@ -2921,12 +2923,70 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
     pad_x = 18.0
     pad_top = 4.0
     pad_bottom = 10.0
+    # Stop before the first nearby prose line. Fixed bottom padding is useful
+    # for descenders, but on tightly typeset pages it can otherwise put the
+    # first raster row of the explanatory sentence into the screenshot.
+    following_prose = [
+        line.rect.y0
+        for line in lines
+        if line.rect.y0 >= y1
+        and line.rect.y0 - y1 <= 18
+        and (
+            _formula_line_looks_like_inline_prose(line.text)
+            or (
+                not _line_has_formula_syntax(line.text)
+                and (
+                    _clean_xml_text(line.text).lower().startswith(
+                        ("where ", "when ", "if ", "the ", "this ", "as ")
+                    )
+                    or len(re.findall(r"[A-Za-z]{3,}", line.text)) >= 3
+                )
+            )
+        )
+        and min(line.rect.x1, x1 + pad_x) - max(line.rect.x0, x0 - pad_x) >= 2
+    ]
+    if following_prose:
+        pad_bottom = min(pad_bottom, max(2.0, min(following_prose) - y1 - 2.0))
+    # PDF text extraction may split one displayed equation into many tiny
+    # spans, including spans on both sides of the page gutter. Those spans
+    # are already filtered above; clamping the union back to one column would
+    # silently remove the left or right half of a full-width equation.
+    clip_left = max(page.rect.x0, x0 - pad_x)
+    clip_right = min(page.rect.x1, x1 + pad_x)
+    if x0 == anchor.x0 and x1 == anchor.x1:
+        clip_left = max(page.rect.x0, left, x0 - pad_x)
+        clip_right = min(page.rect.x1, right, x1 + pad_x)
     return fitz.Rect(
-        max(page.rect.x0, left, x0 - pad_x),
+        clip_left,
         max(0, y0 - pad_top),
-        min(page.rect.x1, right, x1 + pad_x),
+        clip_right,
         min(page.rect.height, y1 + pad_bottom),
     )
+
+
+def _is_nearby_formula_fragment(line: TextLine, anchor_mid: float) -> bool:
+    """Recognize a broken-off math glyph in an anchor's immediate band."""
+
+    line_mid = (line.rect.y0 + line.rect.y1) / 2
+    if abs(line_mid - anchor_mid) > 24:
+        return False
+    text = _clean_xml_text(line.text).strip()
+    if not text or _formula_line_looks_like_inline_prose(text):
+        return False
+    lowered = text.lower()
+    if lowered.startswith(("where ", "when ", "if ", "the ", "this ", "and ", "as ")):
+        return False
+    if _line_has_formula_syntax(text) or _line_has_standalone_formula_marker(text):
+        return True
+    # Math glyphs are often emitted as one-character spans or short pieces
+    # containing TeX punctuation. Avoid admitting normal words from the
+    # neighboring column just because they share the same y-range.
+    words = re.findall(r"[A-Za-z]{3,}", text)
+    if len(words) >= 2:
+        return False
+    if len(words) == 1 and len(words[0]) > 3 and not re.search(r"[\\{}_^=]", text):
+        return False
+    return len(text) <= 28
 
 
 def _formula_column_bounds(page: fitz.Page, rect: fitz.Rect) -> tuple[float, float]:
@@ -4600,19 +4660,35 @@ def _trim_formula_edge_fragments(path: Path) -> None:
             groups = _contiguous_number_groups(content_rows)
             if len(groups) <= 1:
                 return
+
+            def group_width(group: tuple[int, int]) -> int:
+                start, end = group
+                xs: list[int] = []
+                for row in range(start, end + 1):
+                    xs.extend(x for x in range(width) if pixels[x, row] < 235)
+                return (max(xs) - min(xs) + 1) if xs else 0
+
             top = 0
             bottom = height
             first_start, first_end = groups[0]
             last_start, last_end = groups[-1]
-            edge_limit = max(6, int(height * 0.12))
             max_fragment_height = max(8, int(height * 0.18))
-            if first_start <= 2 and first_end - first_start + 1 <= max_fragment_height:
+            wide_edge = max(24, int(width * 0.65))
+            if (
+                first_start <= 2
+                and first_end - first_start + 1 <= max_fragment_height
+                and group_width(groups[0]) >= wide_edge
+            ):
                 top = min(groups[1][0] - 4, height - 1)
-            if height - 1 - last_end <= 2 and last_end - last_start + 1 <= max_fragment_height:
+            if (
+                height - 1 - last_end <= 2
+                and last_end - last_start + 1 <= max_fragment_height
+                and group_width(groups[-1]) >= wide_edge
+            ):
                 bottom = max(groups[-2][1] + 5, 1)
-            if first_start > edge_limit:
+            if first_start > max(6, int(height * 0.12)):
                 top = 0
-            if height - 1 - last_end > edge_limit:
+            if height - 1 - last_end > max(6, int(height * 0.12)):
                 bottom = height
             if top <= 0 and bottom >= height:
                 return

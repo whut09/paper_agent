@@ -63,6 +63,7 @@ from paper_agent.paper_summary import (
     _formula_candidate_is_noise,
     _formula_block_text,
     _formula_clip_rect,
+    _numbered_formula_clip,
     _formula_column_bounds,
     _formula_asset_number,
     _extract_formula_candidates,
@@ -1976,6 +1977,46 @@ def test_formula_clip_rect_keeps_second_line_of_multiline_equation():
     assert rect.y1 < 646
 
 
+def test_formula_clip_rect_merges_split_spans_across_page_gutter():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    anchor = line(r"= \sqrt {\frac {1}{HW}}", 380, 440, 460, 456)
+    lines = [
+        line(r"\mathbf {F}^{t}_{h,w,c}", 128, 438, 208, 454),
+        line(r"\sum _{h=1}^{H}", 220, 439, 296, 455),
+        line(r"= \sqrt {\frac {1}{HW}}", 380, 440, 460, 456),
+        line("(2)", 468, 444, 481, 454),
+        line("As shown in the following figure.", 132, 462, 310, 474),
+    ]
+
+    rect = _formula_clip_rect(FakePage(), anchor.rect, lines)
+
+    assert rect.x0 < 130
+    assert rect.x1 > 480
+    assert rect.y1 < 490
+
+
+def test_numbered_formula_clip_keeps_split_left_spans_and_number():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(9)", 468, 316, 481, 326)
+    lines = [
+        line(r"\mathcal {L}_{tgt} = -", 205, 314, 302, 328),
+        line(r"\frac {1}{HW} \sum W log", 305, 315, 415, 329),
+        number,
+        line("where the integration of W", 135, 338, 290, 350),
+    ]
+
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+
+    assert rect.x0 < 205
+    assert rect.x1 > 480
+    assert "(9)" in text
+    assert "where" not in text.lower()
+
+
 def test_chinese_title_rewrites_mixed_english_placeholder_title():
     summary = (
         "# complex image restoration论文精读\n\n"
@@ -2276,6 +2317,26 @@ def test_trim_formula_edge_fragments_removes_bottom_text_sliver():
         with Image.open(formula) as trimmed:
             assert trimmed.height < 88
             assert trimmed.height > 45
+
+
+def test_trim_formula_edge_fragments_preserves_narrow_math_superscript():
+    with TemporaryDirectory() as tmp:
+        formula = Path(tmp) / "formula-with-superscript.png"
+        image = Image.new("L", (300, 90), 255)
+        pixels = image.load()
+        for y in range(28, 62):
+            for x in range(70, 230):
+                if (x + y) % 7 == 0:
+                    pixels[x, y] = 0
+        for y in range(18, 25):
+            for x in range(176, 184):
+                pixels[x, y] = 0
+        image.convert("RGB").save(formula)
+
+        _trim_formula_edge_fragments(formula)
+
+        with Image.open(formula) as trimmed:
+            assert trimmed.height == 90
 
 
 def test_visual_asset_guard_prioritizes_referenced_tables_for_model_check():
