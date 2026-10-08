@@ -978,6 +978,18 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     elif "invalid_paper_url" in result.reason_codes:
         issue = "输入的内容不是有效的论文链接。"
         cause = "请粘贴以 http:// 或 https:// 开头的论文 PDF 链接；论文标题需要先在浏览器中打开对应 PDF 后再粘贴链接。"
+    elif "model_configuration_error" in result.reason_codes or _is_model_configuration_error_message(message):
+        issue = "模型配置不可用。"
+        model_match = re.search(
+            r"\b(?:gpt|dragon3api|claude|gemini|deepkey|cb|grok|glm)[A-Za-z0-9_.:/-]*",
+            message,
+            re.IGNORECASE,
+        )
+        model_hint = f"（当前配置：{model_match.group(0)}）" if model_match else ""
+        cause = (
+            f"当前 CODEX_BASE_URL 不支持配置的 CODEX_MODEL{model_hint}。"
+            "请把 CODEX_MODEL 改成该接口 /models 列表中的完整模型名称后再重试。"
+        )
     elif "model_connection_failure" in result.reason_codes or any(
         token in message for token in ("连接失败", "服务端断开", "网络链路")
     ):
@@ -992,6 +1004,20 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
         issue = "论文总结未能通过最终检查。"
         cause = "系统自动修复和复检后仍存在会影响 Word 完整性的问题，因此没有提供不可靠的文档。"
     return issue, cause
+
+
+def _is_model_configuration_error_message(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "model_configuration_error",
+            "unknown provider",
+            "model_not_found",
+            "model not found",
+            "model does not exist",
+        )
+    )
 
 
 def _summary_callback_response(result: SummaryRunResult, file_path: str | Path | None):

@@ -122,6 +122,26 @@ def test_gradio_model_connection_failure_has_plain_language_explanation():
     assert "CODEX_BASE_URL" in markdown
 
 
+def test_gradio_model_configuration_failure_explains_model_name():
+    result = SummaryRunResult(
+        status="failed",
+        message=(
+            "总结失败：model_configuration_error：当前接口不支持配置的模型 gpt-6.1-sol。"
+        ),
+        current_stage="SummarizeContribution",
+        progress=0.52,
+        reason_codes=["model_configuration_error"],
+    )
+
+    markdown = _format_summary_diagnostics(result)
+
+    assert "模型配置不可用" in markdown
+    assert "CODEX_MODEL" in markdown
+    assert "gpt-6.1-sol" in markdown
+    assert "最终检查" not in markdown
+    assert "Word 完整性" not in markdown
+
+
 def test_gradio_render_qa_failure_exposes_specific_asset_findings():
     result = SummaryRunResult(
         status="blocked",

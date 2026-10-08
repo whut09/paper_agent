@@ -2,6 +2,8 @@ import threading
 from pathlib import Path
 
 import fitz
+import httpx
+import openai
 import paper_agent.paper_summary as ps
 from paper_agent.harness.context import PaperWorkflowContext
 from paper_agent.paper_summary import PaperAsset
@@ -51,7 +53,8 @@ def test_summary_quality_blocks_untranslated_raw_english_report():
     )
 
 
-def test_final_integration_stops_instead_of_raw_fallback_when_llm_times_out():
+def test_final_integration_stops_instead_of_raw_fallback_when_llm_times_out(monkeypatch):
+    monkeypatch.setattr(ps, "_coerce_codex_client", lambda client: client)
     original_chat = ps._chat
     try:
         ps._chat = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("mock timeout"))
@@ -74,7 +77,8 @@ def test_final_integration_stops_instead_of_raw_fallback_when_llm_times_out():
         ps._chat = original_chat
 
 
-def test_final_integration_uses_parallel_partial_summaries():
+def test_final_integration_uses_parallel_partial_summaries(monkeypatch):
+    monkeypatch.setattr(ps, "_coerce_codex_client", lambda client: client)
     original_chat = ps._chat
     prompts = []
     try:
@@ -202,6 +206,52 @@ def test_http_524_is_retryable_with_a_bounded_retry_limit():
     assert ps._openai_status_retry_limit(StatusError(), 4) == 2
 
 
+def test_model_configuration_error_is_not_retryable():
+    class StatusError:
+        status_code = 400
+
+        def __str__(self):
+            return "unknown provider for model gpt-6.1-sol (model_not_found)"
+
+    error = StatusError()
+    assert ps._is_model_configuration_error(error)
+    assert not ps._is_retryable_openai_status(error)
+
+
+def test_chat_stops_immediately_for_unknown_model_provider():
+    response = httpx.Response(
+        400,
+        request=httpx.Request("POST", "https://api.example.test/v1/chat/completions"),
+    )
+    error = openai.BadRequestError(
+        "unknown provider for model gpt-6.1-sol",
+        response=response,
+        body={"error": {"code": "model_not_found"}},
+    )
+
+    class Completions:
+        calls = 0
+
+        def create(self, **_request):
+            self.calls += 1
+            raise error
+
+    class Chat:
+        def __init__(self):
+            self.completions = Completions()
+
+    class Client:
+        def __init__(self):
+            self.chat = Chat()
+
+    client = Client()
+    _assert_raises_runtime_error(
+        lambda: ps._chat(client, "gpt-6.1-sol", "hello", max_attempts=4),
+        "model_configuration_error",
+    )
+    assert client.chat.completions.calls == 1
+
+
 def test_http_524_summary_failure_is_reported_as_timeout():
     context = PaperWorkflowContext(
         input_path="paper.pdf",
@@ -219,6 +269,27 @@ def test_http_524_summary_failure_is_reported_as_timeout():
 
     assert result.status == "timeout"
     assert "network_timeout" in result.reason_codes
+
+
+def test_model_configuration_failure_is_reported_with_stable_reason_code():
+    context = PaperWorkflowContext(
+        input_path="paper.pdf",
+        output_dir=".",
+        pages=None,
+        summary_language="Chinese",
+        codex_envs={},
+        max_assets=13,
+    )
+
+    result = ps._summary_run_result(
+        context,
+        RuntimeError(
+            "总结失败：model_configuration_error：当前接口不支持配置的模型 gpt-6.1-sol。"
+        ),
+    )
+
+    assert result.status == "failed"
+    assert result.reason_codes == ["model_configuration_error"]
 
 
 def test_adjacent_tables_do_not_turn_neighbor_pixels_into_crop_failures():

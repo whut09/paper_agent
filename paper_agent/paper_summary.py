@@ -1453,7 +1453,9 @@ def _summary_run_result(
             "服务端断开",
             "server disconnected",
         )
-        if any(token in lowered for token in timeout_tokens):
+        if _is_model_configuration_error_text(lowered):
+            reason_codes.append("model_configuration_error")
+        elif any(token in lowered for token in timeout_tokens):
             reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "network_timeout")
         elif any(token in lowered for token in connection_tokens):
             reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "model_connection_failure")
@@ -11040,7 +11042,11 @@ def _chat(
                 request["max_tokens"] = max_tokens
             try:
                 response = _create_chat_completion(client, request)
-            except openai.BadRequestError:
+            except openai.BadRequestError as exc:
+                # A model/provider mismatch is deterministic. Retrying it, or
+                # retrying once without max_tokens, only hides the real fix.
+                if _is_model_configuration_error(exc):
+                    raise
                 if "max_tokens" not in request:
                     raise
                 request.pop("max_tokens", None)
@@ -11078,7 +11084,11 @@ def _chat(
             time.sleep(_chat_retry_delay(attempt))
     if isinstance(last_error, openai.APIStatusError):
         raise RuntimeError(
-            _openai_status_error_message(last_error, _openai_status_retry_limit(last_error, max_attempts))
+            _openai_status_error_message(
+                last_error,
+                _openai_status_retry_limit(last_error, max_attempts),
+                model=model,
+            )
         ) from last_error
     if isinstance(last_error, openai.APITimeoutError):
         raise RuntimeError(
@@ -11121,7 +11131,9 @@ def _chat_stream_content(client: openai.OpenAI, request: dict) -> str:
 def _read_chat_stream_content(client: openai.OpenAI, stream_request: dict) -> str:
     try:
         stream = _create_chat_completion(client, stream_request)
-    except openai.BadRequestError:
+    except openai.BadRequestError as exc:
+        if _is_model_configuration_error(exc):
+            raise
         if "max_tokens" not in stream_request:
             raise
         stream_request.pop("max_tokens", None)
@@ -11162,7 +11174,30 @@ def _stream_request_allows_partial_content(stream_request: dict, content: str) -
 
 
 def _is_retryable_openai_status(exc: openai.APIStatusError) -> bool:
-    return int(getattr(exc, "status_code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504, 524}
+    return (
+        not _is_model_configuration_error(exc)
+        and int(getattr(exc, "status_code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504, 524}
+    )
+
+
+def _is_model_configuration_error(exc: BaseException) -> bool:
+    return _is_model_configuration_error_text(str(exc).lower())
+
+
+def _is_model_configuration_error_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        token in lowered
+        for token in (
+            "model_configuration_error",
+            "unknown provider",
+            "model_not_found",
+            "model not found",
+            "model does not exist",
+            "no such model",
+            "invalid model",
+        )
+    )
 
 
 def _openai_status_retry_limit(exc: openai.APIStatusError, max_attempts: int) -> int:
@@ -11178,8 +11213,14 @@ def _chat_retry_delay(attempt: int) -> float:
     return min(12.0, 1.5 * (2**attempt))
 
 
-def _openai_status_error_message(exc: openai.APIStatusError, attempts: int) -> str:
+def _openai_status_error_message(exc: openai.APIStatusError, attempts: int, model: str = "") -> str:
     status_code = int(getattr(exc, "status_code", 0) or 0)
+    if _is_model_configuration_error(exc):
+        model_text = f" {model}" if model else ""
+        return (
+            f"model_configuration_error：当前接口不支持配置的模型{model_text}。"
+            "请检查 CODEX_MODEL，确认它是当前 CODEX_BASE_URL 的 /models 列表中的完整模型名称。"
+        )
     if status_code == 503:
         return f"Codex 接口暂时不可用（503 Service Unavailable），已重试 {attempts} 次仍失败，请稍后重试。"
     if status_code:
