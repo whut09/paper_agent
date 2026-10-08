@@ -2006,6 +2006,10 @@ def _build_asset_candidate_pool(
         caption_bbox=caption_bbox,
         adjacent_bboxes=adjacent,
     ))
+    if asset.kind == "formula":
+        # Formula bounds already stop at narrative rows. Generic expansion
+        # can reintroduce prose or an adjacent equation after a correct crop.
+        geometry = [(_CandidateStrategy.DETECTOR, bbox)]
     rendered_candidates: list[tuple[_CandidateStrategy, tuple[float, float, float, float], Path | None]] = []
     diagnostics: dict[_CandidateStrategy, tuple[str, ...]] = {}
     border_closed: dict[_CandidateStrategy, bool | None] = {
@@ -2054,7 +2058,7 @@ def _build_asset_candidate_pool(
                         ",".join(f"{value:.3f}" for value in rect).encode("ascii")
                     ).hexdigest()[:10]
                     path = candidate_dir / f"{strategy.value}-{geometry_key}.png"
-                    _save_clip(page, rect, path, padding=2, scale=4)
+                    _save_clip(page, rect, path, padding=0 if asset.kind == "formula" else 2, scale=4)
                     integrity = _inspect_crop_integrity(path, kind=asset.kind)
                     expected_adjacent_sides = _adjacent_table_edge_sides(asset, assets)
                     unexpected_sides = (
@@ -2331,7 +2335,13 @@ def _ensure_formula_evidence_disclosure(
 ) -> str:
     """Prevent prose about an absent equation from masquerading as evidence."""
 
-    if any(asset.kind == "formula" for asset in assets) or formula_candidates:
+    disclosure = (
+        "原文没有给出可独立截取的编号公式或显示方程。本节只解释正文和方法图中明确出现的调度符号与机制关系，"
+        "不把通用 Q-learning 等式补写成论文原始公式。"
+    )
+    if any(asset.kind == "formula" for asset in assets):
+        return summary.replace(disclosure, "").strip()
+    if formula_candidates:
         return summary
     lines = summary.splitlines()
     heading_index = next(
@@ -2350,10 +2360,6 @@ def _ensure_formula_evidence_disclosure(
             end_index = index
             break
     existing = "\n".join(lines[heading_index + 1 : end_index])
-    disclosure = (
-        "原文没有给出可独立截取的编号公式或显示方程。本节只解释正文和方法图中明确出现的调度符号与机制关系，"
-        "不把通用 Q-learning 等式补写成论文原始公式。"
-    )
     if disclosure in existing:
         return summary
     lines[heading_index + 1 : heading_index + 1] = [disclosure, ""]
@@ -2444,21 +2450,57 @@ def _numbered_formula_clip(
     """Return a tight equation crop anchored by its printed number token."""
 
     anchor_mid = (number_line.rect.y0 + number_line.rect.y1) / 2
+    nearby = [
+        line for line in lines
+        if abs((line.rect.y0 + line.rect.y1) / 2 - anchor_mid) <= 70
+    ]
+    gutter = page.rect.width / 2
+    narrative = [line for line in nearby if _formula_line_looks_like_inline_prose(line.text)]
+    two_columns = (
+        page.rect.width >= 420
+        and sum(line.rect.x1 < gutter for line in narrative) >= 2
+        and sum(line.rect.x0 > gutter for line in narrative) >= 2
+        and not any(line.rect.x0 < gutter < line.rect.x1 for line in narrative)
+        and not any(
+            line.rect.x0 < gutter < line.rect.x1
+            and not _formula_line_looks_like_inline_prose(line.text)
+            and _line_has_formula_syntax(line.text)
+            for line in nearby
+        )
+    )
+    if two_columns:
+        left, right = _column_bounds(page, number_line.rect)
+        nearby = [line for line in nearby if line.rect.x1 >= left and line.rect.x0 <= right]
     # Keep the band tight enough to exclude the preceding prose and the next
     # displayed equation in a numbered stack, while retaining superscripts,
     # subscripts, and spans split out by PDF font extraction.
-    top = number_line.rect.y0 - 24.0
-    bottom = number_line.rect.y1 + 24.0
+    top = number_line.rect.y0 - 58.0
+    bottom = number_line.rect.y1 + 58.0
+    # Narrative rows may contain math and separate accent glyphs. Use them
+    # as boundaries before collecting fragments, not merely as rejected text.
+    for line in nearby:
+        mid = (line.rect.y0 + line.rect.y1) / 2
+        other_number = _equation_number_token(line.text)
+        if abs(mid - anchor_mid) < 7 or abs(mid - anchor_mid) > 70:
+            continue
+        if not (_formula_line_looks_like_inline_prose(line.text) or
+                (other_number and line is not number_line)):
+            continue
+        if mid < anchor_mid:
+            top = max(top, line.rect.y1 + 0.5)
+        elif mid > anchor_mid:
+            bottom = min(bottom, line.rect.y0 - 0.5)
     selected: list[TextLine] = []
     formula_parts: list[str] = []
-    for line in lines:
-        if line.rect.y1 < top or line.rect.y0 > bottom:
+    for line in nearby:
+        mid = (line.rect.y0 + line.rect.y1) / 2
+        if mid < top or mid > bottom or _formula_line_looks_like_inline_prose(line.text):
             continue
         is_formula = (
             line is number_line
             or _line_has_formula_syntax(line.text)
             or _is_formula_continuation_line(line.text)
-            or _is_nearby_formula_fragment(line, anchor_mid)
+            or _is_nearby_formula_fragment(line, mid)
         )
         if not is_formula:
             continue
@@ -2469,9 +2511,9 @@ def _numbered_formula_clip(
     rect = _merge_rects([line.rect for line in selected])
     rect = fitz.Rect(
         max(page.rect.x0, rect.x0 - 18.0),
-        max(page.rect.y0, rect.y0 - 4.0),
+        max(page.rect.y0, top, rect.y0 - 4.0),
         min(page.rect.x1, rect.x1 + 18.0),
-        min(page.rect.y1, rect.y1 + 8.0),
+        min(page.rect.y1, bottom, rect.y1 + 10.0),
     )
     return rect, " ".join(part for part in formula_parts if part)
 
@@ -2858,6 +2900,11 @@ def _formula_line_looks_like_inline_prose(text: str) -> bool:
     if not line:
         return False
     lowered = line.lower()
+    # TeX command/function names are not English narrative words.
+    if len(re.findall(r"\\[A-Za-z]+", line)) >= 2:
+        return False
+    if lowered.startswith(("where ", "when ", "if ", "the ", "this ", "we ")):
+        return True
     words = re.findall(r"[A-Za-z]{3,}", line)
     math_symbols = set("=<>±∞αβγδϵεΔ∆θλμσ∈→×·∑Σ∫√≤≥≈∝⊤−˜~′")
     symbol_count = sum(1 for ch in line if ch in math_symbols)
@@ -2880,17 +2927,33 @@ def _formula_line_looks_like_inline_prose(text: str) -> bool:
         " concatenated ",
         " input ",
         " uses ",
+        " for ",
+        " are ",
+        " as ",
+        " we ",
     )
     padded = f" {lowered} "
     if any(token in padded for token in prose_tokens) and len(words) >= 3 and not has_equation_number:
         return True
     if re.search(r"[,;]\s*(?:the|a|an|and|or|if|where|which|with|we|this|that)\b", lowered):
         return True
+    if "\\" in line or "=" in line or _line_has_formula_syntax(line):
+        return False
     return len(words) >= 4 and symbol_count < 5 and not has_equation_number
 
 
 def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]) -> fitz.Rect:
     left, right = _formula_column_bounds(page, anchor)
+    anchor_mid = (anchor.y0 + anchor.y1) / 2
+    numbers = [
+        line for line in lines
+        if re.fullmatch(r"\s*[（(\[]\s*\d+[A-Za-z]?\s*[）)\]]\s*", line.text)
+        and abs((line.rect.y0 + line.rect.y1) / 2 - anchor_mid) <= 58
+        and line.rect.x1 >= left and line.rect.x0 <= right
+    ]
+    if numbers:
+        number = min(numbers, key=lambda line: abs((line.rect.y0 + line.rect.y1) / 2 - anchor_mid))
+        return _numbered_formula_clip(page, number, lines)[0]
     y0 = anchor.y0
     y1 = anchor.y1
     x0 = anchor.x0
@@ -2899,6 +2962,8 @@ def _formula_clip_rect(page: fitz.Page, anchor: fitz.Rect, lines: list[TextLine]
     for line in lines:
         line_mid = (line.rect.y0 + line.rect.y1) / 2
         if abs(line_mid - anchor_mid) > 58:
+            continue
+        if _formula_line_looks_like_inline_prose(line.text):
             continue
         in_formula_column = not (line.rect.x1 < left or line.rect.x0 > right)
         same_row_formula_fragment = (
@@ -2978,7 +3043,9 @@ def _is_nearby_formula_fragment(line: TextLine, anchor_mid: float) -> bool:
     lowered = text.lower()
     if lowered.startswith(("where ", "when ", "if ", "the ", "this ", "and ", "as ")):
         return False
-    if _line_has_formula_syntax(text) or _line_has_standalone_formula_marker(text):
+    if "=" in text or _line_has_formula_syntax(text) or _line_has_standalone_formula_marker(text):
+        return True
+    if "\\" in text:
         return True
     # Math glyphs are often emitted as one-character spans or short pieces
     # containing TeX punctuation. Avoid admitting normal words from the
@@ -6490,7 +6557,6 @@ def _compile_report_asset_references(
     # A repair may have removed or appended assets since the previous draft;
     # never carry an out-of-range positional marker into a guard.
     summary = _remove_mismatched_asset_markers(summary, assets)
-    summary = _ensure_formula_evidence_disclosure(summary, assets, formula_candidates)
     summary = _align_referenced_formula_assets(
         summary,
         assets,
@@ -6498,6 +6564,7 @@ def _compile_report_asset_references(
         work_dir=work_dir,
         max_assets=max_assets,
     )
+    summary = _ensure_formula_evidence_disclosure(summary, assets, formula_candidates)
     summary = _deduplicate_formula_evidence_disclosures(summary)
     summary = _remove_mismatched_asset_markers(summary, assets)
     excluded = excluded_asset_ids or set()
@@ -10017,6 +10084,9 @@ def _asset_reference_text_for_marker(summary: str, marker_start: int) -> str:
 def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
     if not text.strip():
         return False
+    key = _asset_label_key(asset)
+    if key and key in _critical_referenced_asset_keys_in_text(text):
+        return False
     compact = _compact_asset_label(_original_asset_label(asset))
     if compact and compact in text:
         return False
@@ -10039,6 +10109,8 @@ def _asset_reference_kind_mismatch(text: str, asset: PaperAsset) -> bool:
 
 
 def _asset_reference_mentions_kind(text: str, kind: str) -> bool:
+    if any(key[0] == kind for key in _critical_referenced_asset_keys_in_text(text)):
+        return True
     patterns = {
         "table": r"表\s*\d|表格|Table\s*\d|Tab\.\s*\d",
         "figure": r"图\s*\d|图片|图像|曲线|Figure\s*\d|Fig\.\s*\d",
@@ -12371,7 +12443,7 @@ def _extract_front_matter_metadata(source_pdf: Path) -> dict[str, str]:
             (
                 float(block[1])
                 for block in blocks
-                if re.fullmatch(r"\s*abstract\s*", _clean_xml_text(str(block[4])), re.I)
+                if re.match(r"\s*abstract(?:\s|[.:]|$)", _clean_xml_text(str(block[4])), re.I)
             ),
             270.0,
         )
@@ -12385,10 +12457,12 @@ def _extract_front_matter_metadata(source_pdf: Path) -> dict[str, str]:
             if not lines:
                 continue
             for line in lines:
-                author = re.sub(r"[\u2217*]+", "", line).strip(" ,;")
-                if _looks_like_front_matter_author(author):
-                    authors.append(author)
-                if re.search(r"\b(?:university|institute|college|laboratory|lab|school)\b", line, re.I):
+                author_line = re.sub(r"[\u2217*]+", "", line).strip(" ,;")
+                for author in re.split(r"\s*[,;]\s*|\s+and\s+", author_line):
+                    author = re.sub(r"^and\s+", "", author).strip()
+                    if _looks_like_front_matter_author(author):
+                        authors.append(author)
+                if re.search(r"\b(?:university|institute|college|laborator(?:y|ies)|lab|school)\b", line, re.I):
                     institution = re.sub(r"^[\d*\u2217\s]+", "", line).strip(" ,;|-^")
                     if institution and institution not in institutions:
                         institutions.append(institution)
@@ -12419,10 +12493,12 @@ def _looks_like_front_matter_author(text: str) -> bool:
         return False
     if re.search(r"\b(?:corresponding\s+author|abstract|keywords?)\b", text, re.I):
         return False
-    if re.search(r"\b(?:university|institute|college|laboratory|lab|school|department)\b", text, re.I):
+    if re.search(r"\b(?:university|institute|college|laborator(?:y|ies)|lab|school|department)\b", text, re.I):
         return False
-    tokens = re.findall(r"[A-Z][A-Za-z.'-]*", text)
-    return 2 <= len(tokens) <= 5 and not re.search(r"\b(?:abstract|introduction|framework|agent|integration)\b", text, re.I)
+    name_word = r"(?:[A-Z][A-Za-z.'-]*\d*|de|del|van|von|da|dos)"
+    return bool(re.fullmatch(rf"{name_word}(?:\s+{name_word}){{1,4}}", text)) and not re.search(
+        r"\b(?:abstract|introduction|framework|agent|integration|detection|foundation|model)\b", text, re.I
+    )
 
 
 def _remove_excluded_asset_markers(summary: str, excluded_asset_ids: set[int]) -> str:

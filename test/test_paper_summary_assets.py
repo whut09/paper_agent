@@ -24,6 +24,7 @@ from paper_agent.paper_summary import (
     _attach_claims_to_grounding_map,
     _build_prompt_patches,
     _build_grounding_map,
+    _build_asset_candidate_pool,
     _build_knowledge_graph,
     _caption_is_figure,
     _caption_is_table,
@@ -1355,6 +1356,19 @@ def test_missing_formula_assets_get_explicit_source_evidence_disclosure():
     assert "不把通用 Q-learning 等式补写成论文原始公式" in result
 
 
+def test_formula_evidence_removes_stale_absence_disclosure():
+    summary = _ensure_formula_evidence_disclosure("### 关键公式\n公式（1）解释图像特征。", [], [])
+    assets = [PaperAsset("formula", 1, Path("formula.png"), "公式 1 截图", text="x = y (1)")]
+    compiled = _compile_report_asset_references(summary, assets)
+
+    assert "原文没有给出" not in compiled
+    assert "Q-learning" not in compiled
+    assert "图像特征" in compiled
+    assert "[[ASSET:1]]" in compiled
+    assert _asset_guard(compiled, assets).status == "passed"
+    assert _compile_report_asset_references(compiled, assets) == compiled
+
+
 def test_formula_candidates_without_screenshot_fail_asset_guard():
     result = _asset_guard(
         "## 方法主线\n### 关键公式\n公式1定义训练目标。",
@@ -1436,6 +1450,29 @@ def test_front_matter_metadata_stops_author_scan_at_abstract(tmp_path):
     assert "Jiahao Cui1" in metadata["作者"]
     assert "We ask whether" not in metadata["作者"]
     assert metadata["机构"] == "National University of Singapore"
+
+
+def test_front_matter_metadata_handles_inline_abstract_and_long_author_list(tmp_path):
+    pdf_path = tmp_path / "metadata.pdf"
+    document = fitz.open()
+    page = document.new_page(width=612, height=792)
+    page.insert_text((100, 130), "MV2GF: Multi-view Pedestrian Detection")
+    page.insert_text((100, 145), "with a Visual Geometric Foundation Model")
+    page.insert_text((100, 180), "Taiga Yamane, Satoshi Suzuki, Ryo Masumura, Shota Orihashi,")
+    page.insert_text((100, 195), "Tomohiro Tanaka, Mana Ihori, and Naoki Makishima")
+    page.insert_text((100, 215), "Human Informatics Laboratories, NTT, Inc., Japan")
+    page.insert_text((100, 255), "Abstract. Multi-View Pedestrian Detection aims to detect")
+    page.insert_text((100, 268), "MV2GF fuses task-specific features with general-purpose features")
+    document.save(pdf_path)
+    document.close()
+
+    metadata = _extract_front_matter_metadata(pdf_path)
+
+    assert metadata["作者"] == "、".join([
+        "Taiga Yamane", "Satoshi Suzuki", "Ryo Masumura", "Shota Orihashi",
+        "Tomohiro Tanaka", "Mana Ihori", "Naoki Makishima",
+    ])
+    assert metadata["机构"] == "Human Informatics Laboratories, NTT, Inc., Japan"
 
 
 def test_core_info_enrichment_replaces_model_metadata_with_pdf_metadata(tmp_path):
@@ -2015,6 +2052,123 @@ def test_numbered_formula_clip_keeps_split_left_spans_and_number():
     assert rect.x1 > 480
     assert "(9)" in text
     assert "where" not in text.lower()
+
+
+def test_numbered_formula_clip_excludes_math_prose_and_its_detached_accent():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(5)", 468, 651, 481, 662)
+    formula = line(r"\mathcal {L}_{det} = \mathrm {FocalLoss}(M, \bar {M})", 205, 649, 420, 664)
+    lines = [
+        line("M in R and the ground truth offset map O, as", 135, 629, 445, 645),
+        line("~", 139, 630, 144, 640),
+        formula,
+        number,
+        line("where M is the image map and O = x + y.", 135, 676, 481, 687),
+    ]
+
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+
+    assert rect.y0 > 645
+    assert rect.y1 < 676
+    assert rect.x0 > 180
+    assert formula.text in text
+    assert "ground truth" not in text
+    assert "where" not in text
+    assert "~" not in text
+
+
+def test_numbered_formula_clip_keeps_multiline_split_glyphs():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(4)", 468, 394, 481, 405)
+    lines = [
+        line("The voxel size is defined as follows.", 135, 321, 480, 333),
+        line("i", 196, 339, 205, 350),
+        line(r"\left\{", 315, 339, 331, 379),
+        line("S(x,y,z) =", 195, 352, 313, 376),
+        line(r"\begin {pmatrix} x \\ y \end {pmatrix}", 235, 391, 455, 405),
+        number,
+        line("where (x,y,z) indicates the coordinates in V = x.", 135, 420, 481, 433),
+    ]
+
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+
+    assert rect.y0 <= 339
+    assert rect.y1 >= 405
+    assert rect.y1 < 420
+    assert "i" in text.split()
+    assert r"\left\{" in text
+    assert "where" not in text
+
+
+def test_numbered_formula_clip_ignores_adjacent_column_equation_and_prose():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(2)", 570, 394, 583, 405)
+    lines = [
+        line("The left column discusses the data.", 40, 350, 290, 361),
+        line("The next paragraph explains the result.", 40, 380, 290, 391),
+        line("x = y + z", 60, 394, 225, 405),
+        line("(1)", 275, 394, 290, 405),
+        line("The right column defines the loss.", 325, 345, 583, 356),
+        line("L = x + y", 350, 374, 560, 389),
+        line("+ z", 390, 394, 430, 405),
+        number,
+        line("where x is the image feature.", 325, 420, 583, 431),
+    ]
+
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+
+    assert rect.x0 > 306
+    assert rect.y0 < 374
+    assert "L = x + y" in text
+    assert "(1)" not in text
+    assert "x = y + z" not in text
+
+
+def test_numbered_formula_clip_keeps_full_width_equation_between_columns():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(2)", 570, 394, 583, 405)
+    lines = [
+        line("The left column discusses the data.", 40, 340, 290, 351),
+        line("The next paragraph explains the result.", 40, 358, 290, 369),
+        line("The right column defines the loss.", 325, 340, 583, 351),
+        line("The next paragraph explains the feature.", 325, 358, 583, 369),
+        line("L = x + y + z", 120, 394, 550, 405),
+        number,
+    ]
+
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+
+    assert rect.x0 < 120
+    assert rect.x1 > 583
+    assert "L = x + y + z" in text
+
+
+def test_formula_candidates_preserve_tight_source_bounds(tmp_path):
+    pdf = tmp_path / "formula.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((120, 200), "x = y + z (1)")
+    page.insert_text((120, 224), "where x is the image feature.")
+    doc.save(pdf)
+    doc.close()
+    asset = _capture_formula_asset_by_number(pdf, tmp_path, "1")
+    assert asset is not None
+
+    pool = _build_asset_candidate_pool(asset, [asset], source_pdf=pdf, work_dir=tmp_path)
+
+    assert pool is not None
+    assert len(pool.candidates) == 1
+    assert pool.selected.bbox == tuple(asset.rect)
+    with Image.open(asset.path) as original, Image.open(pool.selected.image_path) as candidate:
+        assert candidate.size == original.size
 
 
 def test_chinese_title_rewrites_mixed_english_placeholder_title():
@@ -3085,6 +3239,20 @@ def test_report_asset_compiler_restores_marker_removed_by_model_rewrite():
     assert "表1列出了评测电路和资源边界。\n[[ASSET:1]]" in compiled
     assert compiled.count("[[ASSET:2]]") == 1
     assert _asset_guard(compiled, assets).status == "passed"
+
+
+def test_report_asset_compiler_preserves_parenthesized_formula_markers_with_image_words():
+    assets = [PaperAsset("formula", 1, Path("formula.png"), "公式 1 截图", text="x = y (1)")]
+    for label in ("公式（1）", "公式(1)", "公式（一）", "Equation (1)", "Eq. (1)", "Formula (I)"):
+        draft = "## 方法主线\n### 关键公式\n" + label + "解释图像和图片特征。\n[[ASSET:1]]"
+        compiled = _compile_report_asset_references(draft, assets)
+
+        assert compiled.count("[[ASSET:1]]") == 1, label
+        assert _asset_guard(compiled, assets).status == "passed", label
+        assert _compile_report_asset_references(compiled, assets) == compiled, label
+
+    mismatch = "图2解释图像特征。\n[[ASSET:1]]"
+    assert "[[ASSET:1]]" not in _remove_mismatched_asset_markers(mismatch, assets)
 
 
 def test_figure_crop_without_lower_candidate_still_trims_front_matter():
