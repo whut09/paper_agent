@@ -313,6 +313,16 @@ copy config.json config.local.json
 
 `CODEX_USE_PROXY` 默认为 `false`，总结接口不会继承系统 `HTTP_PROXY` / `HTTPS_PROXY`。如果你的接口必须走代理，再改成 `true`。
 
+论文总结默认使用 `CODEX_WIRE_API: "responses"`，通过 Responses 流式接口接收结果，避免长报告一直等待完整响应而触发网关超时。只有收到完整结束事件才接受报告；流中断或输出被截断时会保留中间结果并报告失败。接口明确不支持 Responses 时自动切换 Chat Completions 流式；也可以显式配置 `CODEX_WIRE_API: "chat"`。模型不存在、524 和 503 不会触发协议降级。`CODEX_STREAM_TIMEOUT_SECONDS` 控制流式请求的总时间上限，未设置时沿用 `CODEX_TIMEOUT_SECONDS`。
+
+使用实际网页配置自检一篇论文（会调用真实模型）：
+
+```bash
+python evaluation/smoke_summary.py paper.pdf --config config.local.json --output paper_agent_files/smoke-check --paper-url https://example.org/paper.pdf
+```
+
+该命令会检查生成结果是否可下载、Word 是否包含传入的论文地址，以及网页的下载适配器是否接受结果。失败时返回非零退出码；输出目录保留 trace、verification、qa 和 acceptance 诊断文件。重复运行同一目录会复用已完成的分段笔记，验证新配置或新模型时使用新的输出目录。
+
 如果总结阶段长时间停在“调用 Codex 接口生成分段笔记”或“整合方法、结果和分析”，通常是大模型接口长时间没有返回。默认单次接口超时为 90 秒，默认重试 2 次；确实需要更慢接口时可以在 `config.local.json` 中调整：
 
 ```json
