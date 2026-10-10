@@ -251,6 +251,7 @@ class CodexConfig:
     model: str
     use_proxy: bool = False
     proxy: str = ""
+    wire_api: str = "responses"
 
 
 @dataclass
@@ -4651,11 +4652,27 @@ def _page_graphic_regions(page: fitz.Page) -> list[fitz.Rect]:
     except Exception:
         pass
     try:
-        for drawing in page.get_drawings():
+        try:
+            drawings = page.get_drawings(extended=True)
+        except TypeError:
+            drawings = page.get_drawings()
+        clips: list[tuple[int, fitz.Rect]] = []
+        for drawing in drawings:
+            level = int(drawing.get("level", 0))
+            clips = [(depth, clip) for depth, clip in clips if depth < level]
+            if drawing.get("type") == "clip":
+                clips.append((level, fitz.Rect(drawing["scissor"])))
+                continue
+            if drawing.get("type") == "group":
+                continue
             rect = drawing.get("rect")
             if not rect:
                 continue
             rect = fitz.Rect(rect)
+            # PDF paths can extend far outside their visible clipping group.
+            # Such invisible geometry must not drag a figure crop into body text.
+            for _, clip in clips:
+                rect &= clip
             if rect.width >= 12 and rect.height >= 12 and not _graphic_region_is_page_artifact(page, rect):
                 regions.append(rect)
     except Exception:
@@ -5095,6 +5112,9 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
     model = _first_value(envs, "CODEX_MODEL", "OPENAI_MODEL")
     use_proxy = _truthy(_first_value(envs, "CODEX_USE_PROXY", "OPENAI_USE_PROXY"))
     proxy = _first_value(envs, "CODEX_PROXY", "OPENAI_PROXY")
+    wire_api = _first_value(envs, "CODEX_WIRE_API") or "responses"
+    if wire_api not in {"responses", "chat"}:
+        raise ValueError("CODEX_WIRE_API 必须是 responses 或 chat。")
 
     if not base_url:
         raise ValueError("缺少 CODEX_BASE_URL，请在前端或 config.json 中配置 Codex 本地接口 URL。")
@@ -5108,6 +5128,7 @@ def _resolve_codex_config(envs: dict[str, str]) -> CodexConfig:
         model=model,
         use_proxy=use_proxy,
         proxy=proxy,
+        wire_api=wire_api,
     )
 
 
@@ -9825,9 +9846,17 @@ def _pdf_page_to_data_url(source_pdf: Path | None, page_number: int) -> str | No
 
 def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
     try:
-        payload = json.loads(str(text).strip())
+        payload = json.loads(_extract_json_object(str(text)))
         if not isinstance(payload, dict):
             raise ValueError("visual guard response must be a JSON object")
+        payload = {str(key).strip(): value for key, value in payload.items()}
+        # Preserve explicit rejections from compatible gateways that rename
+        # passed to suitable/valid, rather than downgrading them to warnings.
+        if not isinstance(payload.get("passed"), bool):
+            for alias in ("suitable", "valid"):
+                if isinstance(payload.get(alias), bool):
+                    payload["passed"] = payload[alias]
+                    break
         # Older OpenAI-compatible vision gateways sometimes return one issue
         # object (valid/severity/reason) even when response_format was sent.
         # Adapt that shape locally instead of turning a useful visual finding
@@ -9877,10 +9906,10 @@ def _parse_visual_asset_guard_response(text: str) -> dict[str, object]:
             {
                 "severity": severity,
                 "type": str(issue.get("type", "visual_issue")),
-                "reason": str(issue.get("reason", "")),
+                "reason": str(issue.get("reason") or issue.get("description") or issue.get("message") or ""),
                 "reason_code": _infer_reason_code(
                     str(issue.get("reason_code") or issue.get("type", "visual_issue")),
-                    str(issue.get("reason", "")),
+                    str(issue.get("reason") or issue.get("description") or issue.get("message") or ""),
                 ),
                 "confidence": max(0.0, min(1.0, confidence)),
                 "provenance": str(issue.get("provenance") or "vision_model"),
@@ -10888,12 +10917,15 @@ def _create_codex_client(config: CodexConfig) -> openai.OpenAI:
         timeout=httpx.Timeout(timeout_seconds, connect=min(20.0, timeout_seconds)),
         **client_kwargs,
     )
-    return openai.OpenAI(
+    client = openai.OpenAI(
         base_url=config.base_url,
         api_key=config.api_key,
         http_client=http_client,
         max_retries=0,
     )
+    client._paper_wire_api = config.wire_api
+    logger.info("Paper model transport: %s (streaming), model=%s", config.wire_api, config.model)
+    return client
 
 
 def _repair_report_format_with_codex(
@@ -11013,6 +11045,75 @@ def _create_chat_completion(client: openai.OpenAI, request: dict):
     return client.chat.completions.create(**request)
 
 
+def _responses_stream_content(client: openai.OpenAI, request: dict) -> str:
+    """Accept only a completed Responses stream, and close it on timeout."""
+    messages = request["messages"]
+    response_request = {
+        "model": request["model"],
+        "instructions": "\n\n".join(m["content"] for m in messages if m["role"] == "system"),
+        "input": [m for m in messages if m["role"] != "system"],
+        "stream": True,
+        "timeout": _codex_stream_timeout_seconds(),
+    }
+    if request.get("max_tokens"):
+        response_request["max_output_tokens"] = request["max_tokens"]
+    stopped = threading.Event()
+    active_stream: list[object] = []
+
+    def read() -> str:
+        with _MODEL_CALL_COUNTS_LOCK:
+            key = id(client)
+            _MODEL_CALL_COUNTS[key] = _MODEL_CALL_COUNTS.get(key, 0) + 1
+        stream = client.responses.create(**response_request)
+        active_stream.append(stream)
+        chunks: list[str] = []
+        try:
+            if stopped.is_set():
+                raise TimeoutError("Responses 流式请求已超时。")
+            for event in stream:
+                if stopped.is_set():
+                    raise TimeoutError("Responses 流式请求已超时。")
+                event_type = getattr(event, "type", "")
+                if event_type == "response.output_text.delta":
+                    chunks.append(event.delta)
+                elif event_type == "response.completed":
+                    response = getattr(event, "response", None)
+                    if response is not None and getattr(response, "status", "completed") != "completed":
+                        raise RuntimeError("Responses 流式请求未完整完成。")
+                    text = "".join(chunks) or _completion_content(response)
+                    return _postprocess_summary(text)
+                elif event_type in {"response.failed", "response.incomplete", "error"}:
+                    response = getattr(event, "response", None)
+                    detail = getattr(event, "message", None) or getattr(response, "error", None) or getattr(response, "incomplete_details", None)
+                    raise RuntimeError(f"Responses 流式请求失败（{event_type}）：{detail}")
+            raise RuntimeError("Responses 流式连接提前结束，未收到 response.completed，已丢弃不完整内容。")
+        finally:
+            stream.close()
+
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="paper-responses-stream")
+    future = executor.submit(read)
+    try:
+        return future.result(timeout=_codex_stream_timeout_seconds() + 5.0)
+    except FuturesTimeoutError as exc:
+        stopped.set()
+        for stream in active_stream:
+            stream.close()
+        future.cancel()
+        raise TimeoutError(f"Responses 流式接口超过 {_codex_stream_timeout_seconds():.0f} 秒仍未结束。") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _responses_endpoint_unsupported(exc: openai.APIStatusError) -> bool:
+    if _is_model_configuration_error(exc):
+        return False
+    status = int(getattr(exc, "status_code", 0) or 0)
+    text = str(exc).lower()
+    return status in {404, 405, 501} or (
+        status == 400 and any(token in text for token in ("responses is not supported", "unsupported endpoint", "unsupported api"))
+    )
+
+
 def _completion_content(response: object) -> str:
     """Read text from OpenAI SDK objects and common compatible API shapes."""
 
@@ -11112,6 +11213,24 @@ def _chat(
             }
             if max_tokens:
                 request["max_tokens"] = max_tokens
+            wire_api = getattr(client, "_paper_wire_api", "responses" if hasattr(client, "responses") else "legacy")
+            if wire_api == "responses":
+                try:
+                    content = _responses_stream_content(client, request)
+                except openai.APIStatusError as exc:
+                    if not _responses_endpoint_unsupported(exc):
+                        raise
+                    logger.warning("Responses endpoint unsupported; using Chat Completions streaming.")
+                    client._paper_wire_api = "chat"
+                    content = _chat_stream_content(client, request)
+                if content.strip():
+                    return content
+                raise RuntimeError("Responses 接口返回空内容。")
+            if wire_api == "chat":
+                content = _chat_stream_content(client, request)
+                if content.strip():
+                    return content
+                raise RuntimeError("Chat 流式接口返回空内容。")
             try:
                 response = _create_chat_completion(client, request)
             except openai.BadRequestError as exc:
@@ -11150,6 +11269,11 @@ def _chat(
                 break
             time.sleep(_chat_retry_delay(attempt))
         except openai.APIConnectionError as exc:
+            last_error = exc
+            if attempt + 1 >= max_attempts:
+                break
+            time.sleep(_chat_retry_delay(attempt))
+        except (RuntimeError, TimeoutError, httpx.HTTPError) as exc:
             last_error = exc
             if attempt + 1 >= max_attempts:
                 break

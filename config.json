@@ -2,6 +2,7 @@
     "CODEX_BASE_URL": "xx",
     "CODEX_API_KEY": "xx",
     "CODEX_MODEL": "xx",
+    "CODEX_WIRE_API": "responses",
     "ENABLED_SERVICES": [],
     "HIDDEN_GRADIO_DETAILS": true,
     "PAPER_AGENT_LANG_FROM": "English",

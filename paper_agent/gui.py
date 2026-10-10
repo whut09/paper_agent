@@ -1139,6 +1139,7 @@ def summarize_file(
                 "CODEX_MODEL": get_config_or_env("CODEX_MODEL"),
                 "CODEX_USE_PROXY": get_config_or_env("CODEX_USE_PROXY"),
                 "CODEX_PROXY": get_config_or_env("CODEX_PROXY"),
+                "CODEX_WIRE_API": get_config_or_env("CODEX_WIRE_API"),
             },
             max_assets=max_assets_value,
             paper_url=entered_paper_url if file_type != "File" else "",
