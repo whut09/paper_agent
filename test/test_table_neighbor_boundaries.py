@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import fitz
 
@@ -82,7 +83,34 @@ def test_descriptive_method_names_with_scores_remain_table_rows():
         page.insert_text((400, 175), "81.2")
         page.insert_text((140, 195), "Training With Frozen Backbone")
         page.insert_text((400, 195), "83.4")
+        page.insert_text((135, 222), "4")
+        page.insert_text((155, 222), "Ablation Study: Low-rank Vision-Language Alignment")
         rect, lines = caption_and_lines(page, "Table 1")
         body, text = ps._table_rect_below_caption(page, rect, lines)
         assert body is not None and body.y1 >= 195
         assert "Linear Probe" in text and "Training With Frozen Backbone" in text
+        assert body.y1 < 215 and "Ablation Study" not in text
+
+
+def test_table_detector_global_state_stays_locked_through_text_extraction(tmp_path):
+    class Table:
+        bbox = (100, 100, 400, 200)
+
+        def extract(self):
+            assert ps._TABLE_DETECTION_LOCK.locked()
+            return [["Method", "Score"], ["Ours", "85.2"]]
+
+    class Page:
+        def find_tables(self):
+            assert ps._TABLE_DETECTION_LOCK.locked()
+            return SimpleNamespace(tables=[Table()])
+
+    regions = ps._detected_table_regions(Page())
+    assert len(regions) == 1 and "85.2" in regions[0][1]
+
+    class EmptyPage:
+        def find_tables(self):
+            assert ps._TABLE_DETECTION_LOCK.locked()
+            return SimpleNamespace(tables=[])
+
+    assert ps._capture_tables(EmptyPage(), tmp_path, 1, 13, set()) == []

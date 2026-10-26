@@ -84,6 +84,10 @@ logger = logging.getLogger(__name__)
 _TEXTELLER_FAILED = False
 _MODEL_CALL_COUNTS: dict[int, int] = {}
 _MODEL_CALL_COUNTS_LOCK = threading.Lock()
+
+# PyMuPDF table detection uses module-global CHARS/EDGES/TEXTPAGE.  Even
+# separate document handles race across page workers until extraction ends.
+_TABLE_DETECTION_LOCK = threading.Lock()
 DEFAULT_MAX_ASSETS = 13
 DEFAULT_FIGURE_ASSET_LIMIT = 5
 DEFAULT_TABLE_ASSET_LIMIT = 4
@@ -1711,6 +1715,17 @@ def _capture_captioned_tables(
 
 
 def _capture_tables(
+    page: fitz.Page,
+    work_dir: Path,
+    page_no: int,
+    limit: int,
+    seen_boxes: set[tuple[int, int, int, int, int]],
+) -> list[PaperAsset]:
+    with _TABLE_DETECTION_LOCK:
+        return _capture_tables_locked(page, work_dir, page_no, limit, seen_boxes)
+
+
+def _capture_tables_locked(
     page: fitz.Page,
     work_dir: Path,
     page_no: int,
@@ -3608,10 +3623,11 @@ def _detected_table_rect_for_caption(
 
 def _detected_table_regions(page: fitz.Page) -> list[tuple[fitz.Rect, str]]:
     try:
-        detected = [
-            (fitz.Rect(table.bbox), _table_to_text(table))
-            for table in page.find_tables().tables
-        ]
+        with _TABLE_DETECTION_LOCK:
+            detected = [
+                (fitz.Rect(table.bbox), _table_to_text(table))
+                for table in page.find_tables().tables
+            ]
     except Exception:
         return []
     regions = [
@@ -3665,15 +3681,16 @@ def _table_rect_below_caption(
         # A prose column beside a plot can share a row with short legend
         # labels/numbers.  Those labels must not make the prose look tabular.
         # Keep descriptive method names when a separate cell holds a score.
-        has_numeric_cell = any(
-            re.fullmatch(r"[\d\s.,+\-\u2212\u00b1/%()~\u2191\u2193]+", line.text.strip())
-            and re.search(r"\d", line.text)
-            for line in group
-        )
-        if selected and not has_numeric_cell and any(
+        if selected and any(
             len(re.findall(r"[A-Za-z]{2,}", line.text)) >= 4
             and line.rect.width >= min(right - left, caption_rect.width) * 0.28
             and not _row_looks_table_like(line.text, [line])
+            and not any(
+                cell.rect.x0 >= line.rect.x1 - 2
+                and re.fullmatch(r"[\d\s.,+\-\u2212\u00b1/%()~\u2191\u2193]+", cell.text.strip())
+                and re.search(r"\d", cell.text)
+                for cell in group
+            )
             for line in group
         ):
             break
