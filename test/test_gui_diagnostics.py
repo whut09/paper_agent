@@ -163,6 +163,18 @@ def test_gradio_render_qa_failure_exposes_specific_asset_findings():
     assert "最终检查" not in markdown
 
 
+def test_visual_guard_mixed_objects_is_not_reported_as_render_qa():
+    result = SummaryRunResult(
+        status="blocked", current_stage="VerifyReport",
+        message="asset 8 visual_contamination: 截图混入 Table 4；asset 6 visual: 包含无关正文",
+        reason_codes=["visual_crop_invalid"],
+    )
+    markdown = _format_summary_diagnostics(result)
+    assert "Asset 8" in markdown and "Asset 6" in markdown
+    assert "混入" in markdown
+    assert "RenderQA" not in markdown
+
+
 def test_gradio_callback_returns_diagnostics_for_download_timeout():
     state = {"session_id": None}
     with patch("paper_agent.gui.download_with_limit", side_effect=requests.exceptions.ReadTimeout("connection timed out")):

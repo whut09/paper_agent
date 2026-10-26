@@ -955,6 +955,12 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
         label = label_match.group(0).replace(" ", "") if label_match else "关键图表"
         issue = f"论文引用的{label}没有成功提取。"
         cause = "系统尝试重新定位该图表后仍未得到完整截图，因此停止生成，避免输出缺少关键信息的 Word。"
+    elif any(token in lowered for token in (
+        "visual_contamination", "mixed_objects", "mixed_figure_table",
+        "混入", "混合", "无关正文", "无关内容",
+    )):
+        issue = f"{asset_name}混入了其他图表或正文。"
+        cause = "素材检查发现截图包含目标以外的内容，自动重裁后仍未通过，因此停止生成。"
     elif (
         "visual_crop_invalid" in result.reason_codes
         and "image_too_small" in result.reason_codes
@@ -971,7 +977,7 @@ def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
         or "visual asset guard" in lowered
     ):
         issue = f"{asset_name}存在边缘截断。"
-        cause = "RenderQA 检查到截图边缘包含被截断的内容，已停止提供不完整的 Word。"
+        cause = "截图完整性检查发现内容被截断，已停止提供不完整的 Word。"
     elif "table" in lowered and any(token in lowered for token in ("crop", "truncated", "body", "表格")):
         issue = f"{asset_name}不完整或混入了其他内容。"
         cause = "系统自动重裁并复检后仍未找到可靠的完整表格，因此停止生成。"
