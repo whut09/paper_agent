@@ -3544,12 +3544,17 @@ def _border_enclosed_table_rect_for_caption(
     ]
     if above_tops:
         top = min(above_tops, key=lambda item: item.y0)
+        # A rule in the next table is not this table's bottom border.  Some
+        # tables have only a header separator, so return no bordered candidate
+        # rather than pairing separators across an intervening caption.
+        next_caption = _next_caption_y(_page_text_lines(page), caption_rect, left, right)
         lower_rules = [
             rule
             for rule in rules
             if rule.y0 > top.y1 + 18
             and rule.y0 - top.y1 <= min(380.0, page.rect.height * 0.5)
             and compatible(rule, top)
+            and (next_caption is None or rule.y1 < next_caption)
         ]
         bottom = max(lower_rules, key=lambda item: item.y1, default=None)
         if bottom is not None:
@@ -3657,6 +3662,21 @@ def _table_rect_below_caption(
         if row_rect.is_empty:
             continue
         row_text = " ".join(line.text for line in group)
+        # A prose column beside a plot can share a row with short legend
+        # labels/numbers.  Those labels must not make the prose look tabular.
+        # Keep descriptive method names when a separate cell holds a score.
+        has_numeric_cell = any(
+            re.fullmatch(r"[\d\s.,+\-\u2212\u00b1/%()~\u2191\u2193]+", line.text.strip())
+            and re.search(r"\d", line.text)
+            for line in group
+        )
+        if selected and not has_numeric_cell and any(
+            len(re.findall(r"[A-Za-z]{2,}", line.text)) >= 4
+            and line.rect.width >= min(right - left, caption_rect.width) * 0.28
+            and not _row_looks_table_like(line.text, [line])
+            for line in group
+        ):
+            break
         if selected and previous_y1 is not None and row_rect.y0 - previous_y1 > 44:
             break
         if (
