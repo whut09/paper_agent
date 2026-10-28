@@ -21,6 +21,24 @@ from paper_agent.schemas.findings import findings_from_verification_payload
 FIXTURE_ROOT = Path("evaluation/migration_golden")
 
 
+@pytest.mark.parametrize("qa_result", [None, SimpleNamespace(status="pending", findings=[])])
+def test_gateway_denial_acceptance_requires_admin_instead_of_blind_retry(qa_result):
+    context = SimpleNamespace(
+        paper_name="paper", source_path="paper.pdf", summary="", legacy_summary="",
+        legacy_asset_manifest=[], assets=[], asset_candidate_pools=[], verification=None,
+        qa_result=qa_result, qa_path=None, repair_history=[], guard_results=[],
+        workflow_started_at=None, agent_trace=[{
+            "node": "SummarizeContribution", "status": "failed",
+            "errors": ["HTTP 403 request_check_blocked (request id: test-403)"],
+        }],
+    )
+    result = build_acceptance_result(context)
+    blocker = next(item for item in result.blockers if item.reason_code == "model_request_blocked")
+    assert "contact_gateway_admin_with_request_id" in blocker.suggested_actions
+    assert "retry_failed_stage" not in blocker.suggested_actions
+    assert result.blockers[0] is blocker
+
+
 def _fixture(name: str) -> dict:
     return json.loads((FIXTURE_ROOT / name).read_text(encoding="utf-8"))
 

@@ -21,6 +21,7 @@ from paper_agent.schemas.acceptance import (
 )
 from paper_agent.schemas.findings import default_actions, finding_from_legacy, findings_from_verification_payload
 from paper_agent.evaluation.quality_policy import QualityDisposition, decide_quality
+from paper_agent.harness.errors import model_request_rejection_code
 
 
 REQUIRED_REPORT_SECTIONS = (
@@ -61,6 +62,8 @@ _ACTION_OVERRIDES = {
     "unresolved_asset_marker": ("rewrite_asset_marker", "regenerate_docx"),
     "workflow_incomplete": ("resume_from_last_checkpoint", "inspect_trace_json"),
     "workflow_stage_failed": ("retry_failed_stage", "inspect_trace_json"),
+    "model_request_blocked": ("contact_gateway_admin_with_request_id", "inspect_gateway_preflight_policy"),
+    "model_access_denied": ("check_gateway_credentials_and_permissions", "contact_gateway_admin_with_request_id"),
 }
 
 _OBSERVATIONAL_ACTIONS = {
@@ -326,9 +329,12 @@ def build_acceptance_result(context: Any, *, model_call_count: int = 0) -> Migra
         if node_name == "GenerateReport" and qa_status in {"pass", "warning"}:
             continue
         failed_nodes.append(item)
-    if failed_nodes and not blockers:
+    if failed_nodes:
         node = failed_nodes[-1]
-        blockers.append(_blocker("workflow_stage_failed", "; ".join(node.get("errors") or ()) or f"{node.get('node')} failed", stage=str(node.get("node") or "workflow")))
+        error_message = "; ".join(node.get("errors") or ()) or f"{node.get('node')} failed"
+        rejection_code = model_request_rejection_code(RuntimeError(error_message))
+        if rejection_code or not blockers:
+            blockers.insert(0, _blocker(rejection_code or "workflow_stage_failed", error_message, stage=str(node.get("node") or "workflow")))
 
     if blockers:
         status = "blocked"
