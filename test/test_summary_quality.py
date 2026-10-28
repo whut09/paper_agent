@@ -271,6 +271,20 @@ def test_http_524_summary_failure_is_reported_as_timeout():
     assert "network_timeout" in result.reason_codes
 
 
+def test_gateway_denial_summary_failure_has_a_stable_non_timeout_reason():
+    context = PaperWorkflowContext(
+        input_path="paper.pdf", output_dir=".", pages=None,
+        summary_language="Chinese", codex_envs={}, max_assets=13,
+    )
+    result = ps._summary_run_result(context, RuntimeError(
+        "分段笔记生成失败：HTTP 403 request_check_blocked (request id: 503504524)"
+    ))
+    assert result.status == "failed"
+    assert "model_request_blocked" in result.reason_codes
+    assert "network_timeout" not in result.reason_codes
+    assert not result.downloadable
+
+
 def test_model_configuration_failure_is_reported_with_stable_reason_code():
     context = PaperWorkflowContext(
         input_path="paper.pdf",

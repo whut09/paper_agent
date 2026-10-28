@@ -105,3 +105,40 @@ def test_client_factory_preserves_wire_api():
         assert client._paper_wire_api == "chat"
     finally:
         client.close()
+
+
+@pytest.mark.parametrize("wire_api", ["responses", "chat", "legacy", "legacy_empty"])
+def test_gateway_preflight_denial_is_terminal_and_reports_real_attempt_count(monkeypatch, wire_api):
+    response = httpx.Response(403, request=httpx.Request("POST", "https://example.test/v1/responses"))
+    error = openai.PermissionDeniedError(
+        "request_check_blocked: Request rejected by preflight safety checks (request id: test-403)",
+        response=response, body={"code": "request_check_blocked"},
+    )
+    calls = []
+
+    def denied(*args, **kwargs):
+        calls.append(1)
+        raise error
+
+    client = SimpleNamespace(_paper_wire_api="legacy" if wire_api == "legacy_empty" else wire_api)
+    monkeypatch.setattr(ps, "_responses_stream_content", denied)
+    monkeypatch.setattr(ps, "_chat_stream_content", denied)
+    monkeypatch.setattr(ps, "_create_chat_completion", lambda *a: "" if wire_api == "legacy_empty" else denied())
+    monkeypatch.setattr(ps.time, "sleep", lambda *_: pytest.fail("must not retry denial"))
+    with pytest.raises(RuntimeError, match="model_request_blocked") as caught:
+        ps._chat(client, "test-model", "paper evidence", max_attempts=4)
+    assert len(calls) == 1
+    assert "实际请求 1 次" in str(caught.value)
+    assert "已重试 4 次" not in str(caught.value)
+    assert caught.value.__cause__ is error
+
+
+def test_nonretryable_status_reports_one_attempt_not_configured_maximum():
+    response = httpx.Response(400, request=httpx.Request("POST", "https://example.test/v1/responses"))
+
+    def create(**request):
+        raise openai.BadRequestError("invalid input", response=response, body={})
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    with pytest.raises(RuntimeError, match="实际请求 1 次"):
+        ps._chat(client, "test-model", "paper evidence", max_attempts=4)

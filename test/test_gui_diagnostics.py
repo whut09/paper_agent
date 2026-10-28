@@ -106,6 +106,21 @@ def test_gradio_network_timeout_has_plain_language_explanation():
     assert "retry_verifier" not in markdown
 
 
+@pytest.mark.parametrize("reason_codes", [[], ["model_request_blocked"], ["network_timeout"]])
+def test_gradio_gateway_preflight_denial_never_blames_word_or_network(reason_codes):
+    result = SummaryRunResult(
+        status="failed", current_stage="SummarizeContribution", progress=0.624,
+        message="分段笔记生成失败：HTTP 403 request_check_blocked (request id: test-403)",
+        reason_codes=reason_codes,
+    )
+    markdown = _format_summary_diagnostics(result)
+    assert "模型网关预检拒绝" in markdown
+    assert "请求 ID：test-403" in markdown
+    assert "接口管理员" in markdown
+    assert "系统自动修复" not in markdown
+    assert "自动重试后连接仍未恢复" not in markdown
+
+
 def test_gradio_model_connection_failure_has_plain_language_explanation():
     result = SummaryRunResult(
         status="failed",

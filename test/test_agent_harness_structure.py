@@ -45,6 +45,22 @@ def test_upstream_524_timeout_is_recoverable():
     assert classify_error(exc) == "recoverable"
 
 
+def test_gateway_denial_is_not_retried_even_with_timeout_digits_in_request_id():
+    exc = RuntimeError("HTTP 403 request_check_blocked (request id: 503504524)")
+    assert not is_recoverable_error(exc)
+    assert classify_error(exc) == "nonrecoverable"
+
+
+def test_wrapped_access_denial_overrides_prior_connection_exception():
+    try:
+        try:
+            raise ConnectionError("connection failed")
+        except ConnectionError:
+            raise RuntimeError("Codex 接口返回 HTTP 401")
+    except RuntimeError as exc:
+        assert not is_recoverable_error(exc)
+
+
 def test_app_facades_import_without_optional_runtime_dependencies():
     import paper_agent.app.backend
     import paper_agent.app.cli

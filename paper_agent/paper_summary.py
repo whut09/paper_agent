@@ -37,6 +37,7 @@ from paper_agent.agents.contracts import (
     PaperAgentRole as _PaperAgentRole,
 )
 from paper_agent.harness.context import PaperWorkflowContext as _PaperWorkflowContext, ProgressCallback as _ProgressCallback
+from paper_agent.harness.errors import model_request_rejection_code
 from paper_agent.harness.executor import PaperWorkflow as _PaperWorkflow
 from paper_agent.harness.node import NodeResult as _NodeResult, PaperWorkflowNode as _PaperWorkflowNode
 from paper_agent.harness.policy import GateDecision as _GateDecision, GatePolicy as _GatePolicy
@@ -1458,7 +1459,10 @@ def _summary_run_result(
             "服务端断开",
             "server disconnected",
         )
-        if _is_model_configuration_error_text(lowered):
+        rejection_code = model_request_rejection_code(exc)
+        if rejection_code:
+            reason_codes.append(rejection_code)
+        elif _is_model_configuration_error_text(lowered):
             reason_codes.append("model_configuration_error")
         elif any(token in lowered for token in timeout_tokens):
             reason_codes.append("verifier_transport_failure" if context.current_stage == "VerifyClaims" else "network_timeout")
@@ -11290,6 +11294,8 @@ def _chat(
                     return stream_content
             except Exception as exc:
                 stream_error = exc
+            if isinstance(stream_error, openai.APIStatusError):
+                raise stream_error
             last_error = stream_error or RuntimeError("Codex 接口返回空内容。")
             if attempt + 1 >= max_attempts:
                 break
@@ -11319,7 +11325,7 @@ def _chat(
         raise RuntimeError(
             _openai_status_error_message(
                 last_error,
-                _openai_status_retry_limit(last_error, max_attempts),
+                attempt + 1,
                 model=model,
             )
         ) from last_error
@@ -11448,6 +11454,14 @@ def _chat_retry_delay(attempt: int) -> float:
 
 def _openai_status_error_message(exc: openai.APIStatusError, attempts: int, model: str = "") -> str:
     status_code = int(getattr(exc, "status_code", 0) or 0)
+    rejection_code = model_request_rejection_code(exc)
+    if rejection_code:
+        detail = "模型网关预检拒绝了请求" if rejection_code == "model_request_blocked" else "模型接口拒绝访问，请检查密钥权限和网关访问策略"
+        return (
+            f"{rejection_code}：{detail}（HTTP {status_code}，实际请求 {attempts} 次）。"
+            f"收到拒绝后未继续重试或切换接口；请联系接口管理员核查。错误详情：{exc}"
+        )
+    attempt_text = f"实际请求 {attempts} 次（重试 {max(0, attempts - 1)} 次）"
     if _is_model_configuration_error(exc):
         model_text = f" {model}" if model else ""
         return (
@@ -11455,10 +11469,10 @@ def _openai_status_error_message(exc: openai.APIStatusError, attempts: int, mode
             "请检查 CODEX_MODEL，确认它是当前 CODEX_BASE_URL 的 /models 列表中的完整模型名称。"
         )
     if status_code == 503:
-        return f"Codex 接口暂时不可用（503 Service Unavailable），已重试 {attempts} 次仍失败，请稍后重试。"
+        return f"Codex 接口暂时不可用（503 Service Unavailable），{attempt_text}仍失败，请稍后重试。"
     if status_code:
-        return f"Codex 接口返回 HTTP {status_code}，已重试 {attempts} 次仍失败：{exc}"
-    return f"Codex 接口请求失败，已重试 {attempts} 次仍失败：{exc}"
+        return f"Codex 接口返回 HTTP {status_code}，{attempt_text}仍失败：{exc}"
+    return f"Codex 接口请求失败，{attempt_text}仍失败：{exc}"
 
 
 def _replace_missing_abstract(

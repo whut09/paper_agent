@@ -21,7 +21,7 @@ from logging.handlers import RotatingFileHandler
 
 from paper_agent import __version__, sanitize_no_proxy_env
 from paper_agent.config import ConfigManager
-from paper_agent.harness.errors import is_recoverable_error
+from paper_agent.harness.errors import is_recoverable_error, model_request_rejection_code
 from paper_agent.harness.policy import DEFAULT_MAX_ASSETS
 from paper_agent.harness.workflow import summarize_paper_detailed
 from paper_agent.schemas.qa import SummaryRunResult
@@ -930,6 +930,20 @@ def _format_summary_diagnostics(result: SummaryRunResult) -> str:
 def _summary_failure_explanation(result: SummaryRunResult) -> tuple[str, str]:
     message = str(result.message or "").strip()
     lowered = message.lower()
+    rejection_code = next(
+        (code for code in result.reason_codes if code in {"model_request_blocked", "model_access_denied"}),
+        "",
+    ) or model_request_rejection_code(RuntimeError(message))
+    if rejection_code:
+        request_match = re.search(r"request id:\s*([A-Za-z0-9_-]+)", message, re.I)
+        request_hint = f" 请求 ID：{request_match.group(1)}。" if request_match else ""
+        issue = "模型网关预检拒绝了请求（HTTP 403）。" if rejection_code == "model_request_blocked" else "模型接口拒绝访问。"
+        cause = (
+            "这不是网络超时，也不是 Word 最终检查失败。"
+            "请让当前 CODEX_BASE_URL 的接口管理员核查访问权限及预检拒绝原因；"
+            "程序不会自动重试或切换接口绕过拒绝。" + request_hint
+        )
+        return issue, cause
     asset_ids = list(dict.fromkeys(re.findall(r"\basset\s+(\d+)\b", lowered)))
     if len(asset_ids) == 1:
         asset_name = f"第 {asset_ids[0]} 个图表截图"
@@ -1176,7 +1190,9 @@ def summarize_file(
         raise gr.Error(f"{exc}\n详细日志：{GUI_LOG_PATH.resolve()}") from exc
     except Exception as exc:
         logger.exception("Summary failed for session %s", session_id)
-        reason_code = "network_timeout" if is_recoverable_error(exc) else "workflow_failure"
+        reason_code = model_request_rejection_code(exc) or (
+            "network_timeout" if is_recoverable_error(exc) else "workflow_failure"
+        )
         summary_result = SummaryRunResult(
             status="timeout" if reason_code == "network_timeout" else "failed",
             message=f"{type(exc).__name__}: {exc}",

@@ -3,6 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import re
+
+
+def model_request_rejection_code(exc: BaseException) -> str:
+    """Identify terminal gateway denials even inside workflow wrappers."""
+    pending = [exc]
+    seen: set[int] = set()
+    access_denied = False
+    while pending:
+        current = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        cause = current.__cause__ or current.__context__
+        if cause is not None:
+            pending.append(cause)
+        text = str(current).lower()
+        if "request_check_blocked" in text or "model_request_blocked" in text:
+            return "model_request_blocked"
+        if getattr(current, "status_code", None) in {401, 403} or re.search(r"\bHTTP\s+(?:401|403)\b", text, re.I):
+            access_denied = True
+    return "model_access_denied" if access_denied else ""
 
 
 class WorkflowError(RuntimeError):
@@ -34,6 +58,8 @@ class WorkflowTimeoutError(RecoverableWorkflowError):
 
 
 def is_recoverable_error(exc: BaseException) -> bool:
+    if model_request_rejection_code(exc):
+        return False
     # Nodes often wrap an SDK exception in a user-facing RuntimeError.  The
     # old classifier only inspected the wrapper text, so a Chinese wrapper
     # around APIConnectionError was incorrectly treated as non-recoverable.
@@ -94,4 +120,5 @@ __all__ = [
     "WorkflowTimeoutError",
     "classify_error",
     "is_recoverable_error",
+    "model_request_rejection_code",
 ]
