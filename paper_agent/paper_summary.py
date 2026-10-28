@@ -5413,6 +5413,16 @@ def _memory_applies_to_paper(memory: CorrectionMemory, normalized_paper_id: str)
     if memory.scope == "global" or memory.paper_id == "global":
         return True
     if memory.scope == "domain":
+        # Older auto-learnings were domain-scoped despite containing local asset
+        # IDs. Do not apply those findings to a different paper. Explicitly
+        # promoted rules retain their user-approved cross-paper scope.
+        if (
+            normalized_paper_id
+            and memory.paper_id != normalized_paper_id
+            and not memory.promoted_from
+            and re.search(r"\basset\s*[:#-]?\s*\d+\b", _memory_text(memory))
+        ):
+            return False
         return True
     return not normalized_paper_id or memory.paper_id == normalized_paper_id
 
@@ -7207,7 +7217,9 @@ def _record_harness_learnings(context: _PaperWorkflowContext) -> None:
             corrected=corrected,
             note=note,
             category=category,
-            scope="domain",
+            # Findings contain paper-specific asset IDs, captions and section names.
+            # Cross-paper reuse requires the explicit memory promotion workflow.
+            scope="paper",
             confidence=0.72,
         )
 
@@ -7228,10 +7240,10 @@ def _learning_rule_for_issue(issue_type: str, message: str) -> str:
         return "图和表必须作为独立 asset 截取；如果一个截图同时包含图、表或正文，应阻断并重新定位。"
     if "figure" in lowered and any(token in lowered for token in ("caption", "text-only", "too shallow", "missing")):
         return "图截图必须包含图主体和必要 caption；caption-only、正文-only 或主体缺失的图片不能插入 Word。"
-    if "title" in lowered or "标题" in text:
-        return "中文标题必须是自然中文，可保留方法名，但不能使用英文任务短语加“论文精读”的半翻译标题。"
     if "asset" in lowered:
         return "正文图表引用必须与 asset manifest 的 kind、编号和原始 caption 对齐，发现不匹配时先修正文案或移除 marker。"
+    if "title" in lowered or "标题" in text:
+        return "中文标题必须是自然中文，可保留方法名，但不能使用英文任务短语加“论文精读”的半翻译标题。"
     if "missing required section" in lowered or "format guard" in lowered:
         return "最终报告必须在生成 Word 前补齐必需章节，并确保每个章节有可读中文内容。"
     return ""

@@ -4,6 +4,8 @@ from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import pytest
+
 from paper_agent.memory import (
     MemoryPolicy,
     disable_correction_memory,
@@ -12,6 +14,7 @@ from paper_agent.memory import (
     record_summary_correction,
 )
 from paper_agent.memory.correction_memory import _load_correction_memories
+from paper_agent import paper_summary as summary
 
 
 def test_memory_policy_filters_low_confidence_and_conflicts():
@@ -119,3 +122,57 @@ def test_memory_cli_list_disable_promote():
         payload = json.loads(output.getvalue())
 
     assert payload["memories"][0]["scope"] == "paper"
+
+
+@pytest.mark.parametrize("reference", ["asset 9", "asset:9", "ASSET#9"])
+def test_legacy_domain_asset_findings_do_not_leak_to_other_papers(tmp_path, reference):
+    memory_path = tmp_path / "memory.jsonl"
+    record_summary_correction("Paper A", "Visual Asset Guard", f"{reference} contains unrelated title",
+                              memory_path=memory_path, scope="domain")
+    record_summary_correction("Paper A", "caption only", "include table body",
+                              memory_path=memory_path, scope="domain")
+    assert len(_load_correction_memories("Paper A", memory_path=memory_path)) == 2
+    memories = _load_correction_memories("Paper B", memory_path=memory_path)
+    assert [memory.corrected for memory in memories] == ["include table body"]
+    rows = list_correction_memories(memory_path=memory_path)
+    assert len(rows) == 2
+    assert rows[0]["hit_count"] == 1
+    assert rows[1]["hit_count"] == 2
+
+
+def test_explicit_domain_promotion_is_respected(tmp_path):
+    memory_path = tmp_path / "memory.jsonl"
+    record_summary_correction("Paper A", "asset 9", "keep original numbering", memory_path=memory_path)
+    for _ in range(2):
+        _load_correction_memories("Paper A", memory_path=memory_path)
+    promote_correction_memory(1, "domain", memory_path=memory_path)
+    memories = _load_correction_memories("Paper B", memory_path=memory_path)
+    assert len(memories) == 1
+    assert memories[0].promoted_from
+
+
+def test_asset_title_finding_does_not_teach_translation_rule():
+    rule = summary._learning_rule_for_issue("visual_crop_invalid", "asset 9 includes unrelated section title")
+    assert "asset manifest" in rule
+    assert rule != summary._learning_rule_for_issue("title", "English report title")
+
+
+def test_automatic_findings_stay_with_their_source_paper(tmp_path, monkeypatch):
+    memory_path = tmp_path / "memory.jsonl"
+    monkeypatch.setattr(summary, "_auto_harness_learning_enabled", lambda: True)
+    monkeypatch.setattr(summary, "_correction_memory_path", lambda path=None: Path(path) if path else memory_path)
+    context = summary._PaperWorkflowContext(
+        input_path="Paper A", output_dir=str(tmp_path), pages=None,
+        summary_language="Chinese", codex_envs={}, max_assets=13,
+    )
+    context.paper_title = "Paper A"
+    context.verification = summary.VerificationResult(passed=False, hard_failures=[
+        {"type": "visual_crop_invalid", "reason": "asset 9 table crop includes unrelated caption"}
+    ])
+    summary._record_harness_learnings(context)
+
+    rows = list_correction_memories(memory_path=memory_path)
+    assert len(rows) == 1
+    assert rows[0]["scope"] == "paper"
+    assert _load_correction_memories("Paper B", memory_path=memory_path) == []
+    assert len(_load_correction_memories("Paper A", memory_path=memory_path)) == 1

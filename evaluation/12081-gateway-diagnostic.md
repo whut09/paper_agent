@@ -66,3 +66,35 @@ check during this follow-up. The last real-paper outcome remains blocked.
 
 Follow-up full-suite result: **489 passed, 1 skipped**, with 7 dependency
 deprecation warnings. Fifteen new offline workflow regressions passed.
+
+## Clean-cache run and offline payload audit
+
+A subsequent clean-output run `20261028-084343-0a9c13ae` failed after
+139.094 seconds, again on chunk 4/5. Notes 1/2/3/5 succeeded; no Word file was
+exposed. Request ID: `202610280844529959829938268d9d6vXxfGENX`.
+This used the same gateway, model and proxy, without reusing earlier notes.
+
+The exact chunk prompts were reconstructed offline from the ExtractSections
+checkpoint using the recorded 8,000-character chunk setting. The fourth prompt
+was 9,875 characters; the reconstructed Responses JSON body was 14,639 UTF-8
+bytes (excluding SDK transport details). Successful prompts were between
+10,153 and 10,502 characters. No prompt contained NUL or Unicode replacement
+characters. Apparent Chinese corruption in an earlier terminal display was an
+output-encoding artifact, not damaged request text. The fourth chunk contains
+the end of page 8 and pages 9/10; its evaluation-metric text was checked against
+a rendering of original page 9. These observations do not identify the gateway
+preflight trigger.
+
+An independent application defect was verified: two automatic learnings from
+another paper, containing asset 8/9 and its section title, were injected as
+domain-wide corrections. New automatic findings now remain paper-scoped; legacy
+domain findings with local asset IDs are not injected into other papers unless
+explicitly promoted. Stored records are preserved. Offline inspection of this
+actual checkpoint confirms both unrelated records are excluded. Asset findings
+mentioning a section title also no longer teach an unrelated Chinese-report-title
+translation rule. Six new regression cases cover these behaviors.
+
+Final full-suite result: **495 passed, 1 skipped**, with 7 dependency deprecation
+warnings. No altered version of the denied request was resubmitted to get around
+preflight checks. This input-quality fix is not proof of restored generation;
+successful same-paper generation, deployment and download remain unverified.
