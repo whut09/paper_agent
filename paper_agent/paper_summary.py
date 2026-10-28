@@ -638,6 +638,8 @@ class ExtractMethods(_PaperWorkflowNode):
                 context.partial_summaries,
             )
         except RuntimeError as exc:
+            if model_request_rejection_code(exc):
+                raise
             legacy_errors = _report_draft_contract_errors(context.legacy_summary)
             if not context.legacy_summary or legacy_errors:
                 raise
@@ -5812,13 +5814,14 @@ def _summarize_chunks_with_codex(
     pending_queue = list(pending_chunks)
     chunks_by_idx = {idx: chunk for idx, chunk in pending_chunks}
     failed_chunks: dict[int, Exception] = {}
+    terminal_error: tuple[int, Exception] | None = None
     submitted_partials: set[str] = set(_partial_integration_keys(partial_records))
 
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="paper-summary") as executor:
         active: dict[object, tuple[str, object]] = {}
 
         def submit_ready_partials() -> None:
-            if not partial_integrator:
+            if terminal_error is not None or not partial_integrator:
                 return
             for spec in group_specs:
                 key = _partial_integration_key(spec["name"], spec["start"], spec["end"])
@@ -5836,7 +5839,7 @@ def _summarize_chunks_with_codex(
                 submitted_partials.add(key)
 
         def submit_more_chunks() -> None:
-            while pending_queue and len(active) < max_workers:
+            while terminal_error is None and pending_queue and len(active) < max_workers:
                 idx, chunk = pending_queue.pop(0)
                 active[executor.submit(summarize_one, idx, chunk)] = ("chunk", idx)
 
@@ -5855,6 +5858,8 @@ def _summarize_chunks_with_codex(
                         idx = _idx
                     except Exception as exc:
                         failed_chunks[idx] = exc
+                        if model_request_rejection_code(exc):
+                            terminal_error = (idx, exc)
                         continue
                     results[idx - 1] = note
                     completed += 1
@@ -5866,14 +5871,27 @@ def _summarize_chunks_with_codex(
                 spec = dict(meta)
                 try:
                     summary = future.result()
-                except Exception:
+                except Exception as exc:
+                    if model_request_rejection_code(exc):
+                        terminal_error = (0, exc)
                     continue
                 partial_records.append(
                     _partial_integration_record(spec["name"], spec["start"], spec["end"], total, summary)
                 )
                 _write_partial_integration_cache(partial_cache_path, partial_records, total)
+            if terminal_error is not None:
+                # Drain already-running work to retain successful notes, but
+                # cancel queued work and never enqueue retries or fallbacks.
+                for future in list(active):
+                    if future.cancel():
+                        active.pop(future)
             submit_ready_partials()
             submit_more_chunks()
+    if terminal_error is not None:
+        idx, exc = terminal_error
+        if idx:
+            raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
+        raise RuntimeError(f"半篇整合被模型网关拒绝，已停止生成：{exc}") from exc
     retry_errors: list[tuple[int, Exception]] = []
     for idx in sorted(failed_chunks):
         if cancellation_check:
@@ -5882,6 +5900,8 @@ def _summarize_chunks_with_codex(
             _idx, note = summarize_one(idx, chunks_by_idx[idx])
             idx = _idx
         except Exception as exc:
+            if model_request_rejection_code(exc):
+                raise RuntimeError(_chunk_summary_error_message(idx, total, exc)) from exc
             retry_errors.append((idx, exc))
             continue
         results[idx - 1] = note
@@ -6044,6 +6064,24 @@ def _run_missing_partial_integrations(
     if not missing:
         return
     workers = max(1, min(max_workers, len(missing)))
+    if workers == 1:
+        for spec in missing:
+            if cancellation_check:
+                cancellation_check()
+            try:
+                summary = partial_integrator(
+                    str(spec["name"]), int(spec["start"]), int(spec["end"]),
+                    chunk_notes[int(spec["start"]) - 1 : int(spec["end"])],
+                )
+            except Exception as exc:
+                if model_request_rejection_code(exc):
+                    raise
+                continue
+            records.append(_partial_integration_record(
+                str(spec["name"]), int(spec["start"]), int(spec["end"]), total, summary,
+            ))
+            _write_partial_integration_cache(cache_path, records, total)
+        return
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="paper-partial") as executor:
         futures = {
             executor.submit(
@@ -6061,7 +6099,11 @@ def _run_missing_partial_integrations(
             spec = futures[future]
             try:
                 summary = future.result()
-            except Exception:
+            except Exception as exc:
+                if model_request_rejection_code(exc):
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise
                 continue
             records.append(
                 _partial_integration_record(str(spec["name"]), int(spec["start"]), int(spec["end"]), total, summary)
@@ -6070,7 +6112,11 @@ def _run_missing_partial_integrations(
 
 
 def _chunk_summary_error_message(idx: int, total: int, exc: Exception) -> str:
-    error = _clean_xml_text(str(exc))[:260]
+    full_error = _clean_xml_text(str(exc))
+    error = full_error[:260]
+    request_match = re.search(r"request id:\s*([A-Za-z0-9_-]+)", full_error, re.I)
+    if request_match and request_match.group(1) not in error:
+        error += f" (request id: {request_match.group(1)})"
     return (
         f"分段笔记生成失败（第 {idx}/{total} 段），已停止生成 Word，避免输出不完整或不可读报告。"
         f"错误摘要：{error}"
@@ -6121,6 +6167,8 @@ def _integrate_summary_with_codex(
             )
             return _require_complete_report_draft(candidate)
         except RuntimeError as exc:
+            if model_request_rejection_code(exc):
+                raise
             return _fast_integrate_summary_with_codex(
                 client,
                 model,
@@ -6165,6 +6213,8 @@ def _integrate_summary_with_codex(
         )
         return _require_complete_report_draft(candidate)
     except RuntimeError as exc:
+        if model_request_rejection_code(exc):
+            raise
         return _fast_integrate_summary_with_codex(
             client,
             model,
@@ -6418,6 +6468,8 @@ def _fast_integrate_summary_with_codex(
         )
         return _require_complete_report_draft(candidate)
     except RuntimeError as exc:
+        if model_request_rejection_code(exc):
+            raise
         raise RuntimeError(
             "总结质量自检未通过：完整整合和快速整合都超时，已停止生成 Word，避免输出不可读的原文摘录版报告。"
             f"完整整合错误：{_clean_xml_text(str(original_error))[:220]}；"
@@ -6866,6 +6918,8 @@ def _synthesize_report_by_sections_with_codex(
                 issues,
             )
         except RuntimeError as exc:
+            if model_request_rejection_code(exc):
+                raise
             logger.warning("Section repair skipped for %s: %s", section, exc)
             continue
         candidate = _replace_report_section_body(report, section, body)
@@ -10299,6 +10353,8 @@ def _run_verification_agent(
             max_attempts=1,
         )
     except RuntimeError as exc:
+        if model_request_rejection_code(exc):
+            raise
         transport_message = f"Verifier Agent 超时，已降级为本地 Guard 校验并允许生成 Word：{_clean_xml_text(str(exc))[:260]}"
         return VerificationResult(
             True,
@@ -10348,7 +10404,9 @@ def _run_verification_agent(
                 max_tokens=1200,
                 max_attempts=1,
             )
-        except RuntimeError:
+        except RuntimeError as exc:
+            if model_request_rejection_code(exc):
+                raise
             return _verification_format_warning(verification)
         repaired = _parse_verification_result(repaired_output)
         if not _verification_failed_due_to_format(repaired):
@@ -11126,7 +11184,8 @@ def _responses_stream_content(client: openai.OpenAI, request: dict) -> str:
                 elif event_type in {"response.failed", "response.incomplete", "error"}:
                     response = getattr(event, "response", None)
                     detail = getattr(event, "message", None) or getattr(response, "error", None) or getattr(response, "incomplete_details", None)
-                    raise RuntimeError(f"Responses 流式请求失败（{event_type}）：{detail}")
+                    error_code = getattr(event, "code", None) or ""
+                    raise RuntimeError(f"Responses 流式请求失败（{event_type}，{error_code}）：{detail}")
             raise RuntimeError("Responses 流式连接提前结束，未收到 response.completed，已丢弃不完整内容。")
         finally:
             stream.close()
@@ -11240,9 +11299,15 @@ def _chat(
 ) -> str:
     if client is None:
         raise RuntimeError("Codex 客户端未初始化，请检查 CODEX_BASE_URL、CODEX_API_KEY、CODEX_MODEL 配置。")
+    previous_rejection = getattr(client, "_paper_terminal_rejection", None)
+    if previous_rejection is not None:
+        raise RuntimeError(f"本次任务的模型请求已被网关拒绝，未再次提交：{previous_rejection}") from previous_rejection
     max_attempts = max_attempts or _codex_chat_attempts()
     last_error: Exception | None = None
     for attempt in range(max_attempts):
+        previous_rejection = getattr(client, "_paper_terminal_rejection", None)
+        if previous_rejection is not None:
+            raise RuntimeError(f"本次任务的模型请求已被网关拒绝，未再次提交：{previous_rejection}") from previous_rejection
         try:
             request = {
                 "model": model,
@@ -11302,6 +11367,8 @@ def _chat(
             time.sleep(_chat_retry_delay(attempt))
         except openai.APIStatusError as exc:
             last_error = exc
+            if model_request_rejection_code(exc):
+                client._paper_terminal_rejection = exc
             retry_limit = _openai_status_retry_limit(exc, max_attempts)
             if not _is_retryable_openai_status(exc) or attempt + 1 >= retry_limit:
                 break
@@ -11318,6 +11385,9 @@ def _chat(
             time.sleep(_chat_retry_delay(attempt))
         except (RuntimeError, TimeoutError, httpx.HTTPError) as exc:
             last_error = exc
+            if model_request_rejection_code(exc):
+                client._paper_terminal_rejection = exc
+                break
             if attempt + 1 >= max_attempts:
                 break
             time.sleep(_chat_retry_delay(attempt))
@@ -11495,7 +11565,9 @@ def _replace_missing_abstract(
             max_tokens=1200,
             max_attempts=1,
         )
-    except RuntimeError:
+    except RuntimeError as exc:
+        if model_request_rejection_code(exc):
+            raise
         return summary
     if not abstract_cn:
         return summary
