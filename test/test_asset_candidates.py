@@ -2,6 +2,8 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+import fitz
+from PIL import Image
 
 from paper_agent.assets.candidates import (
     build_asset_candidate_pool,
@@ -21,6 +23,7 @@ from paper_agent.paper_summary import (
     ReviseReport,
     SummarizeContribution,
     VerifyClaims,
+    PaperAsset,
     _build_asset_candidate_pools,
     _commit_selected_asset_candidates,
 )
@@ -28,6 +31,34 @@ from paper_agent.schemas.contracts import (
     CandidateStrategy,
     EvidenceBundle,
 )
+
+
+def test_same_page_same_caption_formula_candidates_keep_their_source_identity(tmp_path):
+    assets = []
+    for number, top in ((7, 100), (8, 200)):
+        image = tmp_path / f"formula-{number}.png"
+        Image.new("RGB", (100, 40), (number * 20, 0, 0)).save(image)
+        assets.append(PaperAsset("formula", 8, image, "Key formula screenshot",
+                                 text=f"x = y ({number})", rect=fitz.Rect(50, top, 300, top + 40)))
+    pools = _build_asset_candidate_pools(assets)
+    # Ordering cannot be used to repair the identity collision.
+    committed = _commit_selected_asset_candidates(assets, list(reversed(pools)))
+    assert [asset.path for asset in committed] == [asset.path for asset in assets]
+    assert [tuple(asset.rect) for asset in committed] == [tuple(asset.rect) for asset in assets]
+    assert committed[0].path.read_bytes() != committed[1].path.read_bytes()
+
+
+def test_repeated_caption_does_not_adopt_unrelated_pool_when_one_is_missing(tmp_path):
+    assets = []
+    for number in (7, 8):
+        image = tmp_path / f"formula-{number}.png"
+        Image.new("RGB", (100, 40), "white").save(image)
+        assets.append(PaperAsset("formula", 8, image, "Key formula screenshot",
+                                 text=f"x = y ({number})", rect=fitz.Rect(50, number * 10, 300, number * 10 + 5)))
+    pool = _build_asset_candidate_pools(assets)[1]
+    committed = _commit_selected_asset_candidates(assets, [pool])
+    assert committed[0] is assets[0]
+    assert committed[1].path == assets[1].path
 
 
 def evidence(kind="table", caption="Table 1. Results", text="Method 1 2\nOurs 3 4"):

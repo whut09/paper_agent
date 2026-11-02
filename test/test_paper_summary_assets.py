@@ -2054,6 +2054,30 @@ def test_numbered_formula_clip_keeps_split_left_spans_and_number():
     assert "where" not in text.lower()
 
 
+def test_numbered_formula_clip_stops_at_standalone_where_between_equations():
+    class FakePage:
+        rect = fitz.Rect(0, 0, 612, 792)
+
+    number = line("(8)", 468, 395, 481, 406)
+    lines = [
+        line("H(M) = sum P log P", 240, 349, 420, 360),
+        line("(7)", 468, 349, 481, 360),
+        line("i=1", 290, 364, 310, 372),
+        line("where", 135, 380, 161, 390),
+        line("P(C_i) =", 264, 389, 334, 407),
+        line("C_i / sum C_j", 345, 395, 420, 417),
+        number,
+        line("and C_i denotes the number of active locations.", 135, 423, 481, 434),
+    ]
+    rect, text = _numbered_formula_clip(FakePage(), number, lines)
+    assert 372 < rect.y0 < 389
+    assert rect.y1 < 423
+    assert "i=1" not in text
+    assert "(7)" not in text
+    assert "(8)" in text
+    assert "C_i / sum C_j" in text
+
+
 def test_numbered_formula_clip_excludes_math_prose_and_its_detached_accent():
     class FakePage:
         rect = fitz.Rect(0, 0, 612, 792)

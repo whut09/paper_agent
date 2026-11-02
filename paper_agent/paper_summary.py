@@ -2132,6 +2132,9 @@ def _commit_selected_asset_candidates(
             pool.evidence.page_number,
             pool.evidence.object_type,
             _clean_xml_text(pool.evidence.caption_text),
+            tuple(pool.evidence.source_bbox),
+            pool.evidence.table_or_formula_text,
+            Path(pool.evidence.image_path) if pool.evidence.image_path is not None else None,
         ): pool
         for pool in pools
     }
@@ -2141,6 +2144,9 @@ def _commit_selected_asset_candidates(
             asset.page_number,
             asset.kind,
             _clean_xml_text(asset.caption),
+            tuple(asset.rect) if asset.rect is not None else None,
+            asset.text or asset.latex,
+            asset.path,
         )
         pool = pools_by_identity.get(identity)
         selected = pool.selected if pool is not None else None
@@ -2505,11 +2511,16 @@ def _numbered_formula_clip(
         other_number = _equation_number_token(line.text)
         if abs(mid - anchor_mid) < 7 or abs(mid - anchor_mid) > 70:
             continue
-        if not (_formula_line_looks_like_inline_prose(line.text) or
+        # A standalone connector is prose too: ignoring "where" between stacked
+        # equations admits the preceding sum/subscript into the next crop.
+        connector = _clean_xml_text(line.text).strip().lower().rstrip(":,;") in {"where", "with"}
+        if not (_formula_line_looks_like_inline_prose(line.text) or connector or
                 (other_number and line is not number_line)):
             continue
         if mid < anchor_mid:
-            top = max(top, line.rect.y1 + 0.5)
+            # A short connector can sit alongside a fraction numerator. Its
+            # top separates equations; its bottom would cut off valid math.
+            top = max(top, line.rect.y0 - 0.5 if connector else line.rect.y1 + 0.5)
         elif mid > anchor_mid:
             bottom = min(bottom, line.rect.y0 - 0.5)
     selected: list[TextLine] = []
